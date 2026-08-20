@@ -170,18 +170,18 @@ import yaml
 # ---------------------------------------------------------------------------
 
 # Parent directory that holds  silver/  and  gold/  subfolders.
-DATA_ROOT = Path("/lustre/scratch126/cellgen/lotfollahi/DATASETS")
+DATA_ROOT = Path("/lustre/scratch126/cellgen/lotfollahi/DATASETS/")
 
 # Dataset name = subfolder name under  silver/
-DATASET_NAME = "mmb0-1b_smb1-1b_1p_coord_aligned"
+DATASET_NAME = "hst_corpus_110m"
 
 # Path to your local clones of the two repos on the cluster
-REPRO_REPO = Path("/nfs/team361/sb75/squint-reproducibility")
-SQUINT_PKG = Path("/nfs/team361/sb75/squint")
+REPRO_REPO = Path("/nfs/team361/dj16/squint-reproducibility")
+SQUINT_PKG = Path("/nfs/team361/dj16/squint")
 
 # Single root for everything we produce: configs, wandb logs, checkpoints,
 # inference outputs.
-ARTIFACTS_DIR = Path("/nfs/team361/sb75/squint-reproducibility/artifacts")
+ARTIFACTS_DIR = Path("/nfs/team361/dj16/squint-reproducibility/artifacts")
 
 # Where this example writes its tailored config files.
 CONFIG_OUT_DIR = ARTIFACTS_DIR / "configs"
@@ -36942,7 +36942,7 @@ def harmonize_anndata_var():
 # Build dataset blob (one-time preprocessing)
 # ---------------------------------------------------------------------------
 
-def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
+def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory"):
     """
     Build the in-memory PyG DatasetBlob in-process.
 
@@ -37005,6 +37005,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "xhs1000-3b_1p":
         cfg = make_dataset_blob_config_xhs_3b()
         cfg_path = CONFIG_OUT_DIR / "build_blob_xhs1000-3b_1p.yaml"
+    elif dataset == "hst_corpus_110m":
+        cfg = make_dataset_blob_config()  # default config name == DATASET_NAME == hst_corpus_110m
+        cfg_path = CONFIG_OUT_DIR / "build_blob_hst_corpus_110m.yaml"
     else:
         raise ValueError(
             f"Unknown --build-blob-dataset {dataset!r}. Choices: "
@@ -37013,7 +37016,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
             f"'spatch_1p', 'spatch_ov_1p', 'spatch_hcc_1p', "
             f"'spatch_coad_1p', 'squint_hln', 'squint_hln_allgenes', "
             f"'squint_hln_hvg1k', 'squint_hln_hvg2k', 'squint_hln_svg1k', "
-            f"'squint_hln_svg2k', 'squint_vht', 'xhs1000-3b_1p'."
+            f"'squint_hln_svg2k', 'squint_vht', 'xhs1000-3b_1p', 'hst_corpus_110m'."
         )
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -37024,29 +37027,50 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     if str(SQUINT_PKG / "src") not in sys.path:
         sys.path.insert(0, str(SQUINT_PKG / "src"))
 
-    from vqniche.dataset.in_memory_dataset_blob import InMemoryDatasetBlob
-
     ds_cfg = cfg["dataset"]
-    print(f"Building dataset blob into "
-          f"{Path(ds_cfg['data_directory_path']) / 'gold' / 'in-memory-PyG-dataset-blob' / ds_cfg['name']}")
 
-    dataset_blob = InMemoryDatasetBlob(
-        name=ds_cfg["name"],
-        feature_names=ds_cfg["feature_names"],
-        label_names=ds_cfg["label_names"],
-        graph_kwargs=ds_cfg["graph_kwargs"],
-        data_directory_path=ds_cfg["data_directory_path"],
-        pre_transform=ds_cfg["pre_transform"],
-        pre_filter=ds_cfg["pre_filter"],
-        overwrite=ds_cfg["overwrite"],
-        software_paths=cfg["software_paths"],
-    )
-
-    for data_batch in dataset_blob:
-        print(f"Batch: {data_batch.adata_batch_id}")
-        print(f"Data: {data_batch}")
-
-    print(f"Processed data saved at {dataset_blob.processed_dir}")
+    if backend == "on-disk":
+        # Streaming backend: one DB row per tissue section, lazily fetched.
+        # Required for corpora too large to collate into one resident graph
+        # (e.g. hst_corpus_110m ~= 0.6 TB in-memory). Reuses the same
+        # per-section preprocessing (process_anndata_batch) as the
+        # in-memory blob; only the storage layer differs.
+        from vqniche.dataset.on_disk_dataset import OnDiskDatasetBlob
+        out_dir = (Path(ds_cfg["data_directory_path"]) / "gold"
+                   / "on-disk-PyG-dataset-blob" / ds_cfg["name"])
+        print(f"Building ON-DISK dataset blob into {out_dir}")
+        dataset_blob = OnDiskDatasetBlob(
+            name=ds_cfg["name"],
+            feature_names=ds_cfg["feature_names"],
+            label_names=ds_cfg["label_names"],
+            graph_kwargs=ds_cfg["graph_kwargs"],
+            data_directory_path=ds_cfg["data_directory_path"],
+            pre_filter=ds_cfg["pre_filter"],
+            overwrite=ds_cfg["overwrite"],
+            software_paths=cfg["software_paths"],
+        )
+        print(f"Built {len(dataset_blob)} sections; "
+              f"section ids: {getattr(dataset_blob, 'section_ids', None)}")
+        print(f"Processed data saved at {dataset_blob.processed_dir}")
+    else:
+        from vqniche.dataset.in_memory_dataset_blob import InMemoryDatasetBlob
+        print(f"Building IN-MEMORY dataset blob into "
+              f"{Path(ds_cfg['data_directory_path']) / 'gold' / 'in-memory-PyG-dataset-blob' / ds_cfg['name']}")
+        dataset_blob = InMemoryDatasetBlob(
+            name=ds_cfg["name"],
+            feature_names=ds_cfg["feature_names"],
+            label_names=ds_cfg["label_names"],
+            graph_kwargs=ds_cfg["graph_kwargs"],
+            data_directory_path=ds_cfg["data_directory_path"],
+            pre_transform=ds_cfg["pre_transform"],
+            pre_filter=ds_cfg["pre_filter"],
+            overwrite=ds_cfg["overwrite"],
+            software_paths=cfg["software_paths"],
+        )
+        for data_batch in dataset_blob:
+            print(f"Batch: {data_batch.adata_batch_id}")
+            print(f"Data: {data_batch}")
+        print(f"Processed data saved at {dataset_blob.processed_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -39213,6 +39237,7 @@ def main():
                        "chl59-2b_1p",
                        "mmb0-1b_smb1-20b_1p",
                        "mmb0-239b_1p",
+                       "hst_corpus_110m",
                        "smb1-20b_1p",
                        "spatch_1p",
                        "spatch_ov_1p",
@@ -39251,6 +39276,14 @@ def main():
              "`+rvq-both-3level` for Pearson reconstruction). "
              "Use --list-variants to see all registered variants.",
     )
+    p.add_argument("--build-blob-backend", type=str,
+                   default="in-memory",
+                   choices=["in-memory", "on-disk"],
+                   help="DatasetBlob storage backend for --build-blob. "
+                        "in-memory = single collated dataset_blob.pt "
+                        "(default, OOMs on very large corpora); on-disk = "
+                        "streaming OnDiskDataset, one section per DB row "
+                        "(use for hst_corpus_110m).")
     p.add_argument("--list-variants", action="store_true",
                    help="Print all registered ablation variants and exit.")
     p.add_argument("--list-dataset-sweeps", action="store_true",
@@ -39535,7 +39568,8 @@ def main():
     if args.harmonize_var:
         harmonize_anndata_var()
     if args.build_blob:
-        build_blob(dataset=args.build_blob_dataset)
+        build_blob(dataset=args.build_blob_dataset,
+                   backend=args.build_blob_backend)
     # Resolve --compile / --no-compile into a tri-state override:
     #   `--no-compile`               → False (always wins)
     #   `--compile` (alone)          → True
