@@ -562,6 +562,8 @@ class KSectionBlockLoader:
         seed: int = 0,
         input_mask_attr: Optional[str] = None,
         section_transform: Optional[Callable] = None,
+        batch_label_to_dense: Optional[dict] = None,
+        unknown_batch_label_dense_id: int = 0,
         loader_kwargs: Optional[dict] = None,
     ) -> None:
         """
@@ -587,6 +589,19 @@ class KSectionBlockLoader:
         input_mask_attr : str | None
             Node-level boolean attr (e.g. "train_mask") restricting which
             cells may be SEEDS. None => every cell is a valid seed.
+        batch_label_to_dense : dict | None
+            Corpus-wide {batch label -> dense id} used to stamp each cell with
+            `adata_batch_ids`, which the decoder covariate / adversarial head /
+            FiLM conditioning all require (models/vqniche_dual.py:492, :659
+            raise without it). Build it once over ALL sections —
+            `OnDiskDatasetBlob.batch_label_to_dense()` does that from the
+            manifest. Passing None skips stamping, which is only correct when
+            every batch-correction mechanism is disabled.
+        unknown_batch_label_dense_id : int
+            Dense id for labels absent from the map (predict-time novel
+            sections). Those cells are flagged in
+            `adata_batch_ids_unseen_mask` so the model can substitute a mean
+            batch embedding. Matches `build_batch_one_hot_from_obs`.
         section_transform : Callable | None
             PyG transform (or Compose) applied to EACH section Data BEFORE
             list-strip + concatenation. This is where the in-memory pipeline's
@@ -610,6 +625,10 @@ class KSectionBlockLoader:
         self.seed = seed
         self.input_mask_attr = input_mask_attr
         self.section_transform = section_transform
+        # Corpus-wide {batch label -> dense id}. MUST span every section, not
+        # just this block's — see `_block_view` step 1b.
+        self.batch_label_to_dense = batch_label_to_dense
+        self.unknown_batch_label_dense_id = int(unknown_batch_label_dense_id)
         self.loader_kwargs = dict(loader_kwargs or {})
         self._epoch = 0
         # {mask attr -> per-section seed counts}. Populated on first
@@ -623,6 +642,17 @@ class KSectionBlockLoader:
             random.Random(self.seed + self._epoch).shuffle(order)
         K = self.sections_per_block
         return [order[i:i + K] for i in range(0, len(order), K)]
+
+    @staticmethod
+    def _view_num_nodes(view: Data) -> int:
+        """
+        Cell count of a section view: `x` once `SetExperimentDataKeys` has run,
+        otherwise the raw counts matrix. Needed in two places (per-cell batch
+        ids, and `num_nodes`), so kept in one place.
+        """
+        if "x" in view and view.x is not None:
+            return int(view.x.shape[0])
+        return int(view["x_cell_gene_counts"].shape[0])
 
     # -- per-section view prepared for concatenation ----------------------- #
     def _block_view(self, section: Data, row: int) -> Data:
@@ -676,10 +706,7 @@ class KSectionBlockLoader:
             del view[k]
 
         # 5) num_nodes: prefer data.x (set by transform), else raw counts.
-        if "x" in view and view.x is not None:
-            n = view.x.shape[0]
-        else:
-            n = view["x_cell_gene_counts"].shape[0]
+        n = self._view_num_nodes(view)
 
         # 5b) Drop per-section SCALAR / string metadata (adata_batch_id,
         #     dataset_id, species, tissue, ...). Batch.from_data_list would
@@ -687,7 +714,7 @@ class KSectionBlockLoader:
         #     node/edge attribute inference during NeighborLoader collate
         #     ("num_nodes != num_edges" comparison on a tensor). Anything the
         #     model needs at cell level must be a per-CELL tensor of length n
-        #     (produced by section_transform, e.g. adata_batch_ids); keep only
+        #     (e.g. `adata_batch_ids`, set in step 1b above); keep only
         #     tensors whose first dim is n (node attrs), the 2-row edge_index,
         #     and num_nodes. Everything else is dropped from the streaming
         #     batch (recover section-level metadata by row via `get(idx)`).
@@ -710,6 +737,49 @@ class KSectionBlockLoader:
         view.section_row = torch.full((n,), int(row), dtype=torch.long)
         return view
 
+    # -- per-cell batch identity (stamped AFTER collation) ----------------- #
+    def _stamp_batch_ids(self, block: Data, rows: List[int],
+                         sizes: List[int]) -> None:
+        """
+        Stamp `adata_batch_ids` / `adata_batch_ids_unseen_mask` onto an
+        already-collated block.
+
+        These are what the model's batch-correction machinery consumes; the
+        decoder covariate and the adversarial head both raise without them
+        (models/vqniche_dual.py:492-497, :659-666). The in-memory path builds
+        them in `initialize_databatch` (initializers/initialize.py:466-478);
+        streaming never calls that, so we do the equivalent here.
+
+        WHY AFTER `Batch.from_data_list`, not on each section view:
+        PyG's `Data.__inc__` offsets any attribute whose KEY CONTAINS "batch"
+        by `int(value.max()) + 1` per element of the list, so that per-graph
+        `batch` vectors concatenate into a global assignment. `adata_batch_ids`
+        matches that substring rule, so setting it per section and then
+        collating silently shifts the ids — three sections stamped 0/1/2 come
+        out as 0/2/5. Verified on PyG 2.6.1. Stamping after collation avoids
+        `__inc__` entirely, and matches the in-memory ordering (ids are
+        assigned to the collated object there too).
+
+        Labels come from the manifest (`get_batch_labels`), so this costs no
+        extra I/O.
+        """
+        if self.batch_label_to_dense is None:
+            return
+        labels = self.dataset.get_batch_labels()
+        ids, unseen = [], []
+        for row, n in zip(rows, sizes):
+            label = str(labels[row])
+            known = label in self.batch_label_to_dense
+            dense = (self.batch_label_to_dense[label] if known
+                     else self.unknown_batch_label_dense_id)
+            ids.append(torch.full((n,), int(dense), dtype=torch.long))
+            unseen.append(torch.full((n,), not known, dtype=torch.bool))
+        block.adata_batch_ids = torch.cat(ids)
+        # True for sections whose label was absent from the (train-time) map,
+        # i.e. predict-time novel batches: the model substitutes a mean batch
+        # embedding rather than an arbitrary reference batch.
+        block.adata_batch_ids_unseen_mask = torch.cat(unseen)
+
     # -- iteration --------------------------------------------------------- #
     def __iter__(self):
         from torch_geometric.data import Batch
@@ -717,7 +787,10 @@ class KSectionBlockLoader:
 
         for block_rows in self._block_row_lists():
             views = [self._block_view(self.dataset.get(r), r) for r in block_rows]
+            sizes = [int(v.num_nodes) for v in views]
             block = Batch.from_data_list(views)          # edges offset per section
+            # Must come AFTER collation — see `_stamp_batch_ids` for why.
+            self._stamp_batch_ids(block, block_rows, sizes)
 
             input_nodes = None
             if self.input_mask_attr is not None and self.input_mask_attr in block:
@@ -838,9 +911,14 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
       per-section `section_transform` (split transforms + SetExperimentDataKeys)
       each mini-batch carries `batch.x`, `batch.y`, `batch.edge_index`,
       `batch.batch_size`, plus the streaming provenance `batch.section_row`.
-      (Callers that need per-cell `adata_batch_ids` for the adversarial head
-      should include that in `section_transform` — the same transform that
-      produces it in the in-memory path.)
+    - Per-cell `adata_batch_ids` (and `adata_batch_ids_unseen_mask`) are
+      stamped by `KSectionBlockLoader._block_view` from the section's batch
+      label, using a corpus-wide label->dense map. These are what the decoder
+      covariate, adversarial head and FiLM conditioning consume; the model
+      raises without them (models/vqniche_dual.py:492-497, :659-666). An
+      earlier version of this docstring claimed a `section_transform` should
+      supply them — no such transform exists, the in-memory path builds them
+      in `initialize_databatch`, which streaming never calls.
     - TRAIN uses the configured `num_neighbors` and mixes K sections per block
       (section-mixing => batch-integration signal). VAL/TEST/PREDICT override
       to `num_neighbors=[-1]` (full neighborhood) and `shuffle=False` for
@@ -873,6 +951,8 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
         val_num_neighbors: Optional[List[int]] = None,
         num_workers: int = 0,
         seed: int = 0,
+        batch_label_to_dense: Optional[dict] = None,
+        unknown_batch_label_dense_id: int = 0,
     ) -> None:
         super().__init__()
         self.dataset = dataset
@@ -885,6 +965,15 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
         self.section_transform = section_transform
         self.num_workers = int(num_workers)
         self.seed = seed
+        # Derive the corpus-wide batch map from the manifest unless the caller
+        # supplied one (predict time must reuse the TRAIN-time map, otherwise
+        # dense ids shift and the decoder covariate embedding is indexed out of
+        # range). Same reason `initialize_databatch` takes it as an argument.
+        self.batch_label_to_dense = (
+            batch_label_to_dense if batch_label_to_dense is not None
+            else dataset.batch_label_to_dense()
+        )
+        self.unknown_batch_label_dense_id = int(unknown_batch_label_dense_id)
 
     def _make_loader(self, *, split: str) -> KSectionBlockLoader:
         is_train = split == "train"
@@ -904,6 +993,8 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
             seed=self.seed,
             input_mask_attr=mask_attr,
             section_transform=self.section_transform,
+            batch_label_to_dense=self.batch_label_to_dense,
+            unknown_batch_label_dense_id=self.unknown_batch_label_dense_id,
             loader_kwargs={"num_workers": self.num_workers},
         )
 
