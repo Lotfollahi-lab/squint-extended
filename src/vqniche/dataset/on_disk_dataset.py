@@ -87,18 +87,28 @@ _NON_TENSOR_NODE_ATTRS = ("cell_id", "obs_batch")
 # therefore invalid as a per-section `section_transform`.
 #
 # `SubsetHVG` picks the top-n highly variable genes from whatever Data it is
-# handed (dataset/transforms.py:516-530). The in-memory path composes it into
-# the transform applied to the COLLATED batch (initialize.py:336), so one gene
-# set is chosen for every section. Applied per section it selects a DIFFERENT
-# gene set per section; the resulting `x` tensors all have width n_genes, so
-# `Batch.from_data_list` concatenates them without complaint even though
-# column j means a different gene in different sections. The model has one
-# weight per input column shared across all sections, so that column is then
-# trained on two unrelated genes at once. Nothing raises.
+# handed (dataset/transforms.py:516-530). Applied per section it selects a
+# DIFFERENT gene set per section; the resulting `x` tensors all have width
+# n_genes, so concatenation succeeds without complaint even though column j
+# means a different gene in different sections. The model has one weight per
+# input column shared across all sections, so that column is then trained on
+# two unrelated genes at once. Nothing raises.
 #
-# Fixing this properly means deciding the gene set once at build time and
-# applying the SAME indices to every section. Until that exists, refuse the
-# transform rather than silently corrupting features.
+# NOTE this is NOT a streaming-only defect. The in-memory path has the same
+# scoping: `initialize_dataset_blob` hands the composed transform to the
+# dataset as `transform=`, and PyG applies it in `Dataset.__getitem__`
+# (torch_geometric/data/dataset.py:291) — i.e. PER SECTION, before
+# `initialize_databatch` collates. So enabling HVG there would scramble
+# columns in exactly the same way. It has never fired only because
+# `apply_hvg` defaults to False (the gene panels are already curated), not
+# because collation protected it.
+#
+# Fixing it properly means deciding the gene set once, over the whole corpus,
+# and applying the SAME indices to every section. Until that exists, refuse
+# the transform here rather than silently corrupting features. That makes the
+# streaming loader stricter than the in-memory path, deliberately: it is the
+# path being built for multi-panel corpora, where HVG is the documented
+# recommendation (run_squint.py:868-869).
 _GLOBAL_SCOPE_TRANSFORMS = {
     "SubsetHVG": (
         "picks highly variable genes from the Data it is given, so per-section "
