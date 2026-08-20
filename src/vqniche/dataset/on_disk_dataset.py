@@ -83,6 +83,73 @@ from .in_memory_dataset_blob import InMemoryDatasetBlob
 _NON_TENSOR_NODE_ATTRS = ("cell_id", "obs_batch")
 
 
+# Transforms that must make ONE decision for the whole corpus and are
+# therefore invalid as a per-section `section_transform`.
+#
+# `SubsetHVG` picks the top-n highly variable genes from whatever Data it is
+# handed (dataset/transforms.py:516-530). The in-memory path composes it into
+# the transform applied to the COLLATED batch (initialize.py:336), so one gene
+# set is chosen for every section. Applied per section it selects a DIFFERENT
+# gene set per section; the resulting `x` tensors all have width n_genes, so
+# `Batch.from_data_list` concatenates them without complaint even though
+# column j means a different gene in different sections. The model has one
+# weight per input column shared across all sections, so that column is then
+# trained on two unrelated genes at once. Nothing raises.
+#
+# Fixing this properly means deciding the gene set once at build time and
+# applying the SAME indices to every section. Until that exists, refuse the
+# transform rather than silently corrupting features.
+_GLOBAL_SCOPE_TRANSFORMS = {
+    "SubsetHVG": (
+        "picks highly variable genes from the Data it is given, so per-section "
+        "application selects a different gene set per section and column j "
+        "stops meaning the same gene across the corpus"
+    ),
+}
+
+
+def _iter_transforms(transform):
+    """Yield a transform and, for a Compose, each of its members."""
+    if transform is None:
+        return
+    inner = getattr(transform, "transforms", None)
+    if inner is not None:
+        for t in inner:
+            yield from _iter_transforms(t)
+    else:
+        yield transform
+
+
+def _reject_global_scope_transforms(transform) -> None:
+    """
+    Raise if `transform` contains a transform that must decide globally.
+
+    Converts a silent feature-scrambling bug into an immediate, explanatory
+    error. See `_GLOBAL_SCOPE_TRANSFORMS`.
+    """
+    offenders = [
+        (type(t).__name__, _GLOBAL_SCOPE_TRANSFORMS[type(t).__name__])
+        for t in _iter_transforms(transform)
+        if type(t).__name__ in _GLOBAL_SCOPE_TRANSFORMS
+    ]
+    if not offenders:
+        return
+    lines = "\n".join(f"  - {name}: {why}" for name, why in offenders)
+    raise ValueError(
+        "section_transform contains transform(s) that must make a single "
+        "decision for the whole corpus and cannot be applied per section:\n"
+        f"{lines}\n"
+        "These would not raise at runtime — the shapes stay consistent while "
+        "the meaning of each feature column diverges between sections — so "
+        "they are rejected here instead.\n"
+        "For highly variable genes: either train on the full panel "
+        "(apply_hvg=False, the default), or select the gene set once and "
+        "apply the same indices to every section. Split transforms "
+        "(RandomNodeSplit, SpatialBatchSplit) and SetExperimentDataKeys are "
+        "per-section by design and remain fine here."
+    )
+
+
 def _section_batch_label(section: Data) -> str:
     """
     The section's batch label — the value of `adata.uns['batch']`.
@@ -624,6 +691,8 @@ class KSectionBlockLoader:
         self.shuffle = shuffle
         self.seed = seed
         self.input_mask_attr = input_mask_attr
+        # Fail fast on transforms that cannot be applied per section.
+        _reject_global_scope_transforms(section_transform)
         self.section_transform = section_transform
         # Corpus-wide {batch label -> dense id}. MUST span every section, not
         # just this block's — see `_block_view` step 1b.
