@@ -69,6 +69,7 @@ import random
 from pathlib import Path
 from typing import Callable, List, Optional, Iterator, Tuple
 
+import anndata as ad
 import pandas as pd
 import scanpy as sc
 import torch
@@ -316,7 +317,15 @@ class OnDiskDatasetBlob(OnDiskDataset):
         obs_index: dict = {}   # batch_id -> obs sidecar relpath
 
         for adata_batch_file in raw_files:
-            adata_batch = sc.read(adata_batch_file)
+            # BACKED read: pass 1 only needs .var (gene panel), .obs (spilled
+            # below) and .uns (batch id) — never .X. A full `sc.read` here
+            # loaded every section into RAM in its entirety, and pass 2 then
+            # read every file AGAIN via process_anndata_batch, so the build
+            # paid two complete passes over the corpus. Section files reach
+            # ~8.6 GB, so on 636 sections that is a large avoidable read.
+            # `_panelsurvey.py` already established backed mode is enough for
+            # exactly this metadata.
+            adata_batch = ad.read_h5ad(adata_batch_file, backed="r")
             batch_id = self._derive_adata_batch_id(
                 adata_batch=adata_batch, adata_batch_file=adata_batch_file,
             )
@@ -350,6 +359,13 @@ class OnDiskDatasetBlob(OnDiskDataset):
                 _vals = pd.Series(adata_batch.obs[label_key].unique()).dropna().tolist()
                 self.label_categories[label_name].update(_vals)
 
+            # Release the HDF5 handle; backed AnnData keeps the file open and
+            # 636 open handles would exhaust the per-process limit.
+            try:
+                if adata_batch.file is not None:
+                    adata_batch.file.close()
+            except Exception:  # noqa: BLE001 - closing is best-effort
+                pass
             del adata_batch
 
         for label_name in self.label_names:
@@ -597,9 +613,13 @@ class KSectionBlockLoader:
         sections (the property we want), and
       - each seed's sampled NEIGHBORHOOD stays inside its own section
         (because there are no cross-section edges).
-    Peak memory is bounded by K sections (+ the active sub-batch), not the
-    whole corpus. K trades mixing breadth against memory: K=1 == per-section
-    (no mixing); K=all == the in-memory blob (full mixing, full memory).
+    MEMORY. Residency is bounded by a small multiple of K sections, not by the
+    corpus. Budget ~2xK, not K: `Batch.from_data_list` allocates the combined
+    block while the K source views are still referenced, so both exist at the
+    moment of concatenation. With `prefetch=True` one further block is being
+    prepared while the current one is consumed. K trades mixing breadth against
+    memory: K=1 == per-section (no mixing); K=all == the in-memory blob (full
+    mixing, full memory).
 
     Each block is reshuffled every epoch (section->block assignment changes),
     so over epochs a given section co-occurs with many others.
@@ -631,6 +651,7 @@ class KSectionBlockLoader:
         section_transform: Optional[Callable] = None,
         batch_label_to_dense: Optional[dict] = None,
         unknown_batch_label_dense_id: int = 0,
+        prefetch: bool = True,
         loader_kwargs: Optional[dict] = None,
     ) -> None:
         """
@@ -680,8 +701,18 @@ class KSectionBlockLoader:
             section, exactly as the in-memory path applies them to each
             section before collation. When it already sets `data.x` /
             `data.edge_index`, the fallback below is skipped.
+        prefetch : bool
+            Build the next block on a background thread while the current one
+            is being consumed, so the GPU does not idle at block boundaries.
+            Costs one extra resident block (see the memory note in the class
+            docstring). Set False to debug or to minimise memory.
         loader_kwargs : dict | None
-            Extra kwargs forwarded to NeighborLoader (num_workers, etc.).
+            Extra kwargs forwarded to NeighborLoader. NOTE `num_workers` here
+            is usually counter-productive: a NeighborLoader is constructed per
+            block, so workers are spawned and torn down for EVERY block (159
+            per epoch at K=4 over 636 sections) and `persistent_workers` cannot
+            help. `prefetch=True` hides the same disk cost without that
+            churn — prefer it and leave `num_workers=0`.
         """
         self.dataset = dataset
         self.edge_index_name = edge_index_name
@@ -695,9 +726,10 @@ class KSectionBlockLoader:
         _reject_global_scope_transforms(section_transform)
         self.section_transform = section_transform
         # Corpus-wide {batch label -> dense id}. MUST span every section, not
-        # just this block's — see `_block_view` step 1b.
+        # just this block's — see `_stamp_batch_ids`.
         self.batch_label_to_dense = batch_label_to_dense
         self.unknown_batch_label_dense_id = int(unknown_batch_label_dense_id)
+        self.prefetch = bool(prefetch)
         self.loader_kwargs = dict(loader_kwargs or {})
         self._epoch = 0
         # {mask attr -> per-section seed counts}. Populated on first
@@ -850,16 +882,75 @@ class KSectionBlockLoader:
         block.adata_batch_ids_unseen_mask = torch.cat(unseen)
 
     # -- iteration --------------------------------------------------------- #
-    def __iter__(self):
+    def _build_block(self, block_rows: List[int]):
+        """
+        Fetch K sections, prepare and concatenate them into one block graph.
+
+        This is the expensive step (disk read + per-section transform + a full
+        concatenating copy), which is why `__iter__` can run it ahead of time on
+        a background thread.
+        """
         from torch_geometric.data import Batch
+
+        views = [self._block_view(self.dataset.get(r), r) for r in block_rows]
+        sizes = [int(v.num_nodes) for v in views]
+        block = Batch.from_data_list(views)              # edges offset per section
+        # Must come AFTER collation — see `_stamp_batch_ids` for why.
+        self._stamp_batch_ids(block, block_rows, sizes)
+        return block
+
+    def _blocks(self) -> Iterator:
+        """
+        Yield prepared blocks, optionally reading the next one ahead.
+
+        With `prefetch=False` this is a plain synchronous generator. With
+        `prefetch=True` a daemon thread builds block n+1 while the caller is
+        still training on block n, so the GPU no longer idles at every block
+        boundary — previously each boundary stalled for K x (deserialize +
+        transform), once per block per epoch.
+
+        A thread (not a process) is sufficient: the cost is HDF5/SQLite reads
+        and tensor copies, which release the GIL. The queue holds a single
+        block, so steady-state residency is 2 blocks rather than 1 — budget K
+        accordingly (and see the 2xK note in the class docstring).
+        """
+        row_lists = self._block_row_lists()
+        if not self.prefetch:
+            for block_rows in row_lists:
+                yield self._build_block(block_rows)
+            return
+
+        import queue
+        import threading
+
+        q: "queue.Queue" = queue.Queue(maxsize=1)
+        _DONE = object()
+
+        def producer():
+            try:
+                for block_rows in row_lists:
+                    q.put(self._build_block(block_rows))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in consumer
+                q.put(exc)
+            else:
+                q.put(_DONE)
+
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+        while True:
+            item = q.get()
+            if item is _DONE:
+                return
+            if isinstance(item, BaseException):
+                # Surface producer failures on the consumer's stack rather
+                # than losing them in a dead thread.
+                raise item
+            yield item
+
+    def __iter__(self):
         from torch_geometric.loader import NeighborLoader
 
-        for block_rows in self._block_row_lists():
-            views = [self._block_view(self.dataset.get(r), r) for r in block_rows]
-            sizes = [int(v.num_nodes) for v in views]
-            block = Batch.from_data_list(views)          # edges offset per section
-            # Must come AFTER collation — see `_stamp_batch_ids` for why.
-            self._stamp_batch_ids(block, block_rows, sizes)
+        for block in self._blocks():
 
             input_nodes = None
             if self.input_mask_attr is not None and self.input_mask_attr in block:
@@ -876,7 +967,7 @@ class KSectionBlockLoader:
             for mini_batch in nl:
                 yield mini_batch
 
-            del block, views                              # release the K sections
+            del block                                     # release the K sections
         self._epoch += 1
 
     def set_epoch(self, epoch: int) -> None:
@@ -996,8 +1087,11 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
 
     Memory
     ------
-    Peak = K sections (`sections_per_block`) + the active NeighborLoader
-    sub-batch, independent of corpus size. Set K to fit the memory budget.
+    Independent of corpus size, but budget ~2xK sections
+    (`sections_per_block`) plus the active NeighborLoader sub-batch — the
+    concatenating copy coexists with the K source sections, and `prefetch`
+    keeps one more block in flight. Sizing from K alone under-budgets by about
+    half.
 
     Notes
     -----
@@ -1022,6 +1116,7 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
         seed: int = 0,
         batch_label_to_dense: Optional[dict] = None,
         unknown_batch_label_dense_id: int = 0,
+        prefetch: bool = True,
     ) -> None:
         super().__init__()
         self.dataset = dataset
@@ -1043,6 +1138,7 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
             else dataset.batch_label_to_dense()
         )
         self.unknown_batch_label_dense_id = int(unknown_batch_label_dense_id)
+        self.prefetch = bool(prefetch)
 
     def _make_loader(self, *, split: str) -> KSectionBlockLoader:
         is_train = split == "train"
@@ -1064,6 +1160,7 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
             section_transform=self.section_transform,
             batch_label_to_dense=self.batch_label_to_dense,
             unknown_batch_label_dense_id=self.unknown_batch_label_dense_id,
+            prefetch=self.prefetch,
             loader_kwargs={"num_workers": self.num_workers},
         )
 
