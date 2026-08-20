@@ -63,7 +63,9 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import pickle
+import random
 from pathlib import Path
 from typing import Callable, List, Optional, Iterator, Tuple
 
@@ -79,6 +81,28 @@ from .in_memory_dataset_blob import InMemoryDatasetBlob
 # must be removed from a section before NeighborLoader subgraph sampling.
 # (Set at in_memory_dataset_blob.py:522 (cell_id) and :556 (obs_batch).)
 _NON_TENSOR_NODE_ATTRS = ("cell_id", "obs_batch")
+
+
+def _section_batch_label(section: Data) -> str:
+    """
+    The section's batch label — the value of `adata.uns['batch']`.
+
+    `process_anndata_batch` stores it as `obs_batch`, the per-section value
+    broadcast to every cell (in_memory_dataset_blob.py:554-557), so every
+    element is identical and the first one is the label. Falls back to the
+    integer `adata_batch_id` when `uns['batch']` was absent at build time
+    (that field is left unset in exactly that case).
+
+    This is the same identity `initialize_databatch` densifies via
+    `build_batch_one_hot_from_obs`, so streaming and in-memory agree on what
+    "which batch is this cell from" means.
+    """
+    obs_batch = section.get("obs_batch", None) if hasattr(section, "get") else None
+    if obs_batch is None:
+        obs_batch = getattr(section, "obs_batch", None)
+    if obs_batch is not None and len(obs_batch) > 0:
+        return str(obs_batch[0])
+    return str(int(section.adata_batch_id))
 
 
 class OnDiskDatasetBlob(OnDiskDataset):
@@ -273,6 +297,8 @@ class OnDiskDatasetBlob(OnDiskDataset):
 
         # ---------------- Pass 2: one SQLite row per section ---------------
         section_ids: List[int] = []
+        node_counts: List[int] = []
+        batch_labels: List[str] = []
         for adata_batch_file in raw_files:
             print(f"Processing {adata_batch_file}...")
             # Inherited; pre_filter/pre_transform already applied inside it
@@ -282,13 +308,30 @@ class OnDiskDatasetBlob(OnDiskDataset):
             # passthrough and the DB pickles the Data (list attrs survive).
             self.append(self.serialize(data_batch))
             section_ids.append(int(data_batch.adata_batch_id))
+            # Cheap per-section facts recorded HERE so consumers never have
+            # to deserialize a row just to learn them (see `manifest` below).
+            node_counts.append(int(data_batch["x_cell_gene_counts"].shape[0]))
+            batch_labels.append(_section_batch_label(data_batch))
             del data_batch   # never hold two sections at once
 
         # Row order == append order == sorted(raw_files) order.
+        #
+        # `node_counts` and `batch_labels` exist so that nothing downstream
+        # needs a full-row fetch for metadata:
+        #   - node_counts  -> KSectionBlockLoader.__len__ can size an epoch
+        #     exactly without touching the DB. Without it, computing the
+        #     length deserializes EVERY section (the whole corpus) to read
+        #     one integer each.
+        #   - batch_labels -> the label->dense-id map for per-cell batch ids
+        #     must be built ONCE over all sections. Densifying per block
+        #     would assign dense id 0 to a different section in every block.
         manifest = {
+            "manifest_version": 2,
             "name": self.name,
             "num_sections": len(section_ids),
             "section_ids": section_ids,      # DB row idx -> adata_batch_id
+            "node_counts": node_counts,      # DB row idx -> n_cells
+            "batch_labels": batch_labels,    # DB row idx -> uns['batch'] value
             "feature_names": self.feature_names,
             "label_names": self.label_names,
         }
@@ -302,9 +345,17 @@ class OnDiskDatasetBlob(OnDiskDataset):
         meta = self._meta_dir
         mpath = meta / "manifest.json"
         self.section_ids: List[int] = []
+        # `node_counts` / `batch_labels` are manifest_version >= 2. Blobs
+        # built before that stay usable: consumers fall back to deriving
+        # them from the rows (see `node_counts` / `batch_labels` properties).
+        self.node_counts: Optional[List[int]] = None
+        self.batch_labels: Optional[List[str]] = None
         if mpath.exists():
             with open(mpath) as f:
-                self.section_ids = json.load(f).get("section_ids", [])
+                _manifest = json.load(f)
+            self.section_ids = _manifest.get("section_ids", [])
+            self.node_counts = _manifest.get("node_counts", None)
+            self.batch_labels = _manifest.get("batch_labels", None)
 
         gp = meta / "gene_panel.pkl"
         if gp.exists():
@@ -330,6 +381,59 @@ class OnDiskDatasetBlob(OnDiskDataset):
     # ------------------------------------------------------------------ #
     # Streaming consumption helpers
     # ------------------------------------------------------------------ #
+    def get_node_counts(self) -> List[int]:
+        """
+        Cells per section, indexed by DB row — from the manifest when the
+        blob was built with manifest_version >= 2, otherwise derived once by
+        fetching each row and cached back onto the instance.
+
+        The manifest path costs no I/O, which is the whole point: sizing an
+        epoch used to deserialize the entire corpus (one full section per
+        integer read).
+        """
+        if self.node_counts is None:
+            print(
+                "OnDiskDatasetBlob: manifest has no 'node_counts' (blob built "
+                "before manifest_version 2) — deriving it by fetching every "
+                "section once. Rebuild the blob to avoid this."
+            )
+            self.node_counts = [
+                int(self.get(i)["x_cell_gene_counts"].shape[0])
+                for i in range(len(self))
+            ]
+        return self.node_counts
+
+    def get_batch_labels(self) -> List[str]:
+        """
+        Per-section batch label (`uns['batch']`), indexed by DB row — from
+        the manifest when available, else derived once from the rows.
+
+        Used to build ONE label->dense-id map across the whole corpus; see
+        `KSectionBlockLoader` for why a per-block map would be wrong.
+        """
+        if self.batch_labels is None:
+            print(
+                "OnDiskDatasetBlob: manifest has no 'batch_labels' (blob built "
+                "before manifest_version 2) — deriving it by fetching every "
+                "section once. Rebuild the blob to avoid this."
+            )
+            self.batch_labels = [
+                _section_batch_label(self.get(i)) for i in range(len(self))
+            ]
+        return self.batch_labels
+
+    def batch_label_to_dense(self) -> dict:
+        """
+        Corpus-wide {batch label -> dense id}, ids assigned over the SORTED
+        unique labels.
+
+        Sorted-unique matches `build_batch_one_hot_from_obs`
+        (initializers/initialize.py), so a section gets the same dense id
+        whether it is loaded through the streaming or the in-memory path.
+        """
+        labels = sorted(set(self.get_batch_labels()))
+        return {lbl: i for i, lbl in enumerate(labels)}
+
     def iter_sections(self) -> Iterator[Tuple[int, Data]]:
         """Yield (row_idx, section Data) one at a time — never more than one
         section resident. Drives a per-section NeighborLoader in the training
@@ -508,10 +612,12 @@ class KSectionBlockLoader:
         self.section_transform = section_transform
         self.loader_kwargs = dict(loader_kwargs or {})
         self._epoch = 0
+        # {mask attr -> per-section seed counts}. Populated on first
+        # use by `_seed_counts`; see `__len__` for why it is needed.
+        self._seed_count_cache: dict = {}
 
     # -- block assignment -------------------------------------------------- #
     def _block_row_lists(self) -> List[List[int]]:
-        import random
         order = list(range(len(self.dataset)))
         if self.shuffle:
             random.Random(self.seed + self._epoch).shuffle(order)
@@ -638,21 +744,75 @@ class KSectionBlockLoader:
 
     def __len__(self) -> int:
         """
-        Approximate number of mini-batches per epoch. Exact only when every
-        cell is a valid seed; with `input_mask_attr` it's an upper bound
-        (unmasked cells reduce it). Cheap: reads per-section node counts via
-        one lazy fetch each — acceptable at build/setup time, not per step.
+        EXACT number of mini-batches the next `__iter__` will yield.
+
+        This must be exact, because Lightning takes it as `num_training_batches`
+        and stops the epoch there (pytorch_lightning/loops/fit_loop.py:253) —
+        any under-count silently drops the tail of every epoch.
+
+        The count is per-BLOCK, not global. Each block builds its own
+        NeighborLoader, so each block contributes its own partial final batch:
+
+            correct  = sum over blocks of ceil(block_seeds / batch_size)
+            previous = ceil(sum of all seeds / batch_size)
+
+        A sum of ceilings is never smaller than the ceiling of the sum, so the
+        old formula could only ever under-count — by up to (n_blocks - 1)
+        batches per epoch, exact only when K covers every section in one block.
+
+        Uses the SAME block partition `__iter__` will use (both call
+        `_block_row_lists()`, which is deterministic for the current epoch), so
+        the two cannot disagree.
+
+        Cost: zero DB reads in the common case — per-section cell counts come
+        from the manifest. When `input_mask_attr` restricts seeds (train/val
+        splits) the mask is produced by `section_transform` at load time and
+        cannot be known from the manifest, so seed counts are computed once by
+        streaming the sections and then cached per mask attribute.
         """
-        total_seeds = 0
-        for i in range(len(self.dataset)):
-            sec = self.dataset.get(i)
-            n = sec["x_cell_gene_counts"].shape[0]
-            if self.input_mask_attr is not None and self.input_mask_attr in sec:
-                total_seeds += int(sec[self.input_mask_attr].sum())
+        seeds = self._seed_counts()
+        return sum(
+            math.ceil(sum(seeds[r] for r in rows) / self.batch_size)
+            for rows in self._block_row_lists()
+            if sum(seeds[r] for r in rows) > 0
+        )
+
+    def _seed_counts(self) -> List[int]:
+        """
+        Per-section count of cells eligible to be SEED nodes, indexed by DB row.
+
+        No `input_mask_attr` -> every cell is a seed, so this is just the
+        manifest's node counts and costs no I/O.
+
+        With a mask -> the split masks come from `section_transform`, which only
+        exists at load time, so this streams every section once (applying the
+        transform) and caches the result on the instance, keyed by mask
+        attribute. One pass per loader, not one per `len()` call as before.
+        """
+        if self.input_mask_attr is None:
+            return self.dataset.get_node_counts()
+
+        cached = self._seed_count_cache.get(self.input_mask_attr)
+        if cached is not None:
+            return cached
+
+        print(
+            f"KSectionBlockLoader: counting '{self.input_mask_attr}' seeds by "
+            f"streaming {len(self.dataset)} sections once (split masks are "
+            f"produced at load time, so they are not in the manifest). "
+            f"Cached for the rest of this loader's life."
+        )
+        counts: List[int] = []
+        for row in range(len(self.dataset)):
+            view = self._block_view(self.dataset.get(row), row)
+            if self.input_mask_attr in view:
+                counts.append(int(view[self.input_mask_attr].sum()))
             else:
-                total_seeds += n
-        import math
-        return math.ceil(total_seeds / self.batch_size)
+                # Transform produced no such mask -> treat every cell as a
+                # seed, matching NeighborLoader's behaviour for input_nodes=None.
+                counts.append(int(view.num_nodes))
+        self._seed_count_cache[self.input_mask_attr] = counts
+        return counts
 
 
 try:
