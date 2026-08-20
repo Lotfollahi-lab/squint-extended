@@ -22,7 +22,6 @@ Regression coverage, one test per bug fixed:
 
 import json
 import math
-import pickle
 
 import anndata as ad
 import numpy as np

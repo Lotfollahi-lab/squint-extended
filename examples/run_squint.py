@@ -4470,6 +4470,43 @@ def _patch_dual_chl59_2b_1p(
     return cfg
 
 
+def _patch_streaming(
+        cfg: dict,
+        sections_per_block: int = 4,
+        prefetch: bool = True,
+    ) -> dict:
+    """
+    Switch the dataset backend from the collated in-memory blob to on-disk
+    streaming.
+
+    The in-memory backend loads every section into one resident graph; for
+    hst_corpus_110m that object is ~0.6 TB, so it is not an option. Streaming
+    stores one section per SQLite row and holds only `sections_per_block` at a
+    time.
+
+    Requires a blob built with `--build-blob-backend on-disk` (it lives in a
+    separate gold subdir, `on-disk-PyG-dataset-blob/`, so it never collides
+    with an in-memory blob of the same name).
+
+    Parameters
+    ----------
+    sections_per_block:
+        K — how many sections are co-resident and mixed per block. Mini-batches
+        draw seed cells across all K, which is what gives the batch-correction
+        losses cross-section signal; K=1 would put one section per mini-batch
+        and remove that signal entirely. Budget roughly 2xK sections of memory
+        (the concatenating copy coexists with the sources) plus one more block
+        in flight when `prefetch` is on.
+    prefetch:
+        Build the next block on a background thread while the current one
+        trains, so the GPU does not idle at block boundaries.
+    """
+    cfg["dataset"]["backend"] = "on-disk"
+    cfg["datamodule"]["sections_per_block"] = int(sections_per_block)
+    cfg["datamodule"]["prefetch"] = bool(prefetch)
+    return cfg
+
+
 def _patch_dual_mmb20(
         cfg: dict,
         train_adata_ids: Optional[List[int]] = None,
@@ -37227,6 +37264,7 @@ def train(
         initialize_databatch,
         initialize_datamodule,
         initialize_model,
+        initialize_streaming_probe,
     )
 
     # Numerical settings (cudnn.benchmark is now controlled by the
@@ -37400,10 +37438,18 @@ def train(
         _test_ids_is_rest = False
         _test_ids = list(_test_ids_raw)
 
+    # adata_batch_id -> row position. The on-disk blob records the ids in its
+    # manifest, so read them from there: indexing every row would deserialize
+    # the whole corpus (one full section per integer) before training starts.
     _id_to_pos: dict = {}
-    for _pos in range(len(dataset_blob)):
-        _d = dataset_blob[_pos]
-        _id_to_pos[int(_d.adata_batch_id)] = _pos
+    _manifest_ids = getattr(dataset_blob, "section_ids", None)
+    if _manifest_ids:
+        for _pos, _bid in enumerate(_manifest_ids):
+            _id_to_pos[int(_bid)] = _pos
+    else:
+        for _pos in range(len(dataset_blob)):
+            _d = dataset_blob[_pos]
+            _id_to_pos[int(_d.adata_batch_id)] = _pos
     _all_blob_ids = sorted(_id_to_pos.keys())
 
     if _test_ids_is_rest:
@@ -37473,10 +37519,21 @@ def train(
     # the transform pipeline is rebuilt.
     dataset_blob = initialize_dataset_blob(cfg)
 
-    data_batch = initialize_databatch(config=cfg, dataset_blob=dataset_blob)
+    # Streaming backend: `initialize_databatch` would collate every section
+    # into one resident graph, which is precisely what streaming avoids. Use a
+    # one-section probe for the model dims instead, and hand the blob itself to
+    # the datamodule (which dispatches on its type).
+    _streaming = cfg["dataset"].get("backend", "in-memory") == "on-disk"
+    if _streaming:
+        data_batch = initialize_streaming_probe(cfg, dataset_blob)
+        _datamodule_input = dataset_blob
+    else:
+        data_batch = initialize_databatch(config=cfg, dataset_blob=dataset_blob)
+        _datamodule_input = data_batch
+
     datamodule_batch = initialize_datamodule(
         config=cfg,
-        data=data_batch,
+        data=_datamodule_input,
         obs_per_batch_id=getattr(dataset_blob, 'obs_per_batch_id', None),
     )
 
@@ -37496,6 +37553,12 @@ def train(
     # source — it only gets set when FiLM is enabled, which is not the
     # case for adversarial-only or covariate-only variants.
     def _n_distinct_batches(db) -> int:
+        # The streaming probe carries the corpus-wide count explicitly: it is
+        # built from ONE section, so `adata_batch_ids.max()` there would only
+        # ever see that section's own batch.
+        explicit = getattr(db, "n_distinct_batches", None)
+        if explicit is not None:
+            return int(explicit)
         return int(db.adata_batch_ids.max().item()) + 1
 
     # NicheCompass-style decoder covariate (concat-based batch correction).

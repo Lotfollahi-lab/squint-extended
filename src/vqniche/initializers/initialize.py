@@ -341,6 +341,38 @@ def initialize_dataset_blob(
     root_data_dir = config['dataset']['root_data_dir']
     dataset_name = config['dataset']['dataset_name']
 
+    # `backend` selects the storage layer. 'in-memory' (default) collates every
+    # section into one resident graph; 'on-disk' keeps one section per SQLite
+    # row and streams them, which is the only option for corpora that do not
+    # fit in RAM (hst_corpus_110m is ~0.6 TB collated).
+    backend = config['dataset'].get('backend', 'in-memory')
+    if backend not in ('in-memory', 'on-disk'):
+        raise ValueError(
+            f"config['dataset']['backend'] must be 'in-memory' or 'on-disk'; "
+            f"got {backend!r}."
+        )
+
+    if backend == 'on-disk':
+        # The streaming loader applies these transforms PER SECTION, so hand
+        # them over rather than attaching them to the dataset: attaching would
+        # make `get(idx)` transform every fetched row, including the metadata
+        # reads that only want cell counts.
+        #
+        # NOTE the composed list is passed through unchanged, INCLUDING any
+        # gene-count transforms. KSectionBlockLoader rejects the ones that must
+        # decide globally (SubsetHVG) rather than letting them silently pick a
+        # different gene set per section — see
+        # `_reject_global_scope_transforms`.
+        from ..dataset.on_disk_dataset import OnDiskDatasetBlob
+
+        dataset_blob = OnDiskDatasetBlob(
+                            name=dataset_name,
+                            data_directory_path=root_data_dir,
+                        )
+        # Consumed by initialize_datamodule; not applied by the dataset itself.
+        dataset_blob.section_transform = transforms
+        return dataset_blob
+
     # initialize pytorch geometric dataset blob stored at:
     # root_data_dir / 'gold' / 'in-memory-PyG-dataset-blob' / dataset_name / 'dataset_blob.pt'
     dataset_blob = InMemoryDatasetBlob(
@@ -528,6 +560,53 @@ def initialize_databatch(
     return data_batch
 
 
+def initialize_streaming_probe(
+        config: Dict,
+        dataset_blob,
+    ) -> Data:
+    """
+    Derive the shapes/dims the model constructor needs, from ONE section.
+
+    `initialize_databatch` cannot be used with the streaming backend: it
+    collates every section into a single `Batch`, which is exactly the
+    allocation streaming exists to avoid. But `train()` reads a handful of
+    scalars off that object (`num_features`, `num_classes`, the conditioning
+    dims, and the number of distinct batches) before building the model.
+
+    All of those except the batch count are properties of the feature/label
+    layout, which is identical across sections — the blob enforces one shared
+    gene panel and one label vocabulary at build time. So one transformed
+    section is enough. The batch count must span the WHOLE corpus, so it comes
+    from the manifest's batch labels and is attached as `n_distinct_batches`.
+
+    Returns a single-section `Data` intended ONLY for dimension lookup, never
+    for training.
+    """
+    section_transform = getattr(dataset_blob, 'section_transform', None)
+    probe = dataset_blob.get(0)
+    if section_transform is not None:
+        probe = section_transform(probe)
+
+    # Span the corpus, not this section: a single section has one batch label.
+    n_batches = len(dataset_blob.batch_label_to_dense())
+    probe.n_distinct_batches = n_batches
+
+    # `_n_distinct_batches` in the driver falls back to
+    # `adata_batch_ids.max() + 1`; give it a consistent per-cell vector too so
+    # either path agrees.
+    label = dataset_blob.get_batch_labels()[0]
+    dense = dataset_blob.batch_label_to_dense()[label]
+    n_cells = probe.x.shape[0] if getattr(probe, 'x', None) is not None else probe.num_nodes
+    probe.adata_batch_ids = torch.full((n_cells,), int(dense), dtype=torch.long)
+
+    print(
+        f"Streaming probe: num_features={probe.num_features}, "
+        f"num_classes={getattr(probe, 'num_classes', None)}, "
+        f"n_distinct_batches={n_batches} (over {len(dataset_blob)} sections)"
+    )
+    return probe
+
+
 def initialize_datamodule(
         config: Dict,
         data: Data,
@@ -541,6 +620,30 @@ def initialize_datamodule(
     sampler_params = config['datamodule']['sampler_params']
 
     inference_params = config['datamodule']['inference_params']
+
+    # Streaming backend: `data` is the OnDiskDatasetBlob itself, not a
+    # collated Data, so wrap it in the section-mixing streaming DataModule.
+    from ..dataset.on_disk_dataset import OnDiskDatasetBlob, OnDiskStreamingDataModule
+
+    if isinstance(data, OnDiskDatasetBlob):
+        graph_params = config['dataset']['graph_params']
+        edge_index_name = set_edge_index_name(
+                            spatial_key=graph_params['spatial_key'],
+                            delaunay=graph_params['delaunay'],
+                            n_neighs=graph_params['n_neighs'],
+                            radius=graph_params['radius'],
+                        )
+        dm_cfg = config['datamodule']
+        return OnDiskStreamingDataModule(
+                    dataset=data,
+                    edge_index_name=edge_index_name,
+                    sections_per_block=dm_cfg.get('sections_per_block', 4),
+                    batch_size=loader_params.get('batch_size', 256),
+                    num_neighbors=sampler_params.get('num_neighbors', [8]),
+                    section_transform=getattr(data, 'section_transform', None),
+                    num_workers=loader_params.get('num_workers', 0),
+                    prefetch=dm_cfg.get('prefetch', True),
+                )
 
     datamodule_batch = InMemoryDataModule(
                             data=data,

@@ -71,7 +71,6 @@ from typing import Callable, List, Optional, Iterator, Tuple
 
 import anndata as ad
 import pandas as pd
-import scanpy as sc
 import torch
 from torch_geometric.data import Data, OnDiskDataset
 
@@ -730,6 +729,9 @@ class KSectionBlockLoader:
         self.batch_label_to_dense = batch_label_to_dense
         self.unknown_batch_label_dense_id = int(unknown_batch_label_dense_id)
         self.prefetch = bool(prefetch)
+        # Per-thread SQLite read handles for prefetching; see `_fetch_section`.
+        import threading as _threading
+        self._thread_local = _threading.local()
         self.loader_kwargs = dict(loader_kwargs or {})
         self._epoch = 0
         # {mask attr -> per-section seed counts}. Populated on first
@@ -868,7 +870,7 @@ class KSectionBlockLoader:
             return
         labels = self.dataset.get_batch_labels()
         ids, unseen = [], []
-        for row, n in zip(rows, sizes):
+        for row, n in zip(rows, sizes, strict=True):
             label = str(labels[row])
             known = label in self.batch_label_to_dense
             dense = (self.batch_label_to_dense[label] if known
@@ -881,6 +883,45 @@ class KSectionBlockLoader:
         # embedding rather than an arbitrary reference batch.
         block.adata_batch_ids_unseen_mask = torch.cat(unseen)
 
+    # -- section fetch (thread-aware) -------------------------------------- #
+    def _fetch_section(self, row: int) -> Data:
+        """
+        Fetch one section by DB row.
+
+        Every read goes through here so prefetching has a single place to be
+        thread-safe. `sqlite3` connections are bound to the thread that
+        created them (`check_same_thread=True` by default, and PyG's
+        `SQLiteDatabase.connect()` does not override it), so a prefetch thread
+        calling the shared handle raises
+
+            sqlite3.ProgrammingError: SQLite objects created in a thread can
+            only be used in that same thread
+
+        Rebinding the shared handle is not an option — the main thread also
+        reads (`_seed_counts`, `to_concatenated`), so whichever thread
+        reconnected last would break the other. Instead each non-main thread
+        opens its OWN read handle to the same file, cached in thread-local
+        storage. Concurrent readers on one SQLite file are fine.
+
+        `deserialize` is the dataset's, so rows decode identically either way.
+        """
+        import threading
+
+        if threading.current_thread() is threading.main_thread():
+            return self.dataset.get(row)
+
+        db = getattr(self._thread_local, "db", None)
+        if db is None:
+            from torch_geometric.data.database import SQLiteDatabase
+
+            db = SQLiteDatabase(
+                path=self.dataset.db.path,
+                name=self.dataset.db.name,
+                schema=self.dataset.schema,
+            )
+            self._thread_local.db = db
+        return self.dataset.deserialize(db.get(row))
+
     # -- iteration --------------------------------------------------------- #
     def _build_block(self, block_rows: List[int]):
         """
@@ -892,7 +933,7 @@ class KSectionBlockLoader:
         """
         from torch_geometric.data import Batch
 
-        views = [self._block_view(self.dataset.get(r), r) for r in block_rows]
+        views = [self._block_view(self._fetch_section(r), r) for r in block_rows]
         sizes = [int(v.num_nodes) for v in views]
         block = Batch.from_data_list(views)              # edges offset per section
         # Must come AFTER collation — see `_stamp_batch_ids` for why.
@@ -934,6 +975,15 @@ class KSectionBlockLoader:
                 q.put(exc)
             else:
                 q.put(_DONE)
+            finally:
+                # Release this thread's private read handle.
+                db = getattr(self._thread_local, "db", None)
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+                    self._thread_local.db = None
 
         thread = threading.Thread(target=producer, daemon=True)
         thread.start()
@@ -1037,7 +1087,7 @@ class KSectionBlockLoader:
         )
         counts: List[int] = []
         for row in range(len(self.dataset)):
-            view = self._block_view(self.dataset.get(row), row)
+            view = self._block_view(self._fetch_section(row), row)
             if self.input_mask_attr in view:
                 counts.append(int(view[self.input_mask_attr].sum()))
             else:
