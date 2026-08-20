@@ -826,22 +826,32 @@ def make_dataset_blob_config() -> dict:
             "graph_kwargs": {
                 "coord_type": "generic",
                 "spatial_key": "spatial",     # adata.obsm['spatial']
-                # Build the spatial k-NN graph at MULTIPLE k values so
-                # variants can select between them at training time via
-                # `cfg.dataset.graph_params.n_neighs`. The default
-                # training config picks k=8 (the historic SQUINT
-                # default); +knn12 / +knn6 variants select k=12 / k=6
-                # from the same pre-built blob. Rebuilding the blob is
-                # required ONCE to populate the extra graphs:
+                # Build the spatial k-NN graph at the k values variants
+                # actually select at training time via
+                # `cfg.dataset.graph_params.n_neighs`. k=8 is the historic
+                # SQUINT default; k=16 is used by the +knn16 variants.
+                # Every extra k costs ~14 GB of edge_index over a 110M-cell
+                # corpus and is dead weight unless a variant selects it, so
+                # this list is deliberately minimal — add a k here and
+                # rebuild only when a variant needs it:
                 #   python examples/run_squint.py --build-blob
-                "n_neighs_list": [6, 8, 12, 16, 20, 24],  # SQUINT default 8-NN + knn ablations
+                "n_neighs_list": [8, 16],
                 "radius_list": None,
                 "include_self_loop": True,
-                "k": {
-                    # Spectral embeddings — cheap, optional.
-                    "lm_eigvecs": 128,
-                    # DeepWalk / GOSH skipped (require external binaries).
-                },
+                # NO Laplacian spectral embeddings. Every variant trains
+                # with feature_names=["cell_gene_counts"] and never reads
+                # U_lm_eigvecs (the only consumer is the optional
+                # `spatial_prior_feature` / conditioning path in
+                # transforms.py, which no config selects). At 128 eigvecs
+                # per graph that is 6*128*4 = 3072 bytes PER CELL, i.e.
+                # ~338 GB over hst_corpus_110m plus an eigsh(k=128) solve
+                # per graph per section — all of it written, re-read, and
+                # ignored. Because the eigenvector table is one row per
+                # cell it also survives the streaming loader's node-attr
+                # filter and is copied into every mini-batch.
+                # Re-add {"lm_eigvecs": N} and rebuild only if a future
+                # variant genuinely consumes spectral features.
+                "k": {},
             },
             "data_directory_path": str(DATA_ROOT),
             "pre_transform": None,
