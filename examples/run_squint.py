@@ -175,13 +175,19 @@ DATA_ROOT = Path("/lustre/scratch126/cellgen/lotfollahi/DATASETS/")
 # Dataset name = subfolder name under  silver/
 DATASET_NAME = "hst_corpus_110m"
 
-# Path to your local clones of the two repos on the cluster
-REPRO_REPO = Path("/nfs/team361/dj16/squint-reproducibility")
-SQUINT_PKG = Path("/nfs/team361/dj16/squint")
+# Path to your local clones of the two repos on the cluster.
+# These are per-user and edited in place (see the header note). Pointing them at
+# THIS workspace rather than another user's home, so `SQUINT_PKG` (prepended to
+# sys.path below) and the reproducibility scripts resolve against the checkout
+# actually being run.
+_WORKSPACE = Path("/lustre/scratch126/cellgen/lotfollahi/hk11/squint_project")
+REPRO_REPO = _WORKSPACE / "github" / "squint-reproducibility"
+SQUINT_PKG = _WORKSPACE / "squint"
 
 # Single root for everything we produce: configs, wandb logs, checkpoints,
-# inference outputs.
-ARTIFACTS_DIR = Path("/nfs/team361/dj16/squint-reproducibility/artifacts")
+# inference outputs. Deliberately OUTSIDE `squint/` so multi-GB run outputs can
+# never be staged into the repo.
+ARTIFACTS_DIR = _WORKSPACE / "artifacts"
 
 # Where this example writes its tailored config files.
 CONFIG_OUT_DIR = ARTIFACTS_DIR / "configs"
@@ -572,7 +578,11 @@ def make_dataset_blob_config_smb1_20b() -> dict:
 
 
 def _make_spatch_blob_config(name: str, description: str,
-                             label_names: Optional[List[str]] = None) -> dict:
+                             label_names: Optional[List[str]] = None,
+                             *,
+                             data_directory_path: str = "/nfs/team361/sb75/DATASETS",
+                             n_neighs_list: Optional[List[int]] = None,
+                             k: Optional[dict] = None) -> dict:
     """
     Shared body for all `spatch_*_1p` blob configs (and reusable for other
     silver datasets with the same shape). Differs from
@@ -591,9 +601,22 @@ def _make_spatch_blob_config(name: str, description: str,
     to register a dataset that keeps its labels under different column names
     (e.g. the tonsil / lymph-node atlases:
     ["cell_types=cell_type_annotation", "niche_types=niche_annotation"]).
+
+    `data_directory_path`, `n_neighs_list` and `k` are keyword-only with the
+    historical values as defaults, so the seven existing callers are unchanged.
+    Override them for datasets under a different root, or to skip work nothing
+    consumes: `k={}` drops the Laplacian eigenvectors, which cost
+    n_graphs * 128 * 4 bytes PER CELL and are read by no variant
+    (feature_names is always ["cell_gene_counts"]; the only consumer is the
+    optional conditioning branch in transforms.py, which no config selects).
+    See the rationale on `make_dataset_blob_config`.
     """
     if label_names is None:
         label_names = ["cell_types=annotation", "niche_types=spatial_cluster"]
+    if n_neighs_list is None:
+        n_neighs_list = [8, 16, 24]
+    if k is None:
+        k = {"lm_eigvecs": 128}
     return {
         "experiment": {
             "name": "in_memory_dataset_blob",
@@ -609,15 +632,13 @@ def _make_spatch_blob_config(name: str, description: str,
                 # 8 = SQUINT default; 16 = knn16 base; 24 = knn24
                 # ablation in the s51 sweep. Pre-built so no rebuild
                 # per knn variant.
-                "n_neighs_list":      [8, 16, 24],
+                "n_neighs_list":      list(n_neighs_list),
                 "radius_list":        None,
                 "include_self_loop":  True,
                 "batch_key":          "batch",
-                "k": {
-                    "lm_eigvecs": 128,
-                },
+                "k": dict(k),
             },
-            "data_directory_path": "/nfs/team361/sb75/DATASETS",
+            "data_directory_path": data_directory_path,
             "pre_transform": None,
             "pre_filter":    None,
             "overwrite":     True,
@@ -727,6 +748,42 @@ def make_dataset_blob_config_xhs_3b() -> dict:
                     "(batch 11/19/32), 1000-gene panel.",
         label_names=["cell_types=new_annotation",
                      "niche_types=niche_type"],
+    )
+
+
+def make_dataset_blob_config_xhs1000_39b() -> dict:
+    """
+    R0 target: Xenium human skin, ALL 39 sections of the xhs1000-39b_1p panel.
+
+    The first real scale-up for the streaming backend -- 39 sections / 519,058
+    cells / one 4,948-gene panel, versus the paper's largest run at 6 sections.
+    Deliberately single-panel, so it tests "does streaming scale?" without
+    entangling the open cross-panel question.
+
+    Silver already exists at `<DATA_ROOT>/silver/xhs1000-39b_1p` and needs no
+    prep: verified to carry `uns['batch']` (batch0..batch38, unique), and
+    `obs['cell_type']` + `obs['NICHE_NAMES']`. It is byte-equivalent to the
+    corpus copy under `hst_corpus_110m/xhs1000-39b_1p` (same filenames, same
+    4,948-gene panel). Gold lands in the on-disk subdir, which is distinct from
+    the pre-existing `in-memory-PyG-dataset-blob/xhs1000-39b_1p`, so that blob
+    is untouched.
+
+    BOTH label sets are registered so the paper's niche AND cell-type
+    identification metrics (NMI / ARI) are computable, not just reconstruction.
+
+    `k={}` -- no Laplacian eigenvectors, for the reason spelled out in
+    `make_dataset_blob_config`: nothing reads them and they cost
+    n_graphs * 128 * 4 bytes per cell. `n_neighs_list=[8, 16]` covers the
+    SQUINT default k=8 and the knn16 variants; the reference recipe uses 16.
+    """
+    return _make_spatch_blob_config(
+        name="xhs1000-39b_1p",
+        description="xhs1000-39b_1p -- Xenium human skin, 39 sections, "
+                    "4,948-gene panel. R0 streaming scale-up target.",
+        label_names=["cell_types=cell_type", "niche_types=NICHE_NAMES"],
+        data_directory_path=str(DATA_ROOT),
+        n_neighs_list=[8, 16],
+        k={},
     )
 
 
@@ -4659,6 +4716,8 @@ def _patch_dual_spatch_subset(
         test_batch_idx=None,
         batch_size: int = 512,
         edge_sampling_ratio: float = 1.0,
+        *,
+        root_data_dir: str = "/nfs/team361/sb75/DATASETS",
     ) -> dict:
     """
     Generic dataset-switch helper for the spatch tissue-specific subsets
@@ -4687,6 +4746,10 @@ def _patch_dual_spatch_subset(
         to do whole-section holdout.
     batch_size, edge_sampling_ratio
         Memory tuning; defaults match the s51 spine.
+    root_data_dir
+        Keyword-only, defaulting to the historical hardcoded value so the
+        existing spatch wrappers are unchanged. Override for datasets living
+        under a different DATASETS root (e.g. the R0 skin target).
     """
     train_batch_idx = list(train_batch_idx) if train_batch_idx else []
     if test_batch_idx is None:
@@ -4701,7 +4764,7 @@ def _patch_dual_spatch_subset(
 
     cfg["dataset"]["dataset_name"]   = dataset_name
     cfg["dataset"]["dataset_tag"]    = dataset_name
-    cfg["dataset"]["root_data_dir"]  = "/nfs/team361/sb75/DATASETS"
+    cfg["dataset"]["root_data_dir"]  = root_data_dir
     cfg["dataset"]["adata_batch_idx"] = []
 
     cfg["dataset"]["train_transform_params"] = {
@@ -4725,6 +4788,38 @@ def _patch_dual_spatch_subset(
 
     cfg["trainer"]["monitor"] = "val_loss"
     return cfg
+
+
+def _patch_dual_xhs1000_39b(
+        cfg: dict,
+        train_batch_idx: Optional[List[int]] = None,
+        test_batch_idx=None,
+        batch_size: int = 512,
+        edge_sampling_ratio: float = 1.0,
+    ) -> dict:
+    """
+    R0 dataset switch: xhs1000-39b_1p (Xenium human skin, 39 sections).
+
+    Thin wrapper over `_patch_dual_spatch_subset` -- the holdout mechanics
+    (SpatialBatchSplit whole-section test holdout plus a 10% in-section cell
+    split for val/early-stopping) are identical, only the dataset and root
+    differ.
+
+    `train_batch_idx` / `test_batch_idx` are `adata_batch_id` VALUES (the
+    integer parsed out of `uns['batch']`, i.e. batchN -> N), NOT positions in
+    the sorted blob. `SpatialBatchSplit` matches `data.adata_batch_id` against
+    these lists, so passing positions silently produces no masks for any
+    section and then fails with `KeyError: 'train_mask'` at collate. Empty
+    `train_batch_idx` means "every section not held out".
+    """
+    return _patch_dual_spatch_subset(
+        cfg, dataset_name="xhs1000-39b_1p",
+        train_batch_idx=train_batch_idx,
+        test_batch_idx=test_batch_idx,
+        batch_size=batch_size,
+        edge_sampling_ratio=edge_sampling_ratio,
+        root_data_dir=str(DATA_ROOT),
+    )
 
 
 def _patch_dual_spatch_ov(
@@ -5157,7 +5252,119 @@ def _patch_quick(
     return cfg
 
 
+# ---------------------------------------------------------------------------
+# R0: the paper-faithful reference recipe, as a named stack
+# ---------------------------------------------------------------------------
+
+def _r0_reference_stack() -> dict:
+    """
+    The reference recipe, applied in order, written sequentially.
+
+    Identical to the composition inside
+    `s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+
+    sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+
+    contrastWB-w10-k5+...`, but as a sequence of assignments rather than a
+    fourteen-deep nest whose arguments trail after the closing parens. Same
+    patches, same order, same arguments -- verified against that entry.
+
+    Everything here is machinery the paper relies on (Eq. 6): dual RVQ at
+    (30, 90) per branch, the decoder section covariate as the batch-correction
+    lever, the within-section adjacency BCE, the within-section contrastive
+    term and the cell-branch codebook-diversity regulariser. Deliberately NO
+    adversarial head -- Eq. 6 does not have one.
+
+    Reusing this keeps R0's numbers comparable with the existing reference runs.
+    """
+    cfg = _BD()
+    cfg = _patch_dual_rvq(cfg, branch="niche", codebook_sizes=(30, 90))
+    cfg = _patch_dual_rvq(cfg, branch="cell", codebook_sizes=(30, 90))
+    cfg = _patch_dual_decoder_covariate(cfg)
+    cfg = _patch_dual_encoder_deeper(cfg, hidden_channels=[400, 400, 256])
+    cfg = _patch_dual_decoupled_encoders(cfg)
+    cfg = _patch_dual_decoder_width(cfg, hidden_channels=[32])
+    cfg = _patch_dual_graph_knn(cfg, n_neighs=16)
+    cfg = _patch_dual_sampler_neighbors(cfg, num_neighbors=[16])
+    cfg = _patch_dual_attr_recon_weight(cfg, weight=1.0)
+    cfg = _patch_dual_batch_lr(cfg, batch_size=512, lr=7e-4)
+    cfg = _patch_dual_no_batch_int(cfg)
+    cfg = _patch_dual_adj_within_section_only(cfg, enabled=True)
+    cfg = _patch_dual_contrastive_cell_within_batch(
+        cfg, wt_contrastive_cell=10.0, k_pos=5, temperature=0.1)
+    cfg = _patch_dual_codebook_diversity(
+        cfg, weight=10.0, temperature=100.0, branch="cell")
+    return cfg
+
+
+# R0 whole-section test holdout, as `adata_batch_id` VALUES (batchN -> N), NOT
+# blob positions -- SpatialBatchSplit matches data.adata_batch_id against these.
+# Chosen to span the size distribution of the 39 sections
+# (2,351 / 5,706 / 13,487 / 32,573 cells = 54,117, i.e. 10.4% of 519,058).
+# The remaining 35 sections train; val is a 10% in-section cell split.
+_R0_TEST_BATCHES = [3, 7, 0, 22]
+
+
 VARIANTS: dict = {
+    # ---- R0: first real streaming scale-up (39 sections, 519,058 cells) ----
+    "smoke-test+stream+xhs1000-39b_1p": {
+        "description": (
+            "1-epoch end-to-end pipeline test of the STREAMING path through the "
+            "real driver, on the R0 dataset (xhs1000-39b_1p, 39 Xenium human "
+            "skin sections, one 4,948-gene panel). Reference recipe + on-disk "
+            "streaming, capped at 1 epoch with a narrow GNN and small batch. "
+            "Run this before stream+r0: it is the first thing to exercise "
+            "`--train --variant` on the streaming backend at all."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhs1000-39b_1p dataset, test_batches=[3,7,0,22]",
+            "+streaming(sections_per_block=2)",
+            "+quick(max_epochs=1, batch_size=64, narrow GNN)",
+        ],
+        "build": lambda: _patch_streaming(
+            _patch_quick(
+                _patch_dual_xhs1000_39b(
+                    _r0_reference_stack(),
+                    test_batch_idx=list(_R0_TEST_BATCHES),
+                    batch_size=64,
+                ),
+                max_epochs=1, batch_size=64,
+            ),
+            sections_per_block=2,
+        ),
+    },
+    "stream+r0+xhs1000-39b_1p": {
+        "description": (
+            "R0 -- the first real scale-up of the streaming backend. "
+            "xhs1000-39b_1p: 39 Xenium human skin sections, 519,058 cells, one "
+            "4,948-gene panel, so it tests 'does streaming scale?' without "
+            "entangling the open cross-panel question. ~6x the paper's largest "
+            "run (6 sections). Paper-faithful reference recipe throughout; the "
+            "only additions are the dataset switch and the on-disk backend. "
+            "Whole-section test holdout of 4 sections spanning the size range "
+            "(10.4% of cells), 35 sections training, 10% in-section cell split "
+            "for val / early stopping."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhs1000-39b_1p dataset, test_batches=[3,7,0,22]",
+            "+streaming(sections_per_block=8)",
+        ],
+        "build": lambda: _patch_streaming(
+            _patch_dual_xhs1000_39b(
+                _r0_reference_stack(),
+                test_batch_idx=list(_R0_TEST_BATCHES),
+                batch_size=512,
+            ),
+            # 8 sections resident. Largest R0 section is 0.64 GB dense, so ~5 GB,
+            # ~10 GB at the 2xK concatenation peak plus one prefetch block. K=8
+            # gives the contrastive / covariate terms far more cross-section
+            # signal than the default 4. Sweep {4, 8, 16} in Phase 2 proper.
+            sections_per_block=8,
+        ),
+    },
+
     # ---- Smoke test (1 epoch end-to-end) ----------------------------------
     "smoke-test+mmb0-1b_smb1-1b_1p": {
         "description": (
@@ -37062,6 +37269,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
     elif dataset == "squint_vht":
         cfg = make_dataset_blob_config_squint_vht()
         cfg_path = CONFIG_OUT_DIR / "build_blob_squint_vht.yaml"
+    elif dataset == "xhs1000-39b_1p":
+        cfg = make_dataset_blob_config_xhs1000_39b()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_xhs1000-39b_1p.yaml"
     elif dataset == "xhs1000-3b_1p":
         cfg = make_dataset_blob_config_xhs_3b()
         cfg_path = CONFIG_OUT_DIR / "build_blob_xhs1000-3b_1p.yaml"
@@ -39338,6 +39548,7 @@ def main():
                        "squint_hln_svg2k",
                        "squint_vht",
                        "xhs1000-3b_1p",
+                       "xhs1000-39b_1p",
                    ],
                    help="Which dataset to build (default: "
                         "mmb0-1b_smb1-1b_1p — MERFISH + STARmap mouse "
