@@ -39472,7 +39472,7 @@ def main():
              "from the base config (currently 'bf16-mixed' — see the "
              "base-config trainer block for the bf16 rationale). "
              "Common values: 'bf16-mixed' (default-on; Ampere/Hopper "
-             "20-40% wall-clock saving with no GradScaler needed), "
+             "20-40%% wall-clock saving with no GradScaler needed), "
              "'32-true' (legacy fp32, slowest but most reproducible), "
              "'16-mixed' (fp16 + GradScaler — validate against the "
              "adversarial alpha schedule before adopting). Affects the "
@@ -39530,7 +39530,7 @@ def main():
     p.add_argument(
         "--deterministic", action="store_true",
         help="Force `Trainer(deterministic=True)` (default is False, "
-             "with `benchmark=True` for ~5-10% speedup). Pass this for "
+             "with `benchmark=True` for ~5-10%% speedup). Pass this for "
              "publication-final runs or A/B-vs-historic regression "
              "diagnostics where bit-exact within-seed reproducibility "
              "matters more than wall-clock.",
