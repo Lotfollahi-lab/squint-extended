@@ -875,8 +875,16 @@ def make_train_config_poc() -> dict:
     Right-sized Graph VQ-VAE baseline for 431-gene / ~100k-cell spatial data.
 
     Design choices:
-    - No HVG subsetting (`apply_hvg=False`): the gene panel is already curated;
-      set apply_hvg=True (and adjust n_hvg) for larger multi-panel datasets.
+    - No HVG subsetting (`apply_hvg=False`): the gene panel is already curated.
+      NOTE HVG is NOT a way to handle multiple gene panels, despite what an
+      earlier version of this note claimed. A genuinely multi-panel input never
+      reaches HVG at all -- the blob build requires an identical `.var` across
+      sections and raises first (in_memory_dataset_blob.py:243-263). And on
+      same-panel input, `SubsetHVG` runs PER SECTION (PyG applies the dataset
+      transform in `Dataset.__getitem__`), so with >1 section each section picks
+      its own gene set and column j stops meaning the same gene. That is now
+      refused by `initialize_dataset_blob` rather than silently corrupting
+      features; see dataset/transform_scope.py.
     - Encoder: 431 -> MLP[400,256] -> GNN[128, 1 layer, 8-NN] -> VQ[30 codes].
       Latent dim = 128 keeps the VQ cosine-similarity manifold tractable for
       30 codes.  A 30-code codebook with 400-dim embeddings is over-parametrised
@@ -932,10 +940,14 @@ def make_train_config_poc() -> dict:
             #   idx 0 -> batch15 (STARmap+)   idx 1 -> batch82 (MERFISH)
             "adata_batch_idx": [0, 1],
             "root_data_dir": str(DATA_ROOT),
-            # HVG subsetting — OFF for this dataset (431 curated genes).
-            # Switch apply_hvg=True and set n_hvg to a smaller number when
-            # running on larger multi-panel datasets where all genes are NOT
-            # equally informative.
+            # HVG subsetting — OFF for this dataset (431 curated genes), and
+            # off everywhere: `apply_hvg=True` is REFUSED whenever more than one
+            # section is loaded, because `SubsetHVG` is applied per section and
+            # would select a different gene set per section (see
+            # dataset/transform_scope.py). It is also not a route to multi-panel
+            # support: mismatched panels are rejected earlier, by the blob build.
+            # Enabling it needs a corpus-wide gene set chosen once and the same
+            # indices applied to every section, which does not exist yet.
             "apply_hvg": False,
             "n_hvg": 2000,                    # only used when apply_hvg=True
             "gene_count_transform_names": [], # populated by train() based on apply_hvg

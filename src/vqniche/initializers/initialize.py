@@ -14,6 +14,7 @@ from pytorch_lightning.loggers import WandbLogger
 
 from ..preprocessors.graph_constructors import set_edge_index_name
 from ..dataset.transforms import SetExperimentDataKeys, init_gene_count_transforms, init_train_transforms
+from ..dataset.transform_scope import _reject_global_scope_transforms
 from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 from ..dataloaders.in_memory_datamodule import InMemoryDataModule
 from ..models.vanilla_mlp import VanillaMLP
@@ -380,6 +381,34 @@ def initialize_dataset_blob(
                         data_directory_path=root_data_dir,
                         transform=transforms
                     )
+
+    # Refuse transforms that must decide once for the whole corpus but would run per
+    # section. `transform=` above is applied by PyG in `Dataset.__getitem__`
+    # (torch_geometric/data/dataset.py:291), and `initialize_databatch` reads sections with
+    # `[dataset_blob[idx] for idx in adata_batch_idx]` — so the transform has already run on
+    # each section BEFORE collation. Collation does NOT make a per-section choice global; it
+    # simply concatenates, which is why HVG applied here silently scrambles which gene each
+    # feature column holds. The streaming loader rejects the same thing at construction; this
+    # keeps the two backends consistent rather than leaving the older path unguarded.
+    #
+    # Safe to raise here: the transform is attached at construction but only APPLIED on
+    # __getitem__, whose first call is in initialize_databatch, so nothing has been
+    # transformed yet.
+    #
+    # Only >1 section is a problem — with a single section, per-section selection is
+    # trivially self-consistent. Count exactly rather than treating -1 as "many", so a
+    # legitimate single-section blob with HVG on is not falsely rejected.
+    _idx = config['dataset'].get('adata_batch_idx', -1)
+    if isinstance(_idx, int):
+        n_sections = len(dataset_blob) if _idx == -1 else 1
+    else:
+        n_sections = len(_idx)
+    if n_sections > 1:
+        _reject_global_scope_transforms(
+            transforms,
+            where=(f"the composed dataset transform for {dataset_name!r} "
+                   f"({n_sections} sections will be loaded)"),
+        )
 
     return dataset_blob
 

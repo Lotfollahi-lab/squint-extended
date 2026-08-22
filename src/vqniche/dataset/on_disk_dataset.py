@@ -97,81 +97,25 @@ from .in_memory_dataset_blob import InMemoryDatasetBlob
 _NON_TENSOR_NODE_ATTRS = ("cell_id", "obs_batch")
 
 
-# Transforms that must make ONE decision for the whole corpus and are
-# therefore invalid as a per-section `section_transform`.
-#
-# `SubsetHVG` picks the top-n highly variable genes from whatever Data it is
-# handed (dataset/transforms.py:516-530). Applied per section it selects a
-# DIFFERENT gene set per section; the resulting `x` tensors all have width
-# n_genes, so concatenation succeeds without complaint even though column j
-# means a different gene in different sections. The model has one weight per
-# input column shared across all sections, so that column is then trained on
-# two unrelated genes at once. Nothing raises.
-#
-# NOTE this is NOT a streaming-only defect. The in-memory path has the same
-# scoping: `initialize_dataset_blob` hands the composed transform to the
-# dataset as `transform=`, and PyG applies it in `Dataset.__getitem__`
-# (torch_geometric/data/dataset.py:291) — i.e. PER SECTION, before
-# `initialize_databatch` collates. So enabling HVG there would scramble
-# columns in exactly the same way. It has never fired only because
-# `apply_hvg` defaults to False (the gene panels are already curated), not
-# because collation protected it.
-#
-# Fixing it properly means deciding the gene set once, over the whole corpus,
-# and applying the SAME indices to every section. Until that exists, refuse
-# the transform here rather than silently corrupting features. That makes the
-# streaming loader stricter than the in-memory path, deliberately: it is the
-# path being built for multi-panel corpora, where HVG is the documented
-# recommendation (run_squint.py:868-869).
-_GLOBAL_SCOPE_TRANSFORMS = {
-    "SubsetHVG": (
-        "picks highly variable genes from the Data it is given, so per-section "
-        "application selects a different gene set per section and column j "
-        "stops meaning the same gene across the corpus"
-    ),
-}
+# Transform-scope guard. Lives in `transform_scope` because BOTH backends apply their
+# composed transform per section, so the in-memory path
+# (initializers/initialize.py) needs the identical check —
+# see that module for the full rationale. Re-exported here so
+# `KSectionBlockLoader` and existing importers are unaffected.
+from .transform_scope import (  # noqa: E402  (kept next to its usage)
+    _GLOBAL_SCOPE_TRANSFORMS,
+    _iter_transforms,
+    _reject_global_scope_transforms,
+)
 
-
-def _iter_transforms(transform):
-    """Yield a transform and, for a Compose, each of its members."""
-    if transform is None:
-        return
-    inner = getattr(transform, "transforms", None)
-    if inner is not None:
-        for t in inner:
-            yield from _iter_transforms(t)
-    else:
-        yield transform
-
-
-def _reject_global_scope_transforms(transform) -> None:
-    """
-    Raise if `transform` contains a transform that must decide globally.
-
-    Converts a silent feature-scrambling bug into an immediate, explanatory
-    error. See `_GLOBAL_SCOPE_TRANSFORMS`.
-    """
-    offenders = [
-        (type(t).__name__, _GLOBAL_SCOPE_TRANSFORMS[type(t).__name__])
-        for t in _iter_transforms(transform)
-        if type(t).__name__ in _GLOBAL_SCOPE_TRANSFORMS
-    ]
-    if not offenders:
-        return
-    lines = "\n".join(f"  - {name}: {why}" for name, why in offenders)
-    raise ValueError(
-        "section_transform contains transform(s) that must make a single "
-        "decision for the whole corpus and cannot be applied per section:\n"
-        f"{lines}\n"
-        "These would not raise at runtime — the shapes stay consistent while "
-        "the meaning of each feature column diverges between sections — so "
-        "they are rejected here instead.\n"
-        "For highly variable genes: either train on the full panel "
-        "(apply_hvg=False, the default), or select the gene set once and "
-        "apply the same indices to every section. Split transforms "
-        "(RandomNodeSplit, SpatialBatchSplit) and SetExperimentDataKeys are "
-        "per-section by design and remain fine here."
-    )
+__all__ = [
+    "OnDiskDatasetBlob",
+    "KSectionBlockLoader",
+    "OnDiskStreamingDataModule",
+    "_GLOBAL_SCOPE_TRANSFORMS",
+    "_iter_transforms",
+    "_reject_global_scope_transforms",
+]
 
 
 def _section_batch_label(section: Data) -> str:
@@ -775,7 +719,7 @@ class KSectionBlockLoader:
         self.seed = seed
         self.input_mask_attr = input_mask_attr
         # Fail fast on transforms that cannot be applied per section.
-        _reject_global_scope_transforms(section_transform)
+        _reject_global_scope_transforms(section_transform, where="section_transform")
         self.section_transform = section_transform
         # Corpus-wide {batch label -> dense id}. MUST span every section, not
         # just this block's — see `_stamp_batch_ids`.
