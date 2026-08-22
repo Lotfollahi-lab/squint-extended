@@ -318,6 +318,45 @@ def test_loader_rejects_global_transform_at_construction(blob):
 # prefetching
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.parametrize("K", [1, 2, 3])
+def test_minibatch_batch_size_is_the_seed_count(blob, K):
+    """
+    Regression test for a severe silent bug: mini-batches reported
+    `batch_size == K` (sections per block) instead of the true seed count.
+
+    `Batch.batch_size` is a PROPERTY returning num_graphs, and `Data` has none. So when
+    the graph handed to NeighborLoader is the `Batch` that `from_data_list` produced, the
+    loader's own `batch_size` assignment is shadowed and the mini-batch reports K.
+
+    That value is not cosmetic. `VQNiche_Dual._step` (:570) reads `batch.batch_size`, and
+    `batch_pred_attr_and_target_attr` slices `batch_xhat[:batch_size]` /
+    `batch_x[:batch_size]` -- the MAIN cell-branch NB loss -- plus the adversary input and
+    the quantizer terms (:711-712, :740-742). Uncorrected, streaming trained on the first
+    K cells of each mini-batch instead of all of them, with no error raised.
+
+    `_build_block` now rebuilds the block as a plain `Data`, mirroring what the in-memory
+    path already does (in_memory_datamodule.py:420).
+    """
+    for mb in _loader(blob, K):
+        n_seeds = int(mb.input_id.numel())          # the ground truth
+        assert int(mb.batch_size) == n_seeds, (
+            f"batch_size={int(mb.batch_size)} but {n_seeds} seeds; "
+            f"a Batch (num_graphs={K}) leaked through to NeighborLoader"
+        )
+        assert n_seeds <= BATCH_SIZE
+        break
+
+
+def test_block_handed_to_the_loader_is_a_plain_data(blob):
+    """Pin the mechanism, so a refactor cannot quietly reintroduce a Batch."""
+    from torch_geometric.data import Batch
+
+    ld = _loader(blob, 2)
+    block = ld._build_block(next(iter(ld._block_row_lists())))
+    assert not isinstance(block, Batch), "a Batch here shadows batch_size via num_graphs"
+    assert "ptr" not in block, "ptr has length K+1 and is not a node attribute"
+
+
 @pytest.mark.parametrize("K", [1, 2])
 def test_prefetch_does_not_change_results(blob, K):
     """
@@ -333,7 +372,10 @@ def test_prefetch_does_not_change_results(blob, K):
     def seed_fingerprint(prefetch):
         out = []
         for mb in _loader(blob, K, prefetch=prefetch):
-            n_seeds = int(mb.batch_size)
+            # input_id.numel() is the ground truth for the seed count; batch_size only
+            # agrees because _build_block hands the loader a plain Data (see
+            # test_minibatch_batch_size_is_the_seed_count).
+            n_seeds = int(mb.input_id.numel())
             out.append((n_seeds, mb.adata_batch_ids[:n_seeds].tolist()))
         return out
 

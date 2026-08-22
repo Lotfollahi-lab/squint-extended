@@ -231,7 +231,9 @@ def test_streaming_is_identical_across_containers(both, K):
             shuffle=False, prefetch=True,
             batch_label_to_dense=blob.batch_label_to_dense(),
         )
-        seeds = [(int(mb.batch_size), mb.adata_batch_ids[:int(mb.batch_size)].tolist())
+        # input_id.numel() is the ground-truth seed count, not batch_size
+        seeds = [(int(mb.input_id.numel()),
+                  mb.adata_batch_ids[:int(mb.input_id.numel())].tolist())
                  for mb in ld]
         return len(ld), seeds
 

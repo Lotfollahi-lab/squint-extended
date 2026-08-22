@@ -67,7 +67,9 @@ def _config(root, name, *, hvg, adata_batch_idx):
             "adata_batch_idx": adata_batch_idx,
             "gene_count_transform_names": ["SubsetHVG"] if hvg else [],
             "gene_count_transform_params": {"n_genes": 8} if hvg else {},
-            "feature_names": ["cell_gene_counts"],
+            # SetExperimentDataKeys namespace ("X"), as the training configs use
+            # (run_squint.py:968) -- not the blob-build namespace
+            "feature_names": ["X"],
             "label_name": "cell_types",
             "graph_params": {"spatial_key": "spatial", "delaunay": False,
                              "n_neighs": 4, "radius": None},

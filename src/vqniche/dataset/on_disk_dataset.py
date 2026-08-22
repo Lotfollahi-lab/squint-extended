@@ -939,6 +939,32 @@ class KSectionBlockLoader:
         block = Batch.from_data_list(views)              # edges offset per section
         # Must come AFTER collation — see `_stamp_batch_ids` for why.
         self._stamp_batch_ids(block, block_rows, sizes)
+
+        # Hand NeighborLoader a plain `Data`, NOT the `Batch` that from_data_list
+        # returned. This is load-bearing, not tidying.
+        #
+        # `Batch.batch_size` is a PROPERTY returning num_graphs. `Data` has no such
+        # property. NeighborLoader sets `batch_size` on its output to the seed count,
+        # but when the input graph is a Batch that assignment is shadowed by the
+        # property, so the mini-batch reports K (sections per block) instead of the
+        # real seed count. Measured on PyG 2.6.1: a 2-section block yields
+        # mb.batch_size == 2 while mb.input_id.numel() == 256.
+        #
+        # That value is not cosmetic. `VQNiche_Dual._step` (:570) reads
+        # `batch_size = batch.batch_size` and it slices the losses:
+        # `batch_pred_attr_and_target_attr` computes
+        # `pred_attr = batch_xhat[:batch_size]` / `target_attr = batch_x[:batch_size]`
+        # (the MAIN cell-branch NB loss), and :711-712 / :740-742 slice the adversary
+        # input and the quantizer terms the same way. Left uncorrected, streaming
+        # trains on the first K cells of every mini-batch instead of all 256 — it runs,
+        # the loss descends, and nothing raises.
+        #
+        # The in-memory path already avoids this by rebuilding a plain Data before the
+        # loader (in_memory_datamodule.py:420, `Data(**data_dict_for_loader)`); this
+        # mirrors it. `ptr` is dropped because it has length K+1 and is not a node
+        # attribute, which would confuse PyG's node/edge inference; `batch` is
+        # per-node and harmless to keep.
+        block = Data(**{k: v for k, v in block.to_dict().items() if k != "ptr"})
         return block
 
     def _blocks(self) -> Iterator:
