@@ -34,12 +34,25 @@ Design decisions
    silver/gold path properties (raw_dir / raw_file_names), and
    `_derive_adata_batch_id` come for free.
 
-3. Use PyG's REAL OnDiskDataset machinery (SQLite backend, schema=object)
-   rather than a hand-rolled per-file store. Verified against PyG 2.6.1:
+3. Use PyG's REAL OnDiskDataset machinery (schema=object) rather than a
+   hand-rolled store. Verified against PyG 2.6.1:
    `extend([serialize(d)])` writes rows; `get(idx)` lazily deserializes one
    `Data` (python-list attrs like `cell_id` survive the default pickle
    schema). NOTE: OnDiskDataset.__init__ does NOT accept `pre_transform`
    (signature is root, transform, pre_filter, backend, schema, log).
+
+3b. CONTAINER: the default is `backend="file"` (`file_database.FileDatabase`,
+   one file per section), NOT sqlite. SQLite caps a single value at its
+   compile-time MAX_LENGTH — 1e9 bytes on this stack, measured: 900 MB OK,
+   1.05 GB InterfaceError, 2.1 GB OverflowError — while a real
+   `xhb1002-AT10` section is 360,208 x 4,949 = 7.13 GB dense, roughly 7x
+   over. So the sqlite container cannot hold the corpus at all; it went
+   unnoticed because every test section was ~5.7 MB. `backend="sqlite"`
+   remains selectable and existing blobs keep opening (the manifest's
+   `container` field defaults to "sqlite" when absent). RocksDB was
+   rejected: its value size is a uint32, capping at 4 GB — still below
+   7.13 GB — and it is not installed. See file_database.py for the full
+   rationale.
 
 4. gold subdir is distinct (`on-disk-PyG-dataset-blob`) so an on-disk blob
    never collides with an in-memory blob of the same dataset.
@@ -74,6 +87,7 @@ import pandas as pd
 import torch
 from torch_geometric.data import Data, OnDiskDataset
 
+from .file_database import FileDatabase
 from .in_memory_dataset_blob import InMemoryDatasetBlob
 
 
@@ -202,6 +216,17 @@ class OnDiskDatasetBlob(OnDiskDataset):
     which we set in `__init__`.
     """
 
+    # Extend PyG's backend registry with a filesystem container.
+    # `OnDiskDataset.__init__` validates `backend not in self.BACKENDS` and raises, so
+    # adding to the dict on the subclass is the supported way in. `OnDiskDataset.db`
+    # then builds it as `cls(path=processed_paths[0], schema=..)`, passing `name` only
+    # for SQLiteDatabase subclasses — which is why FileDatabase takes `(path, schema)`.
+    #
+    # 'file' is the DEFAULT for new blobs: SQLite caps a single value at 1e9 bytes and
+    # real sections reach 7.13 GB, so the sqlite container cannot hold the corpus at
+    # all. It is kept selectable so existing blobs stay readable.
+    BACKENDS = {**OnDiskDataset.BACKENDS, "file": FileDatabase}
+
     # --- Borrow ALL of InMemoryDatasetBlob's OWN preprocessing methods /
     #     silver-side path properties, EXCEPT the ones we override here.
     #     `process_anndata_batch` calls sibling helpers
@@ -234,7 +259,7 @@ class OnDiskDatasetBlob(OnDiskDataset):
         pre_filter: Optional[Callable] = None,
         overwrite: bool = False,
         software_paths: dict = {},
-        backend: str = "sqlite",
+        backend: str = "file",
     ) -> None:
         # Mirror InMemoryDatasetBlob.__init__ attribute setup WITHOUT calling
         # it (its super().__init__ is InMemoryDataset's, which eagerly loads a
@@ -281,9 +306,20 @@ class OnDiskDatasetBlob(OnDiskDataset):
 
     @property
     def processed_file_names(self) -> List[str]:
-        # OnDiskDataset always writes 'sqlite.db'; requiring it here makes
-        # files_exist() -> skip process() on subsequent instantiations.
-        return ["sqlite.db", "manifest.json"]
+        """
+        Artifacts whose presence makes `files_exist()` skip `process()`.
+
+        Backend-dependent, because the container decides what the store is called:
+        SQLite writes a single `sqlite.db` file, while `FileDatabase` writes a
+        `sections/` DIRECTORY (which is `processed_paths[0]`, i.e. the `path` handed to
+        the backend by `OnDiskDataset.db`).
+
+        `manifest.json` stays in the list for both. It is written only at the very END
+        of `process()`, so an interrupted build leaves the manifest absent and the next
+        instantiation rebuilds rather than opening a half-populated store.
+        """
+        store = "sections" if self.backend == "file" else f"{self.backend}.db"
+        return [store, "manifest.json"]
 
     @property
     def _meta_dir(self) -> Path:
@@ -420,6 +456,9 @@ class OnDiskDatasetBlob(OnDiskDataset):
         manifest = {
             "manifest_version": 2,
             "name": self.name,
+            # Which container holds the rows. Recorded so a reopen knows what to
+            # expect and so a blob built before this field defaults to sqlite.
+            "container": self.backend,
             "num_sections": len(section_ids),
             "section_ids": section_ids,      # DB row idx -> adata_batch_id
             "node_counts": node_counts,      # DB row idx -> n_cells
@@ -442,12 +481,16 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # them from the rows (see `node_counts` / `batch_labels` properties).
         self.node_counts: Optional[List[int]] = None
         self.batch_labels: Optional[List[str]] = None
+        self.container: str = "sqlite"
         if mpath.exists():
             with open(mpath) as f:
                 _manifest = json.load(f)
             self.section_ids = _manifest.get("section_ids", [])
             self.node_counts = _manifest.get("node_counts", None)
             self.batch_labels = _manifest.get("batch_labels", None)
+            # Blobs built before the file container existed have no `container`
+            # field and are sqlite by construction.
+            self.container = _manifest.get("container", "sqlite")
 
         gp = meta / "gene_panel.pkl"
         if gp.exists():
@@ -917,7 +960,11 @@ class KSectionBlockLoader:
         """
         import threading
 
-        if threading.current_thread() is threading.main_thread():
+        # The 'file' container has no connection and therefore no thread affinity, so
+        # every thread can read directly. This is one of the reasons it was preferred
+        # over another connection-based backend.
+        if (threading.current_thread() is threading.main_thread()
+                or getattr(self.dataset, "backend", None) != "sqlite"):
             return self.dataset.get(row)
 
         db = getattr(self._thread_local, "db", None)

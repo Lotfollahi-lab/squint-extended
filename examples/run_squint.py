@@ -36989,7 +36989,8 @@ def harmonize_anndata_var():
 # Build dataset blob (one-time preprocessing)
 # ---------------------------------------------------------------------------
 
-def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory"):
+def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
+               container: str = "file"):
     """
     Build the in-memory PyG DatasetBlob in-process.
 
@@ -37085,7 +37086,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory"):
         from vqniche.dataset.on_disk_dataset import OnDiskDatasetBlob
         out_dir = (Path(ds_cfg["data_directory_path"]) / "gold"
                    / "on-disk-PyG-dataset-blob" / ds_cfg["name"])
-        print(f"Building ON-DISK dataset blob into {out_dir}")
+        print(f"Building ON-DISK dataset blob into {out_dir} (container={container})")
         dataset_blob = OnDiskDatasetBlob(
             name=ds_cfg["name"],
             feature_names=ds_cfg["feature_names"],
@@ -37095,6 +37096,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory"):
             pre_filter=ds_cfg["pre_filter"],
             overwrite=ds_cfg["overwrite"],
             software_paths=cfg["software_paths"],
+            backend=container,
         )
         print(f"Built {len(dataset_blob)} sections; "
               f"section ids: {getattr(dataset_blob, 'section_ids', None)}")
@@ -39357,6 +39359,16 @@ def main():
                         "(default, OOMs on very large corpora); on-disk = "
                         "streaming OnDiskDataset, one section per DB row "
                         "(use for hst_corpus_110m).")
+    p.add_argument("--container", type=str,
+                   default="file",
+                   choices=["file", "sqlite"],
+                   help="Storage container for --build-blob-backend on-disk. "
+                        "file (default) = one file per tissue section; sqlite = "
+                        "one BLOB per section in a single sqlite.db. Use 'file' "
+                        "for real corpora: sqlite caps a single value at 1e9 "
+                        "bytes and real sections reach ~7 GB dense, so the "
+                        "sqlite container cannot store them at all. 'sqlite' is "
+                        "kept for reading/rebuilding older blobs.")
     p.add_argument("--list-variants", action="store_true",
                    help="Print all registered ablation variants and exit.")
     p.add_argument("--list-dataset-sweeps", action="store_true",
@@ -39642,7 +39654,8 @@ def main():
         harmonize_anndata_var()
     if args.build_blob:
         build_blob(dataset=args.build_blob_dataset,
-                   backend=args.build_blob_backend)
+                   backend=args.build_blob_backend,
+                   container=args.container)
     # Resolve --compile / --no-compile into a tri-state override:
     #   `--no-compile`               → False (always wins)
     #   `--compile` (alone)          → True
