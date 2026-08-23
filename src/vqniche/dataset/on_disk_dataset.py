@@ -934,6 +934,9 @@ class KSectionBlockLoader:
         self.batch_label_to_dense = batch_label_to_dense
         self.unknown_batch_label_dense_id = int(unknown_batch_label_dense_id)
         self.prefetch = bool(prefetch)
+        # Resolved once from the DATASET, which is where the build-time flag
+        # lives -- the loader has no say in whether a blob is cross-panel.
+        self.cross_panel = bool(getattr(dataset, "cross_panel", False))
         # Per-thread SQLite read handles for prefetching; see `_fetch_section`.
         import threading as _threading
         self._thread_local = _threading.local()
@@ -1045,6 +1048,112 @@ class KSectionBlockLoader:
         view.section_row = torch.full((n,), int(row), dtype=torch.long)
         return view
 
+    # -- cross-panel: per-block gene union ---------------------------------- #
+
+    # Gene-width attributes, by NAME. Deliberately an explicit allow-list rather
+    # than "any [n, G] tensor": `y_cell_types` is [n, n_classes], so a shape
+    # heuristic would silently widen the labels of any dataset whose class count
+    # happened to equal its gene count.
+    _GENE_WIDTH_ATTRS = ("x", "x_cell_gene_counts")
+
+    def _widen_to_block_union(self, views, section_gene_ids):
+        """
+        Scatter each section onto the union of the block's panels, in place.
+
+        Returns `(union, panel_masks, panel_of_section)`:
+          union            LongTensor[W]    sorted global vocabulary ids
+          panel_masks      BoolTensor[P, W] one row per DISTINCT panel
+          panel_of_section list[int]        section index -> panel row
+
+        Masks are per PANEL, not per cell. A per-cell [N, W] mask is ~530 MB at
+        K=8, while [P, W] is kilobytes and the per-cell gather is trivial at
+        mini-batch size. Deduplicating matters because panels repeat heavily --
+        150 corpus sections share the 4,949-gene panel, so a block of 8 such
+        sections has P=1.
+
+        Block width is max-driven, not mean-driven: mixing a 169-gene section
+        with a 4,949-gene one gives W ~= 4,949 and leaves the narrow section's
+        rows ~97% zeros. That waste is deliberate -- grouping same-panel
+        sections into a block would minimise W but remove exactly the
+        cross-panel mixing the batch-correction terms need. Panel-aware block
+        grouping is a possible future knob.
+        """
+        # `unique` returns SORTED values, which is what makes `searchsorted`
+        # below valid -- no dict and no Python loop over genes.
+        union = torch.unique(torch.cat(section_gene_ids))
+        W = int(union.numel())
+
+        masks: List[torch.Tensor] = []
+        panel_of_section: List[int] = []
+        key_to_panel: dict = {}
+
+        for view, ids in zip(views, section_gene_ids):
+            cols = torch.searchsorted(union, ids)
+            g = int(ids.numel())
+
+            present = [k for k in self._GENE_WIDTH_ATTRS if k in view]
+            for key in present:
+                src = view[key]
+                if src.shape[1] != g:
+                    raise ValueError(
+                        f"`{key}` has {src.shape[1]} columns but the section "
+                        f"records {g} gene ids. They must correspond exactly, "
+                        f"or counts would scatter into the wrong genes."
+                    )
+                # Unmeasured positions stay EXACTLY zero. Load-bearing:
+                # `read_depth = batch.x.sum(dim=-1)` (vqniche_dual.py:476) is
+                # only the measured-gene depth because of it, so no separate
+                # masked sum is needed there.
+                wide = src.new_zeros((src.shape[0], W))
+                wide[:, cols] = src
+                view[key] = wide
+
+            # Exactly ONE of the two is ever present, so this widens one matrix
+            # per section rather than two. `SetExperimentDataKeys.forward`
+            # deletes every `x_*` key at the end (dataset/transforms.py:874-877,
+            # "to reduce memory footprint during training"), so once it has run
+            # the raw counts are gone and only `x` remains. With NO section
+            # transform they are never copied into `x` and they ARE the
+            # features, so they become the thing to widen. Hence the allow-list
+            # rather than a hardcoded "x".
+
+            key = tuple(ids.tolist())
+            panel = key_to_panel.get(key)
+            if panel is None:
+                panel = len(masks)
+                key_to_panel[key] = panel
+                m = torch.zeros(W, dtype=torch.bool)
+                m[cols] = True
+                masks.append(m)
+            panel_of_section.append(panel)
+
+        return union, torch.stack(masks), panel_of_section
+
+    def _stamp_panel_attrs(self, block: Data, union, panel_masks,
+                           panel_of_section, sizes: List[int]) -> None:
+        """
+        Stamp the cross-panel attributes onto an already-collated block.
+
+        AFTER collation for the same reason as `_stamp_batch_ids`: none of these
+        are per-section quantities, and `panel_id` is per-CELL only once the
+        sections are concatenated.
+
+        `gene_ids` is [1, W], not [W]. PyG decides "is this a node attribute?"
+        by testing `size(cat_dim) == num_nodes` -- a shape test that never looks
+        at the key -- so a flat [W] becomes per-cell data whenever W equals the
+        block's cell count, after which `NeighborLoader` slices it and the ids
+        stop corresponding to the columns of `x`. At corpus scale (thousands of
+        genes, thousands of cells per block) that is an ordinary coincidence.
+        Asserted both ways in `tests/test_gene_vocab_pyg_contract.py`.
+        `panel_masks[P, W]` needs no such guard: it would require P == N_blk.
+        """
+        block.gene_ids = union.reshape(1, -1)
+        block.panel_masks = panel_masks
+        block.panel_id = torch.cat([
+            torch.full((n,), int(p), dtype=torch.long)
+            for p, n in zip(panel_of_section, sizes)
+        ])
+
     # -- per-cell batch identity (stamped AFTER collation) ----------------- #
     def _stamp_batch_ids(self, block: Data, rows: List[int],
                          sizes: List[int]) -> None:
@@ -1142,11 +1251,46 @@ class KSectionBlockLoader:
         """
         from torch_geometric.data import Batch
 
-        views = [self._block_view(self._fetch_section(r), r) for r in block_rows]
+        # `gene_ids` must be read off the SECTION, before `_block_view`. Step 5b
+        # of that method drops every tensor whose first dim != num_nodes, and
+        # `gene_ids` is [1, G] by design (see `_stamp_gene_ids`), so it is
+        # already gone by the time the view is returned. Convenient rather than
+        # awkward: it means the per-section ids can never reach
+        # `Batch.from_data_list`, where sections of differing width would either
+        # fail to collate or concatenate into nonsense. The block gets its own.
+        views = []
+        section_gene_ids: List = []
+        for r in block_rows:
+            section = self._fetch_section(r)
+            if self.cross_panel:
+                ids = getattr(section, "gene_ids", None)
+                if ids is None:
+                    raise KeyError(
+                        f"Section (row {r}) has no `gene_ids`, but this blob is "
+                        f"cross_panel. It was probably built before "
+                        f"cross_panel=True; rebuild with overwrite=True."
+                    )
+                section_gene_ids.append(ids.reshape(-1))
+            views.append(self._block_view(section, r))
+            del section                    # the view shares its tensors already
+
         sizes = [int(v.num_nodes) for v in views]
+
+        # Widen each section onto the block's gene union BEFORE collation --
+        # `Batch.from_data_list` cannot concatenate `x` of differing widths,
+        # which is exactly what native-width storage produces.
+        union = panel_masks = panel_of_section = None
+        if self.cross_panel:
+            union, panel_masks, panel_of_section = self._widen_to_block_union(
+                views, section_gene_ids,
+            )
+
         block = Batch.from_data_list(views)              # edges offset per section
         # Must come AFTER collation — see `_stamp_batch_ids` for why.
         self._stamp_batch_ids(block, block_rows, sizes)
+        if self.cross_panel:
+            self._stamp_panel_attrs(block, union, panel_masks,
+                                    panel_of_section, sizes)
 
         # Hand NeighborLoader a plain `Data`, NOT the `Batch` that from_data_list
         # returned. This is load-bearing, not tidying.

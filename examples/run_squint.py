@@ -14257,7 +14257,17 @@ VARIANTS: dict = {
                     _patch_dual_cvq(
                         _patch_dual_rvq(_BD(),
                             branch="niche", codebook_sizes=(30, 60, 120)),
-                        branch="cell", codebook_sizes=(30, 10),
+                        # `_patch_dual_cvq` takes k1/k2/k3, not `codebook_sizes`
+                        # (that is `_patch_dual_rvq`'s parameter). This entry
+                        # passed the wrong name, raised TypeError at build, and
+                        # has never been runnable. k1=30, k2=10 is what the
+                        # variant NAME (`cvq-cell-30-10`) and its description
+                        # ("30 x 10 = 300 effective codes") specify, and matches
+                        # the working sibling that uses k1=30, k2=10, k3=5.
+                        # Inferred from the name, not from a recorded run:
+                        # confirm the intent before treating results as
+                        # comparable to the other v13 entries.
+                        branch="cell", k1=30, k2=10,
                     ),
                 ),
                 alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
@@ -14567,7 +14577,21 @@ VARIANTS: dict = {
                     alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
                 ),
             ),
-            hidden_channels=[512],
+            # `_patch_dual_mlp_width` takes `encoder_hidden` /
+            # `decoder_hidden`, not `hidden_channels` (that is
+            # `_patch_dual_encoder_deeper`'s parameter), so this entry raised
+            # TypeError at build and has never been runnable. Widths follow the
+            # working `mlp-h512` sibling, whose `patches` string spells out
+            # `enc=[512,512,256], dec=[512,512]`: the base after `+enc-deeper`
+            # is [400, 400, 256] and this entry's description says
+            # "MLP hidden 400 -> 512". The trailing 256 is the latent /
+            # codebook embedding dim and is held fixed, so this stays a WIDTH
+            # ablation rather than also moving the latent dim, as
+            # `_patch_dual_mlp_width`'s docstring prescribes. Inferred from the
+            # name, not from a recorded run: confirm the intent before treating
+            # results as comparable.
+            encoder_hidden=[512, 512, 256],
+            decoder_hidden=[512, 512],
         ),
     },
     "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+mlp-h128+mmb0-1b_smb1-1b_1p": {
@@ -14595,7 +14619,21 @@ VARIANTS: dict = {
                     alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
                 ),
             ),
-            hidden_channels=[128],
+            # `_patch_dual_mlp_width` takes `encoder_hidden` /
+            # `decoder_hidden`, not `hidden_channels` (that is
+            # `_patch_dual_encoder_deeper`'s parameter), so this entry raised
+            # TypeError at build and has never been runnable. Widths follow the
+            # working `mlp-h512` sibling, whose `patches` string spells out
+            # `enc=[512,512,256], dec=[512,512]`: the base after `+enc-deeper`
+            # is [400, 400, 256] and this entry's description says
+            # "MLP hidden 400 -> 128". The trailing 256 is the latent /
+            # codebook embedding dim and is held fixed, so this stays a WIDTH
+            # ablation rather than also moving the latent dim, as
+            # `_patch_dual_mlp_width`'s docstring prescribes. Inferred from the
+            # name, not from a recorded run: confirm the intent before treating
+            # results as comparable.
+            encoder_hidden=[128, 128, 256],
+            decoder_hidden=[128, 128],
         ),
     },
     "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+dropout-p0.1+mmb0-1b_smb1-1b_1p": {
