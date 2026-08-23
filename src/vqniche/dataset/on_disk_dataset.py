@@ -981,6 +981,23 @@ class KSectionBlockLoader:
         and tensor copies, which release the GIL. The queue holds a single
         block, so steady-state residency is 2 blocks rather than 1 — budget K
         accordingly (and see the 2xK note in the class docstring).
+
+        MEASURED CAVEAT (R0, 39 sections / 519,058 cells, K=8): this does NOT
+        currently hide the boundaries. GPU utilisation was 8.1% with 53% of
+        samples at exactly 0%, and the 179 idle stretches came to 4.97 per
+        epoch — precisely the 5 blocks/epoch. The budget is ~1.5 min/epoch of
+        consuming against ~3.1 min/epoch of block-build work, so ONE producer
+        thread is structurally ~2x too slow and queue depth alone cannot fix
+        it. Note also that the GIL claim in the paragraph above is an
+        assertion, not a measurement: if the per-section transform is
+        Python/numpy CPU work rather than I/O, threads cannot help here at all.
+
+        Deliberately left as-is for now. `REMAINING_WORK.md` item 0d records
+        the proposed fix (profile the build first, then producer parallelism or
+        a worker process), and why it is postponed: this is tested code where a
+        threading bug would silently yield a wrong block rather than raise, and
+        per item 0b a corpus epoch already fits in one overnight job, so the
+        upside is ~2x on something that is not blocking.
         """
         row_lists = self._block_row_lists()
         if not self.prefetch:

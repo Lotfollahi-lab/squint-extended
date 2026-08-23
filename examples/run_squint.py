@@ -4543,6 +4543,7 @@ def _patch_streaming(
         cfg: dict,
         sections_per_block: int = 4,
         prefetch: bool = True,
+        num_workers: int = 2,
     ) -> dict:
     """
     Switch the dataset backend from the collated in-memory blob to on-disk
@@ -4568,11 +4569,97 @@ def _patch_streaming(
         in flight when `prefetch` is on.
     prefetch:
         Build the next block on a background thread while the current one
-        trains, so the GPU does not idle at block boundaries.
+        trains, so the GPU does not idle at block boundaries. Note this does
+        NOT currently succeed at R0 scale — see the measurement in
+        `REMAINING_WORK.md` and the postponed optimisation recorded there.
+    num_workers:
+        DataLoader workers per block loader, and the reason this parameter
+        exists rather than inheriting `loader_params['num_workers']`.
+
+        The streaming path creates a NEW `NeighborLoader` per block, so every
+        block boundary forks `num_workers` processes against a block that is
+        already resident in RAM — 2-4 GB at K=8 on R0. The in-memory backend
+        forks once against one shared graph, so its default of 22 is fine
+        there; here it is a per-boundary multiplier. R0 measured the cost
+        directly: host RSS peaked at 96.5 GB and LSF killed the run at epoch
+        35 of 80, while GPU utilisation sat at 8.1% — so those 22 workers
+        bought no throughput whatsoever, they only bought the OOM.
+
+        Default 2: enough to overlap the sampler with the training step,
+        cheap enough that the fork cost and the resident copies stay small.
+        The block read itself is already covered by `prefetch`, so workers
+        are not the mechanism hiding disk latency here.
     """
     cfg["dataset"]["backend"] = "on-disk"
     cfg["datamodule"]["sections_per_block"] = int(sections_per_block)
     cfg["datamodule"]["prefetch"] = bool(prefetch)
+    cfg["datamodule"]["loader_params"]["num_workers"] = int(num_workers)
+    return cfg
+
+
+def _patch_step_budget(
+        cfg: dict,
+        max_steps: int,
+        val_check_interval: int = 2000,
+        max_epochs: int = 1000,
+    ) -> dict:
+    """
+    Train to a STEP budget rather than an epoch count.
+
+    Epochs stop being a meaningful unit once the dataset is large. The base
+    config's `max_epochs: 80` was calibrated on paper-scale data (a handful of
+    sections); carried across a 212x increase in cells it becomes absurd:
+
+        R0 (519,058 cells, batch 512)      817 steps/epoch
+          36 epochs actually completed  =  29,422 steps
+        hst_corpus_110m (~89M train seeds, batch 512)
+          ONE epoch                     = 174,023 steps
+          80 epochs                     = ~14,000,000 steps
+
+    One corpus epoch is already 5.9x the total step count R0 ran, and R0's
+    29,422 steps is reached after 16.9% of a single corpus pass. So the budget
+    that matters is steps seen, and a corpus run is a fraction of one epoch.
+
+    Three settings, and all three are load-bearing:
+
+    `max_steps`
+        The actual budget. Lightning stops at whichever of max_steps /
+        max_epochs comes first.
+    `max_epochs`
+        Raised out of the way (default 1000) so it cannot bind first. Left as
+        a finite number rather than -1 so a misconfigured run still terminates.
+    `val_check_interval` + `check_val_every_n_epoch = 1`
+        Validation MUST become step-grained. Pick the interval from the COST of
+        a streaming val pass, not from the training epoch: the val loader has
+        its own `KSectionBlockLoader` and rebuilds blocks over every section in
+        the blob to reach the 10% of cells masked for validation (39 sections at
+        R0, all 636 at corpus scale). At R0's measured ~3.1 min/epoch of block-
+        build work that makes one val pass minutes, not seconds, so a cadence
+        of a few hundred steps would spend more wall clock validating than
+        training. Default 2000 steps = 15 val checks over a 30k-step budget,
+        and EarlyStopping's patience=10 then spans 20,000 steps. A corpus step budget is a
+        fraction of one epoch, so an epoch-grained cadence would never fire —
+        and because `ModelCheckpoint._should_save_on_train_epoch_end()`
+        returns False whenever `check_val_every_n_epoch != 1`
+        (pytorch_lightning 2.4.0, model_checkpoint.py:425-432), the callback
+        saves only from `on_validation_end`. The run would then finish having
+        logged no `val_*` metric and written an EMPTY `checkpoints/`, leaving
+        nothing for `--predict`. That is the same failure `_patch_quick`
+        already had to fix for 1-epoch smoke tests, arriving from a different
+        direction. EarlyStopping counts `patience` in val checks, so it keeps
+        working on the step grid.
+
+    Safe to apply to the R0 reference stack: it is entirely epoch-agnostic —
+    `warmup_epochs: 0`, `vq_warmup_epochs` 0, no LR scheduler (plain
+    constant-LR Adam) and static loss temperatures, so nothing silently
+    changes schedule when the epoch count does. NOT safe for the
+    `adv-warmup10` variants, whose adversarial alpha ramp is keyed to
+    `current_epoch` and would never complete under a short budget.
+    """
+    cfg["trainer"]["max_steps"] = int(max_steps)
+    cfg["trainer"]["max_epochs"] = int(max_epochs)
+    cfg["trainer"]["check_val_every_n_epoch"] = 1
+    cfg["trainer"]["val_check_interval"] = int(val_check_interval)
     return cfg
 
 
@@ -5381,6 +5468,40 @@ VARIANTS: dict = {
             # gives the contrastive / covariate terms far more cross-section
             # signal than the default 4. Sweep {4, 8, 16} in Phase 2 proper.
             sections_per_block=8,
+        ),
+    },
+
+    "stream+r0-steps+xhs1000-39b_1p": {
+        "description": (
+            "R0 on a STEP budget instead of an epoch count, and with the "
+            "streaming loader's worker fan-out corrected. Same reference recipe "
+            "and same data as stream+r0, so the two are directly comparable; "
+            "the only changes are 30,000 steps with step-grained validation "
+            "(epochs are not a meaningful unit at corpus scale) and "
+            "num_workers=2 (22 forked copies of each 2-4 GB block are what "
+            "made LSF kill stream+r0 at 96.5 GB, while GPU utilisation sat at "
+            "8.1%). 30k steps is the budget stream+r0 had already reached by "
+            "epoch 36, where both first-level codebooks were fully occupied."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhs1000-39b_1p dataset, test_batches=[3,7,0,22]",
+            "+streaming(sections_per_block=8, num_workers=2)",
+            "+step-budget(max_steps=30000, val every 2000 steps)",
+        ],
+        "build": lambda: _patch_step_budget(
+            _patch_streaming(
+                _patch_dual_xhs1000_39b(
+                    _r0_reference_stack(),
+                    test_batch_idx=list(_R0_TEST_BATCHES),
+                    batch_size=512,
+                ),
+                sections_per_block=8,
+                num_workers=2,
+            ),
+            max_steps=30_000,
+            val_check_interval=2000,
         ),
     },
 
@@ -38071,6 +38192,11 @@ def train(
         callbacks=callbacks,
         strategy=_train_strategy,
         max_epochs=cfg["trainer"]["max_epochs"],
+        # Optional STEP budget. Lightning's default of -1 means "no step
+        # limit, stop on max_epochs", so variants that don't set the key
+        # behave exactly as before. `_patch_step_budget` sets it for runs
+        # where epochs are the wrong unit — see that function's docstring.
+        max_steps=int(cfg["trainer"].get("max_steps", -1)),
         # Run val every N train epochs (N=2 by default — see base
         # config). Halves val-pass overhead at the cost of running
         # early stopping on a coarser val grid. `getattr`-style
@@ -38079,6 +38205,15 @@ def train(
         check_val_every_n_epoch=int(
             cfg["trainer"].get("check_val_every_n_epoch", 1)
         ),
+        # Validate every N optimizer steps when set to an int (Lightning's
+        # default is the float 1.0 = "once per training epoch"). Required
+        # alongside `max_steps`: on a corpus-scale dataset a step budget is
+        # a fraction of ONE epoch, so an epoch-grained val cadence would
+        # never fire -- and with `check_val_every_n_epoch != 1`
+        # ModelCheckpoint saves only from `on_validation_end`, so the run
+        # would finish with an empty `checkpoints/`. Keep the type: int =
+        # steps, float = fraction of an epoch.
+        val_check_interval=cfg["trainer"].get("val_check_interval", 1.0),
         enable_checkpointing=enable_checkpointing,
         num_sanity_val_steps=0,
         enable_progress_bar=False,
