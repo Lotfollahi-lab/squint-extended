@@ -833,9 +833,20 @@ class BaseModel(pl.LightningModule):
         - torch.Tensor
             The computed loss for the current batch.
         """
+        # `mode` MUST be forwarded. `criterion` defaults to mode='train' and
+        # logs every per-term loss as f"{mode}_{loss_fn_name}", so omitting it
+        # made the validation pass log its per-term losses under `train_*`
+        # keys. Those are then overwritten by the real training values before
+        # anything reads `callback_metrics` (verified: the per-term train
+        # numbers are bit-identical in runs with and without a validation
+        # pass), so no reported figure was ever wrong -- but it meant NO
+        # per-term `val_*` metric existed at all, only the total `val_loss`.
+        # On an 80-epoch run that is the difference between seeing which term
+        # drives the generalisation gap and seeing only that there is one.
         loss_value = self.criterion(
             loss_data=batch_loss_data,
             curr_batch_size=batch_size,
+            mode=mode,
         )
 
         self.log(
