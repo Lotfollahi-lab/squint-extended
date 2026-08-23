@@ -38487,6 +38487,7 @@ def predict(
     precision: Optional[str] = None,
     strategy: Optional[str] = None,
     compression: Optional[str] = None,
+    predict_batch_size: Optional[int] = None,
 ):
     """
     Run inference on a folder of .h5ad files using a trained SQUINT
@@ -38585,6 +38586,25 @@ def predict(
         model_ckpt_fname=model_ckpt_fname,
     )
     print(f"Using checkpoint: {config['model']['model_ckpt_fname']}")
+
+    # ---- predict_batch_size override -----------------------------------------
+    # Needed because the inference cache aggregates 1-hop neighbours with
+    # `X_nbr.index_add_(0, col, X[row])` (utils/loss_utils.py:136), and `X[row]`
+    # materialises an [n_edges, n_genes] gather. Predict runs with
+    # `predict_sample_neighbors_for_inference=False` (full neighbourhood), so
+    # n_edges grows with the batch: at the base default of 65,536 seeds on the
+    # 4,948-gene R0 panel that single gather asked for 47.51 GiB and OOM'd an
+    # 80 GB H100. The cost is O(batch x degree x genes), so it bites on wide
+    # panels regardless of how much host RAM the job has -- lowering the batch
+    # is the direct lever, and predict is a single pass so more batches costs
+    # little.
+    if predict_batch_size is not None:
+        _old_pbs = config["datamodule"]["inference_params"].get("predict_batch_size")
+        config["datamodule"]["inference_params"]["predict_batch_size"] = int(predict_batch_size)
+        print(
+            f"Predict: predict_batch_size {_old_pbs} -> {int(predict_batch_size)} "
+            f"(override; the 1-hop neighbour gather is O(batch x degree x genes))."
+        )
 
     if silver_dir:
         silver_dir = Path(silver_dir)
@@ -39777,6 +39797,15 @@ def main():
     # GPU DDP-wrapped behaviour, or `"ddp"` for true multi-GPU DDP
     # without find-unused.
     p.add_argument(
+        "--predict-batch-size", type=int, default=None,
+        help=(
+            "Override `inference_params.predict_batch_size` for --predict. The "
+            "1-hop neighbour aggregation gathers an [n_edges, n_genes] tensor, so "
+            "the base default of 65536 OOMs a GPU on wide panels (47.5 GiB on the "
+            "4948-gene R0 panel). Try 4096-8192."
+        ),
+    )
+    p.add_argument(
         "--strategy", type=str, default=None,
         help="Lightning Trainer(strategy=...) override for the TRAIN "
              "pass. Default: None = honour `cfg['trainer']['strategy']` "
@@ -39967,6 +39996,7 @@ def main():
             silver_dir=args.silver_dir,
             model_ckpt_fname=args.model_ckpt_fname,
             output_dir=args.output_dir,
+            predict_batch_size=args.predict_batch_size,
         )
 
     # --all: end-to-end train -> predict -> 3 plot scripts -> metrics.
