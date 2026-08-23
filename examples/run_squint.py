@@ -4597,6 +4597,75 @@ def _patch_streaming(
     return cfg
 
 
+def _patch_no_val(
+        cfg: dict,
+        checkpoint_every_n_steps: int = 2000,
+    ) -> dict:
+    """
+    Disable the validation loop and checkpoint on a pure step schedule.
+
+    WHY THIS IS DEFENSIBLE, AND ONLY IN ONE REGIME. A streaming val pass is
+    expensive because the val loader has its own `KSectionBlockLoader` and
+    rebuilds blocks across every section in the blob to reach the 10% of cells
+    masked for validation. Extrapolating R0's measured 4.8 s/section, one
+    corpus val pass is ~51 min, so even a derived 10-check cadence costs ~8.4 h
+    against ~6.1 h of actual training on a 200,000-step budget. Validation
+    would be the majority of the run.
+
+    What validation buys is the ability to notice generalisation degrading. At
+    corpus scale that risk is largely absent, for a concrete reason: 200,000
+    steps at batch 512 is ~1.15 passes over the corpus, so **each cell is seen
+    about once**. A model cannot memorise data it sees once. R0 corroborates
+    the direction — train 2007.7 vs val 2043.7, a 1.8% gap with the two curves
+    tracking each other, and that was after 36 passes, far more repetition than
+    a corpus run gets.
+
+    Note also that the base config's stated reason for monitoring `val_loss`
+    ("matters in particular for the adversarial variants where train_loss can
+    keep declining while val performance silently degrades") does not apply to
+    the R0 reference stack, which has no adversarial term.
+
+    Final evaluation does not depend on this either way: it comes from the
+    WHOLE-SECTION test holdout via `examples/compute_inference_metrics.py`,
+    which never touches the in-section val split.
+
+    So: use this for corpus-scale, ~single-pass runs. Do NOT use it for
+    R0-scale runs (~36 passes over 519k cells), where repetition makes
+    overfitting real and a val pass costs ~3.1 min rather than ~51 min.
+
+    WHY NOT `limit_val_batches=K` INSTEAD, which looks like the obvious middle
+    ground. It would be cheap for the right reason — the block build dominates
+    and Lightning stops consuming after K batches, so only the first block or
+    two ever gets built. But stopping mid-iteration ABANDONS the block
+    generator, and `KSectionBlockLoader._blocks()` runs its producer on a
+    background thread writing into a `queue.Queue(maxsize=1)`. An abandoned
+    generator leaves that producer blocked in `q.put()` holding a fully-built
+    block, and the thread is a daemon so nothing reaps it: one leaked thread
+    and up to two leaked blocks (~2-4 GB at K=8) per val pass. Fixing that
+    means touching the prefetch threading, which is deliberately postponed
+    (`REMAINING_WORK.md` item 0d). Disabling validation outright never iterates
+    the val loader at all, so it sidesteps the leak instead of provoking it.
+
+    Parameters
+    ----------
+    checkpoint_every_n_steps:
+        Checkpoint cadence, in optimizer steps. `monitor` is set to None so
+        ModelCheckpoint saves on this schedule alone rather than ranking by a
+        metric — see the `monitor in (None, ...)` branch in `train()` for why
+        `train_loss` cannot stand in for `val_loss` here.
+    """
+    cfg["trainer"]["limit_val_batches"] = 0
+    cfg["trainer"]["monitor"] = None
+    cfg["trainer"]["checkpoint_params"]["every_n_train_steps"] = int(
+        checkpoint_every_n_steps
+    )
+    # EarlyStopping keys off `val_loss`, and by default it evaluates at
+    # validation end -- with no validation it would simply never fire, so
+    # leaving it "enabled" would be a lie in the archived config.
+    cfg["trainer"]["early_stopping_params"]["enabled"] = False
+    return cfg
+
+
 def _patch_step_budget(
         cfg: dict,
         max_steps: int,
@@ -5535,6 +5604,40 @@ VARIANTS: dict = {
             ),
             max_steps=3_000,
             val_checks=3,
+        ),
+    },
+    "smoke-steps-noval+stream+xhs1000-39b_1p": {
+        "description": (
+            "Same 3,000-step budget as smoke-steps, but with the validation "
+            "loop DISABLED and checkpointing on a pure step schedule -- the "
+            "configuration a corpus-scale run would use, where ~10 val passes "
+            "would cost ~8.4 h against ~6.1 h of training. Proves the "
+            "monitor=None path writes checkpoints from `on_train_batch_end` "
+            "without any val_loss to rank by, which is the whole risk of "
+            "turning validation off."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhs1000-39b_1p dataset, test_batches=[3,7,0,22]",
+            "+streaming(sections_per_block=8, num_workers=2)",
+            "+step-budget(max_steps=3000)",
+            "+no-val(checkpoint every 1000 steps)",
+        ],
+        "build": lambda: _patch_no_val(
+            _patch_step_budget(
+                _patch_streaming(
+                    _patch_dual_xhs1000_39b(
+                        _r0_reference_stack(),
+                        test_batch_idx=list(_R0_TEST_BATCHES),
+                        batch_size=512,
+                    ),
+                    sections_per_block=8,
+                    num_workers=2,
+                ),
+                max_steps=3_000,
+            ),
+            checkpoint_every_n_steps=1000,
         ),
     },
     "stream+r0-steps+xhs1000-39b_1p": {
@@ -38195,11 +38298,26 @@ def train(
             "val_pearson_cell_wise_1hop_nbr_log1p":             "{epoch}-{val_pearson_cell_wise_1hop_nbr_log1p:.3f}",
             "val_pearson_cell_wise_1hop_nbr_log1p_median":      "{epoch}-{val_pearson_cell_wise_1hop_nbr_log1p_median:.3f}",
         }
-        filename = _filename_by_monitor.get(
-            monitor, "{epoch}-{val_loss:.3f}"
-        )
-        if monitor not in _filename_by_monitor:
-            monitor = "val_loss"
+        if monitor in (None, "none", ""):
+            # No metric to rank by -- save on a pure step schedule. Needed when
+            # the validation loop is disabled (`_patch_no_val`): with no
+            # `val_loss` a monitored ModelCheckpoint would warn
+            # "could not find the monitored key" and save nothing. `train_loss`
+            # is not a usable substitute either, because it is logged with
+            # `on_epoch=True, on_step=False` (base_model.py:842) so it only
+            # enters `callback_metrics` at epoch end -- which never arrives
+            # when the step budget is a fraction of one epoch.
+            #
+            # `{step}` rather than `{epoch}` in the filename for the same
+            # reason: epoch is pinned at 0 for the whole run.
+            monitor = None
+            filename = "{epoch}-{step}"
+        else:
+            filename = _filename_by_monitor.get(
+                monitor, "{epoch}-{val_loss:.3f}"
+            )
+            if monitor not in _filename_by_monitor:
+                monitor = "val_loss"
 
         checkpoint_params = cfg["trainer"]["checkpoint_params"]
         callbacks.append(
@@ -38279,6 +38397,9 @@ def train(
         # would finish with an empty `checkpoints/`. Keep the type: int =
         # steps, float = fraction of an epoch.
         val_check_interval=cfg["trainer"].get("val_check_interval", 1.0),
+        # 0 disables the validation loop outright (`_patch_no_val`). Default
+        # 1.0 = "use all of it", so variants that don't set it are unaffected.
+        limit_val_batches=cfg["trainer"].get("limit_val_batches", 1.0),
         enable_checkpointing=enable_checkpointing,
         num_sanity_val_steps=0,
         enable_progress_bar=False,
