@@ -4600,7 +4600,8 @@ def _patch_streaming(
 def _patch_step_budget(
         cfg: dict,
         max_steps: int,
-        val_check_interval: int = 2000,
+        val_check_interval: Optional[int] = None,
+        val_checks: int = 10,
         max_epochs: int = 1000,
     ) -> dict:
     """
@@ -4620,6 +4621,18 @@ def _patch_step_budget(
     29,422 steps is reached after 16.9% of a single corpus pass. So the budget
     that matters is steps seen, and a corpus run is a fraction of one epoch.
 
+    The budget is therefore PER DATASET, not a global convention — the same
+    step count means completely different things (steps x batch / train seeds):
+
+        200,000 steps @ batch 512   =   1.15 passes over the corpus
+                                    = 244.71 passes over R0
+
+    ~200k is the natural corpus figure: a little over one pass, which is where
+    a corpus run belongs. On R0 it would be 245 passes of a dataset that
+    plateaued after 36 (29,422 steps, both first-level codebooks already fully
+    occupied), so R0-scale runs want ~30k. Set the ceiling generously and let
+    EarlyStopping on `val_loss` decide the real endpoint.
+
     Three settings, and all three are load-bearing:
 
     `max_steps`
@@ -4629,15 +4642,33 @@ def _patch_step_budget(
         Raised out of the way (default 1000) so it cannot bind first. Left as
         a finite number rather than -1 so a misconfigured run still terminates.
     `val_check_interval` + `check_val_every_n_epoch = 1`
-        Validation MUST become step-grained. Pick the interval from the COST of
-        a streaming val pass, not from the training epoch: the val loader has
-        its own `KSectionBlockLoader` and rebuilds blocks over every section in
-        the blob to reach the 10% of cells masked for validation (39 sections at
-        R0, all 636 at corpus scale). At R0's measured ~3.1 min/epoch of block-
-        build work that makes one val pass minutes, not seconds, so a cadence
-        of a few hundred steps would spend more wall clock validating than
-        training. Default 2000 steps = 15 val checks over a 30k-step budget,
-        and EarlyStopping's patience=10 then spans 20,000 steps. A corpus step budget is a
+        Validation MUST become step-grained. DERIVED from `max_steps` by
+        default (`max_steps // val_checks`) rather than being a fixed number,
+        because a fixed interval silently becomes pathological as the budget
+        grows and the two must not drift apart.
+
+        The cost driver is that the val loader has its own
+        `KSectionBlockLoader` and rebuilds blocks across every section in the
+        blob to reach the 10% of cells masked for validation — 39 sections at
+        R0, all 636 at corpus scale. Extrapolating R0's measured build rate of
+        ~4.8 s/section, one corpus val pass is ~51 min, against a
+        training-only rate of ~0.11 s/step. So for a 200,000-step corpus run:
+
+            val every  2,000 steps = 100 passes = 84.3 h of validation
+                                                   vs 6.1 h of training
+            val every 20,000 steps =  10 passes =  8.4 h
+
+        A fixed 2,000 would have spent 14x more wall clock validating than
+        training. Deriving the interval keeps the ratio bounded whatever the
+        budget: `val_checks=10` gives 10 passes, and EarlyStopping's
+        patience=10 then spans the whole run (tighten `val_checks` if you want
+        early stopping to be able to fire sooner).
+
+        Even 10 passes is ~8.4 h at corpus scale, which is real and is NOT
+        hidden here: if that matters, `limit_val_batches` is the other lever,
+        at the cost of biasing validation towards the first blocks (the val
+        loader is built with `shuffle=False`, so it would always be the same
+        leading sections rather than a random sample). A corpus step budget is a
         fraction of one epoch, so an epoch-grained cadence would never fire —
         and because `ModelCheckpoint._should_save_on_train_epoch_end()`
         returns False whenever `check_val_every_n_epoch != 1`
@@ -4656,6 +4687,8 @@ def _patch_step_budget(
     `adv-warmup10` variants, whose adversarial alpha ramp is keyed to
     `current_epoch` and would never complete under a short budget.
     """
+    if val_check_interval is None:
+        val_check_interval = max(1, int(max_steps) // max(1, int(val_checks)))
     cfg["trainer"]["max_steps"] = int(max_steps)
     cfg["trainer"]["max_epochs"] = int(max_epochs)
     cfg["trainer"]["check_val_every_n_epoch"] = 1
@@ -5471,6 +5504,39 @@ VARIANTS: dict = {
         ),
     },
 
+    "smoke-steps+stream+xhs1000-39b_1p": {
+        "description": (
+            "Short proof of the STEP-BUDGET machinery on the streaming backend "
+            "-- the paths `_patch_step_budget` introduced have never executed. "
+            "3,000 steps with validation every 1,000, so it exercises: does "
+            "`max_steps` actually stop the run; does step-grained validation "
+            "fire mid-epoch; does ModelCheckpoint write from `on_validation_end` "
+            "on the step grid (an empty checkpoints/ is the failure mode that "
+            "would silently waste a long corpus run); and does num_workers=2 "
+            "hold memory down. Same recipe/data/batch as stream+r0-steps, only "
+            "the budget is short -- ~10 min, not a model run."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhs1000-39b_1p dataset, test_batches=[3,7,0,22]",
+            "+streaming(sections_per_block=8, num_workers=2)",
+            "+step-budget(max_steps=3000, val every 1000 steps)",
+        ],
+        "build": lambda: _patch_step_budget(
+            _patch_streaming(
+                _patch_dual_xhs1000_39b(
+                    _r0_reference_stack(),
+                    test_batch_idx=list(_R0_TEST_BATCHES),
+                    batch_size=512,
+                ),
+                sections_per_block=8,
+                num_workers=2,
+            ),
+            max_steps=3_000,
+            val_checks=3,
+        ),
+    },
     "stream+r0-steps+xhs1000-39b_1p": {
         "description": (
             "R0 on a STEP budget instead of an epoch count, and with the "
@@ -5488,7 +5554,7 @@ VARIANTS: dict = {
             "diversity-w10, contrastWB-w10-k5)",
             "+xhs1000-39b_1p dataset, test_batches=[3,7,0,22]",
             "+streaming(sections_per_block=8, num_workers=2)",
-            "+step-budget(max_steps=30000, val every 2000 steps)",
+            "+step-budget(max_steps=30000, val every 3000 steps)",
         ],
         "build": lambda: _patch_step_budget(
             _patch_streaming(
@@ -5500,8 +5566,7 @@ VARIANTS: dict = {
                 sections_per_block=8,
                 num_workers=2,
             ),
-            max_steps=30_000,
-            val_check_interval=2000,
+            max_steps=30_000,      # ~36 passes over R0 -- where it plateaued
         ),
     },
 
