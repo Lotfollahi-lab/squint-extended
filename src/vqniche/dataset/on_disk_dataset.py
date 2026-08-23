@@ -79,10 +79,12 @@ import json
 import math
 import pickle
 import random
+import shutil
 from pathlib import Path
 from typing import Callable, List, Optional, Iterator, Tuple
 
 import anndata as ad
+import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import Data, OnDiskDataset
@@ -204,6 +206,8 @@ class OnDiskDatasetBlob(OnDiskDataset):
         overwrite: bool = False,
         software_paths: dict = {},
         backend: str = "file",
+        cross_panel: bool = False,
+        exclude_sections: Optional[List[str]] = None,
     ) -> None:
         # Mirror InMemoryDatasetBlob.__init__ attribute setup WITHOUT calling
         # it (its super().__init__ is InMemoryDataset's, which eagerly loads a
@@ -219,9 +223,64 @@ class OnDiskDatasetBlob(OnDiskDataset):
         self.data_directory_path = data_directory_path
         self.software_paths = software_paths
 
+        # ---- cross-panel (union + mask) --------------------------------------
+        # OFF by default, so every existing blob, variant and test keeps the
+        # single-panel behaviour: pass 1 hard-raises unless all sections share
+        # an identical `.var`.
+        #
+        # ON, sections are stored at their OWN gene width with a `gene_ids`
+        # index into a corpus-wide vocabulary, and the union is assembled per
+        # BLOCK at load time. Storing at a padded global width instead would be
+        # simpler but is not affordable: the corpus is ~1.21 TB dense at the
+        # section-weighted mean width of 2,752 genes, 4.21 TB padded to the
+        # 9,571-gene union, 8.33 TB padded to the full 18,937.
+        #
+        # `exclude_sections` drops sections by file stem BEFORE the vocabulary
+        # is computed. That ordering is the point: the vocabulary is the union
+        # over the sections actually built, so a built section can never carry a
+        # gene outside it. Filtering GENES instead would silently drop columns
+        # from sections that measured them -- excluding `chp60-1b_1p`'s ~9,366
+        # exclusive genes while still building that section would discard ~49%
+        # of its data with no error. This is also the knob for growing the
+        # vocabulary later: build with the section included and V goes from
+        # 9,571 to 18,937 with no code change.
+        self.cross_panel = bool(cross_panel)
+        self.exclude_sections = set(exclude_sections or ())
+        self.gene_vocab = None            # pd.Index of gene names, len V
+        self._gene_ids_per_batch: dict = {}   # batch_id -> np.ndarray[G_sec]
+
         # force_reload is consulted by OnDiskDataset._process via the base
         # Dataset; store it so `process()` gating matches PyG semantics.
         self.force_reload = overwrite
+
+        # ... except it does NOT survive. `OnDiskDataset.__init__` takes no
+        # `force_reload` argument, and the base `Dataset.__init__` assigns
+        # `self.force_reload = force_reload` from its own default of False
+        # (torch_geometric/data/dataset.py:109) -- AFTER the line above, and
+        # before `_process()` reaches `if not self.force_reload and
+        # files_exist(...)` (:255). So `overwrite=True` silently did nothing
+        # whenever a blob already existed. Every test passed only because each
+        # builds into a fresh tmp dir.
+        #
+        # Benign until now; actively unsafe with cross_panel, because
+        # `gene_ids` are baked into each stored section. Rebuilding after
+        # changing `exclude_sections` (and therefore the vocabulary) would have
+        # silently kept the old rows, leaving every section's ids pointing at
+        # the wrong genes -- a wrong answer, not a crash.
+        #
+        # Remove the gate artifacts instead, which is what `overwrite` promises.
+        # `processed_paths` is exactly [store, manifest.json]; the store must go
+        # too, not just the manifest, or `process()` would re-run and APPEND to
+        # the existing rows. `self.backend` is normally set by the base init, so
+        # set it here for `processed_file_names`, which is backend-dependent.
+        if overwrite:
+            self.backend = backend
+            for _path in self.processed_paths:
+                _p = Path(_path)
+                if _p.is_dir():
+                    shutil.rmtree(_p)
+                elif _p.exists():
+                    _p.unlink()
 
         # Drive PyG's OnDiskDataset (SQLite), NOT InMemoryDataset. Its
         # __init__ opens/creates the DB and calls _process() -> process()
@@ -300,10 +359,35 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # Deterministic order for reproducible builds.
         raw_files = sorted(self.raw_paths, key=lambda p: str(p))
 
+        # Drop excluded sections BEFORE the vocabulary is computed, so V is the
+        # union over what is actually built (see `cross_panel` in __init__).
+        if self.exclude_sections:
+            kept = [f for f in raw_files
+                    if Path(f).stem not in self.exclude_sections]
+            dropped = [Path(f).stem for f in raw_files if f not in kept]
+            missing = self.exclude_sections - {Path(f).stem for f in raw_files}
+            if missing:
+                raise ValueError(
+                    f"exclude_sections names sections that are not in "
+                    f"{self.raw_dir}: {sorted(missing)}. Refusing to build, "
+                    f"because a typo here would silently include a section the "
+                    f"caller meant to leave out (and, with cross_panel, widen "
+                    f"the vocabulary accordingly)."
+                )
+            print(f"Excluding {len(dropped)} section(s) from the build: "
+                  f"{sorted(dropped)}")
+            raw_files = kept
+
         # ---------------- Pass 1: gene panel + label vocab (streamed) ------
         self.gene_panel = None
         self.label_categories = {ln: set() for ln in self.label_names}
         obs_index: dict = {}   # batch_id -> obs sidecar relpath
+        # cross_panel only: accumulate the vocabulary and remember each
+        # section's own gene order. Strings are held only until pass 1 ends,
+        # then collapsed to integer ids (636 sections x ~5k genes x int32 is
+        # ~13 MB, versus ~32 MB of interned strings).
+        vocab: set = set()
+        var_index_per_batch: dict = {}
 
         for adata_batch_file in raw_files:
             # BACKED read: pass 1 only needs .var (gene panel), .obs (spilled
@@ -324,13 +408,32 @@ class OnDiskDatasetBlob(OnDiskDataset):
                 pickle.dump(adata_batch.obs.copy(), f)
             obs_index[batch_id] = obs_rel
 
-            if self.gene_panel is None:
+            if self.cross_panel:
+                # Union, not intersection. Intersection is not merely lossy
+                # across the corpus, it is EMPTY: 46 distinct panels whose
+                # global intersection is 0 genes (`_panelsurvey_summary.json`).
+                # No `.var` metadata comparison either -- panels legitimately
+                # disagree there, and the only per-gene fact this path needs is
+                # the name, which is what the vocabulary is keyed on.
+                names = list(adata_batch.var.index)
+                if len(set(names)) != len(names):
+                    raise ValueError(
+                        f"{Path(adata_batch_file).name} has duplicate gene "
+                        f"names in .var; the vocabulary maps name -> column, "
+                        f"so duplicates would make `gene_ids` ambiguous."
+                    )
+                var_index_per_batch[batch_id] = names
+                vocab.update(names)
+            elif self.gene_panel is None:
                 self.gene_panel = adata_batch.var
             else:
                 if set(self.gene_panel.index) != set(adata_batch.var.index):
                     raise ValueError(
                         "All batches must share the same gene panel "
-                        "(gene SETS differ between batches)."
+                        "(gene SETS differ between batches). Build with "
+                        "cross_panel=True to store each section at its own "
+                        "width with a `gene_ids` index into a shared "
+                        "vocabulary."
                     )
                 aligned_var = adata_batch.var.reindex(self.gene_panel.index)
                 if not self.gene_panel.equals(aligned_var):
@@ -360,6 +463,40 @@ class OnDiskDatasetBlob(OnDiskDataset):
         for label_name in self.label_names:
             self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
 
+        # ---- finalise the cross-panel vocabulary --------------------------
+        if self.cross_panel:
+            # NOTE: no local `import pandas as pd` here. A function-level import
+            # would make `pd` local to the whole of process(), shadowing the
+            # module-level import and making the EARLIER use of `pd` in the
+            # pass-1 label loop raise UnboundLocalError.
+            #
+            # SORTED, so the vocabulary is a deterministic function of the gene
+            # names alone -- independent of file order, of which section happens
+            # to be read first, and of set iteration order. A build must be
+            # reproducible: `gene_ids` are baked into every stored section, so a
+            # vocabulary that reshuffled between builds would silently
+            # invalidate an existing blob (and any checkpoint trained on it,
+            # whose V-wide weight rows are indexed by exactly these ids).
+            self.gene_vocab = pd.Index(sorted(vocab), name="gene")
+            pos = {g: i for i, g in enumerate(self.gene_vocab)}
+            self._gene_ids_per_batch = {
+                bid: np.fromiter((pos[g] for g in names), dtype=np.int64,
+                                 count=len(names))
+                for bid, names in var_index_per_batch.items()
+            }
+            widths = sorted({len(v) for v in self._gene_ids_per_batch.values()})
+            print(f"Cross-panel vocabulary: {len(self.gene_vocab)} genes over "
+                  f"{len(self._gene_ids_per_batch)} sections; per-section "
+                  f"widths {widths[0]}..{widths[-1]} "
+                  f"({len(widths)} distinct).")
+            with open(meta / "gene_vocab.pkl", "wb") as f:
+                pickle.dump(self.gene_vocab, f)
+            # `gene_panel.pkl` is what predict() reads to recover gene names
+            # (run_squint.py, "Resolved gene names ... from gene_panel.pkl").
+            # Write the vocabulary in that shape so the existing consumer keeps
+            # working; in cross-panel mode it is the vocabulary, not one panel.
+            self.gene_panel = pd.DataFrame(index=self.gene_vocab)
+
         with open(meta / "label_categories.pkl", "wb") as f:
             pickle.dump(self.label_categories, f)
         with open(meta / "gene_panel.pkl", "wb") as f:
@@ -371,11 +508,24 @@ class OnDiskDatasetBlob(OnDiskDataset):
         section_ids: List[int] = []
         node_counts: List[int] = []
         batch_labels: List[str] = []
+        # In cross-panel mode `process_anndata_batch` must NOT reindex. Its
+        # only use of `self.gene_panel` is to reindex each section onto a single
+        # canonical panel (in_memory_dataset_blob.py:381-385) -- exactly what we
+        # are replacing -- and with the vocabulary now stored there, leaving it
+        # set would reindex every section up to the full width V, reintroducing
+        # the padding this design exists to avoid. None disables that branch
+        # and touches nothing else in the inherited method.
+        _panel_for_pass2 = self.gene_panel
+        if self.cross_panel:
+            self.gene_panel = None
+
         for adata_batch_file in raw_files:
             print(f"Processing {adata_batch_file}...")
             # Inherited; pre_filter/pre_transform already applied inside it
             # (in_memory_dataset_blob.py:579-585).
             data_batch = self.process_anndata_batch(adata_batch_file)
+            if self.cross_panel:
+                self._stamp_gene_ids(data_batch)
             # Append as a serialized row. schema=object => serialize() is a
             # passthrough and the DB pickles the Data (list attrs survive).
             self.append(self.serialize(data_batch))
@@ -397,9 +547,19 @@ class OnDiskDatasetBlob(OnDiskDataset):
         #   - batch_labels -> the label->dense-id map for per-cell batch ids
         #     must be built ONCE over all sections. Densifying per block
         #     would assign dense id 0 to a different section in every block.
+        if self.cross_panel:
+            self.gene_panel = _panel_for_pass2
+
         manifest = {
-            "manifest_version": 2,
+            # 3 adds the cross-panel fields. `_load_sidecars` reads every field
+            # with .get(), so a v2 blob keeps loading unchanged.
+            "manifest_version": 3,
             "name": self.name,
+            "cross_panel": self.cross_panel,
+            "gene_vocab_size": (
+                int(len(self.gene_vocab)) if self.gene_vocab is not None else None
+            ),
+            "excluded_sections": sorted(self.exclude_sections),
             # Which container holds the rows. Recorded so a reopen knows what to
             # expect and so a blob built before this field defaults to sqlite.
             "container": self.backend,
@@ -412,6 +572,44 @@ class OnDiskDatasetBlob(OnDiskDataset):
         }
         with open(meta / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)
+
+    def _stamp_gene_ids(self, data_batch) -> None:
+        """
+        Attach this section's vocabulary ids, cross-panel builds only.
+
+        Shape is `[1, G_sec]`, NOT `[G_sec]`, and that is load-bearing rather
+        than stylistic. PyG decides "is this a node attribute?" purely by
+        testing `size(cat_dim) == num_nodes` -- a SHAPE test, with no reference
+        to the key. A flat `[G_sec]` therefore becomes a node attribute by
+        accident whenever a section has as many cells as genes, after which
+        collation and `NeighborLoader` slice it like per-cell data and the ids
+        silently stop corresponding to the columns of `x`. At corpus scale
+        (thousands of genes, thousands of cells) that coincidence is ordinary,
+        not exotic. A leading singleton dim can only collide when a section
+        holds exactly one cell. Verified both ways in
+        `tests/test_gene_vocab_pyg_contract.py`.
+
+        The name is also checked there: `Data.__inc__` adds an offset to any key
+        CONTAINING "batch", which is what silently shifted `adata_batch_ids`
+        0/1/2 into 0/2/5. "gene_ids" is inert under that rule.
+        """
+        bid = int(data_batch.adata_batch_id)
+        ids = self._gene_ids_per_batch.get(bid)
+        if ids is None:
+            raise KeyError(
+                f"No gene ids recorded for adata_batch_id {bid}. Pass 1 builds "
+                f"the map from the same file list as pass 2, so this means the "
+                f"two passes disagreed about which sections exist."
+            )
+        n_genes = int(data_batch["x_cell_gene_counts"].shape[1])
+        if len(ids) != n_genes:
+            raise ValueError(
+                f"Section {bid}: pass 1 recorded {len(ids)} genes but the "
+                f"processed counts have {n_genes} columns. `gene_ids` must "
+                f"index the columns of `x_cell_gene_counts` exactly, or the "
+                f"per-block union would scatter counts into the wrong genes."
+            )
+        data_batch.gene_ids = torch.as_tensor(ids, dtype=torch.long).unsqueeze(0)
 
     # ------------------------------------------------------------------ #
     # Metadata restore
@@ -426,6 +624,7 @@ class OnDiskDatasetBlob(OnDiskDataset):
         self.node_counts: Optional[List[int]] = None
         self.batch_labels: Optional[List[str]] = None
         self.container: str = "sqlite"
+        _manifest: dict = {}
         if mpath.exists():
             with open(mpath) as f:
                 _manifest = json.load(f)
@@ -440,6 +639,15 @@ class OnDiskDatasetBlob(OnDiskDataset):
         if gp.exists():
             with open(gp, "rb") as f:
                 self.gene_panel = pickle.load(f)
+
+        # Cross-panel fields. All read with .get()/exists() so a v2 blob (and
+        # every blob built before this) reopens exactly as it did.
+        self.cross_panel = bool(_manifest.get("cross_panel", False))
+        self.gene_vocab = None
+        gv = meta / "gene_vocab.pkl"
+        if gv.exists():
+            with open(gv, "rb") as f:
+                self.gene_vocab = pickle.load(f)
 
         lc = meta / "label_categories.pkl"
         if lc.exists():
