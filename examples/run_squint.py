@@ -4789,7 +4789,23 @@ def _patch_step_budget(
         val_check_interval = max(1, int(max_steps) // max(1, int(val_checks)))
     cfg["trainer"]["max_steps"] = int(max_steps)
     cfg["trainer"]["max_epochs"] = int(max_epochs)
-    cfg["trainer"]["check_val_every_n_epoch"] = 1
+    # MUST be None, not 1. With an int here Lightning treats
+    # `val_check_interval` as an offset WITHIN one epoch and hard-raises if it
+    # exceeds the batches per epoch:
+    #
+    #   ValueError: `val_check_interval` (1000) must be less than or equal to
+    #   the number of the training batches (821). ... If you want to validate
+    #   based on the total training batches, set `check_val_every_n_epoch=None`
+    #
+    # (measured on `smoke-steps+stream+xhs1000-39b_1p`, R0 = 821 train batches
+    # per epoch.) None switches it to the GLOBAL step grid, which is the whole
+    # point of a step budget — the interval must be free to span epoch
+    # boundaries. Note this bites hardest at SMALL scale: R0 has 821
+    # batches/epoch so any interval above that is rejected, whereas one corpus
+    # epoch is ~174,023 steps and would have swallowed the same setting
+    # silently. `val_check_interval` must be an int when this is None, which
+    # the line below guarantees.
+    cfg["trainer"]["check_val_every_n_epoch"] = None
     cfg["trainer"]["val_check_interval"] = int(val_check_interval)
     return cfg
 
@@ -38419,8 +38435,13 @@ def train(
         # early stopping on a coarser val grid. `getattr`-style
         # fallback to 1 keeps backward compat for any cfg that
         # doesn't carry the key.
-        check_val_every_n_epoch=int(
-            cfg["trainer"].get("check_val_every_n_epoch", 1)
+        # None means "ignore epoch boundaries and validate purely on the
+        # global step grid", which is what a step budget needs — see
+        # `_patch_step_budget`. Kept nullable rather than coerced with int(),
+        # which would raise on None.
+        check_val_every_n_epoch=(
+            None if cfg["trainer"].get("check_val_every_n_epoch", 1) is None
+            else int(cfg["trainer"]["check_val_every_n_epoch"])
         ),
         # Validate every N optimizer steps when set to an int (Lightning's
         # default is the float 1.0 = "once per training epoch"). Required
