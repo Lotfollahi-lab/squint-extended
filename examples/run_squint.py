@@ -38604,6 +38604,43 @@ def predict(
 
     # Build dataset + datamodule + model from the saved config.
     dataset_blob = initialize_dataset_blob(config)
+
+    # ---- Streaming (`backend: on-disk`) configs -------------------------------
+    # The on-disk branch of `initialize_dataset_blob` attaches the composed
+    # transforms as `section_transform` -- the streaming loader applies them per
+    # section -- and deliberately leaves PyG's `transform` hook unset, so that
+    # `get(idx)` stays cheap for the metadata reads that only want cell counts.
+    # `initialize_databatch` below builds its data_list as
+    # `[dataset_blob[idx] for idx in adata_batch_idx]`, so on a streaming config
+    # it would collate RAW sections: no `data.x` / `data.y` (produced by
+    # SetExperimentDataKeys) and no split masks (SpatialBatchSplit).
+    #
+    # Attaching the hook here makes `dataset_blob[idx]` behave exactly like the
+    # in-memory blob, so the whole tested predict path downstream is reused
+    # unchanged rather than duplicated for streaming. Note predict does NOT
+    # stream: `data` becomes a collated Batch, so `initialize_datamodule`
+    # dispatches to InMemoryDataModule (it switches on the type of `data`, not
+    # on `config['dataset']['backend']`).
+    #
+    # Safe for the streaming loader as well -- `KSectionBlockLoader._fetch_section`
+    # reads via `dataset.get(row)`, which bypasses `Dataset.__getitem__` and so
+    # can never double-apply the transforms.
+    #
+    # CAVEAT, and the reason this is a stop-gap rather than the answer: collating
+    # the whole blob is exactly what streaming exists to avoid. It is fine at R0
+    # scale (39 sections / 519,058 cells / 4,948 genes ~= 10 GB dense for `x`,
+    # ~21 GB at the collation peak) and hopeless for the 110M-cell corpus, which
+    # needs predict routed through `OnDiskStreamingDataModule.predict_dataloader`
+    # plus a streaming writer for `predicted_adata.h5ad`.
+    _section_tf = getattr(dataset_blob, "section_transform", None)
+    if _section_tf is not None and getattr(dataset_blob, "transform", None) is None:
+        dataset_blob.transform = _section_tf
+        print(
+            f"Predict: streaming blob detected ({type(dataset_blob).__name__}); "
+            f"attached the per-section transforms to PyG's `transform` hook so "
+            f"the {len(dataset_blob)} sections are transformed before collation."
+        )
+
     with open(Path(dataset_blob.processed_dir) / "label_categories.pkl", "rb") as f:
         label_categories = pickle.load(f)
 
