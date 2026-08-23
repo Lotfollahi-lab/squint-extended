@@ -5240,9 +5240,28 @@ def _patch_quick(
     can't accidentally drift the smoke test into a heavier config.
     Dataset patches applied AFTER `_patch_quick` (e.g. `_patch_dual_mmb20`)
     can still override batch_size if they need to.
+
+    Also forces `check_val_every_n_epoch = 1` for a 1-epoch cap. The base
+    config sets it to 2 (a throughput optimisation for real 80-epoch runs),
+    and Lightning schedules validation when `(current_epoch + 1) %
+    check_val_every_n_epoch == 0` — so with `max_epochs=1` the only epoch is
+    epoch 0 and validation NEVER runs. That is not merely a missing metric:
+    `ModelCheckpoint._should_save_on_train_epoch_end()` returns False as soon
+    as `check_val_every_n_epoch != 1` (pytorch_lightning 2.4.0,
+    model_checkpoint.py:425-432), so the callback only ever saves from
+    `on_validation_end` — which is never reached. The result is a smoke test
+    that logs no `val_*` metric and writes an EMPTY `checkpoints/`, i.e. one
+    that covers neither the validation path nor checkpointing, and leaves
+    nothing for `--predict` to load. Diagnosed on
+    `smoke-test+stream+xhs1000-39b_1p` (run 20260823_010659_seed0): full train
+    epoch (6,548 steps), empty Validation banner, empty `checkpoints/`.
+    Only applied when `max_epochs < 2`, so a caller asking for more epochs
+    keeps the base cadence.
     """
     cfg["trainer"]["max_epochs"] = int(max_epochs)
     cfg["trainer"]["early_stopping_params"]["enabled"] = False
+    if int(max_epochs) < 2:
+        cfg["trainer"]["check_val_every_n_epoch"] = 1
     # Narrow GNN — single-hop everywhere.
     cfg["model"]["encoder_params"]["gnn_params"]["num_layers"] = 1
     cfg["datamodule"]["sampler_params"]["num_neighbors"] = [8]
