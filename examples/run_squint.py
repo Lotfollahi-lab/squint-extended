@@ -4600,6 +4600,7 @@ def _patch_streaming(
 def _patch_no_val(
         cfg: dict,
         checkpoint_every_n_steps: int = 2000,
+        save_top_k: Optional[int] = None,
     ) -> dict:
     """
     Disable the validation loop and checkpoint on a pure step schedule.
@@ -4653,12 +4654,40 @@ def _patch_no_val(
         ModelCheckpoint saves on this schedule alone rather than ranking by a
         metric — see the `monitor in (None, ...)` branch in `train()` for why
         `train_loss` cannot stand in for `val_loss` here.
+
+        MEASURED, because the cadence looks alarming and is not: a checkpoint
+        is 60 MB (R0's are 60,242,202 B) and an fsync'd 60 MB write to this
+        Lustre filesystem takes 0.19 s. Each event writes the tracked file and
+        refreshes `last.ckpt`, so on a 200,000-step corpus run:
+
+            every  1,000 steps = 200 events = 1.2 min = 0.34% of a 6.1 h run
+            every  2,000 steps = 100 events = 0.6 min = 0.17%
+            every 10,000 steps =  20 events = 0.1 min = 0.03%
+
+        Disk does not accumulate either: with `save_top_k=1` and no monitor,
+        `_save_none_monitor_checkpoint` deletes the previous file after saving
+        the new one (pytorch_lightning 2.4.0, model_checkpoint.py:717-718), so
+        the directory holds 2 files (~120 MB), not one per event.
+
+        So pick this from CRASH EXPOSURE, not from write cost: the cadence is
+        what you lose when a job dies, and `stream+r0` dying at epoch 35 after
+        111 min shows that is the live risk. At 2,000 the exposure is ~3.7 min
+        of training. There is no reason to economise here — for scale, the val
+        pass this patch removes was 8.4 h, three orders of magnitude larger.
+    save_top_k:
+        Override `checkpoint_params['save_top_k']`. Leave as None to keep the
+        base config's 1 (rolling: newest kept, previous deleted). Pass -1 to
+        retain every save, which is what a test wants — with save_top_k=1 the
+        deletions make a working step schedule indistinguishable from one that
+        only fired once.
     """
     cfg["trainer"]["limit_val_batches"] = 0
     cfg["trainer"]["monitor"] = None
     cfg["trainer"]["checkpoint_params"]["every_n_train_steps"] = int(
         checkpoint_every_n_steps
     )
+    if save_top_k is not None:
+        cfg["trainer"]["checkpoint_params"]["save_top_k"] = int(save_top_k)
     # EarlyStopping keys off `val_loss`, and by default it evaluates at
     # validation end -- with no validation it would simply never fire, so
     # leaving it "enabled" would be a lie in the archived config.
@@ -5638,6 +5667,11 @@ VARIANTS: dict = {
                 max_steps=3_000,
             ),
             checkpoint_every_n_steps=1000,
+            # Keep all 3 saves. With the default save_top_k=1 each save
+            # deletes the previous, so a schedule that fired 3 times and one
+            # that fired once leave an identical directory — which would make
+            # this test unable to prove the thing it exists to prove.
+            save_top_k=-1,
         ),
     },
     "stream+r0-steps+xhs1000-39b_1p": {
