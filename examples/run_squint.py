@@ -38723,6 +38723,45 @@ def predict(
     _train_label_to_dense: dict = {
         lbl: i for i, lbl in enumerate(sorted(_train_labels))
     }
+
+    # ---- Streaming backend uses a DIFFERENT train-time map --------------------
+    # The reconstruction above mirrors `build_batch_one_hot_from_obs`, which
+    # densifies over TRAIN sections only -- correct for the in-memory backend.
+    # `OnDiskStreamingDataModule` does not do that: `initialize_datamodule`
+    # constructs it without `batch_label_to_dense`, so it falls back to
+    # `dataset.batch_label_to_dense()`, which is derived from the MANIFEST and
+    # therefore spans every section in the blob, held-out ones included. (Hence
+    # R0's "n_distinct_batches=39 (over 39 sections)" and a `batch_embedding` of
+    # 624 params = 39 rows x 16 dim, four of whose rows never receive a gradient.)
+    #
+    # Rebuilding a 35-label map at predict time then shifts every dense id: with
+    # batch0 / batch22 / batch3 / batch7 held out, sorted-unique over 35 labels
+    # maps batch1->0 where training used batch1->1, and so on for all 35 shared
+    # labels. Each cell's decoder covariate would be looked up in the wrong
+    # embedding row.
+    #
+    # Scope of the damage had this gone unnoticed: the covariate is concatenated
+    # to the QUANTISED latent and only feeds the decoders, and this variant has
+    # no encoder batch conditioning (`no-batch-int`, FiLM off, and the collated
+    # batch reports encoder_condition_dim=0), so `Indices_cell` / `Indices_niche`
+    # would still have been correct while `X_hat` and every reconstruction
+    # metric derived from it would have been silently wrong.
+    #
+    # Predict must reproduce whatever map training used, so read it from the
+    # dataset for streaming blobs rather than reconstructing it.
+    if hasattr(dataset_blob, "batch_label_to_dense"):
+        _stream_map = dataset_blob.batch_label_to_dense()
+        if _stream_map and _stream_map != _train_label_to_dense:
+            print(
+                f"Predict: streaming blob -- using the manifest-wide "
+                f"label->dense map training actually used "
+                f"({len(_stream_map)} labels) instead of the "
+                f"train-sections-only reconstruction ({len(_train_label_to_dense)} "
+                f"labels). Rebuilding would shift every dense id and index the "
+                f"decoder covariate embedding on the wrong row."
+            )
+            _train_label_to_dense = dict(_stream_map)
+
     if _train_label_to_dense:
         print(
             f"Predict: train-time label->dense map (used for batch "
