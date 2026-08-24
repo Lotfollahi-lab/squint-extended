@@ -339,3 +339,34 @@ def test_per_cell_gene_mask_refuses_half_a_panel_table():
     blk.panel_masks = torch.ones(2, 3, dtype=torch.bool)
     with pytest.raises(ValueError, match="half the panel table"):
         VQNiche_Dual._per_cell_gene_mask(blk)
+
+
+# --------------------------------------------------------------------------- #
+# every forward call site must carry the cross-panel pair
+# --------------------------------------------------------------------------- #
+
+def test_all_forward_call_sites_pass_gene_ids_and_mask():
+    """
+    Regression for a real bug: only `_step` (train/val) passed gene_ids /
+    gene_mask, so `test_step` and `predict_step` ran the softmax unmasked.
+    `_perpanelrecon.py` caught it as X_hat non-zero at UNMEASURED genes (max
+    96.6 and 125 on xhc38-4b_1p's two 319-gene sections). Nothing raised.
+
+    A source-level check rather than a behavioural one, deliberately: the bug
+    was an omission at a call site, and a behavioural test would need a full
+    model plus a Trainer to reach `predict_step`. This catches a fourth call
+    site added later without the pair.
+    """
+    import inspect
+    import re
+
+    from vqniche.models import vqniche_dual
+
+    src = inspect.getsource(vqniche_dual)
+    # each `... = self(` opens a forward call; capture its argument list
+    calls = [m.start() for m in re.finditer(r"= self\(\n", src)]
+    assert len(calls) >= 3, f"expected >=3 forward call sites, found {len(calls)}"
+    for pos in calls:
+        args = src[pos:src.index("\n        )", pos)]
+        assert "gene_ids=" in args, f"forward call missing gene_ids:\n{args[:200]}"
+        assert "gene_mask=" in args, f"forward call missing gene_mask:\n{args[:200]}"

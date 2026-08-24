@@ -995,6 +995,18 @@ class VQNiche_Dual(BaseModel):
         attr_decoder_conditions = getattr(test_batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(test_batch, 'adata_batch_ids',         None)
         unseen_mask             = getattr(test_batch, 'adata_batch_ids_unseen_mask', None)
+        # Cross-panel: same pair `_step` passes. Omitting them here was a real
+        # bug -- `_perpanelrecon.py` caught `X_hat` non-zero at UNMEASURED genes
+        # (max 96.6 and 125 on the two 319-gene sections of xhc38-4b_1p), i.e.
+        # the softmax was normalising over all 419 and leaking mass onto genes
+        # those sections never measured. Nothing raised.
+        #
+        # Pearson happens to be immune -- softmax preserves the ratios among a
+        # subset, so the leak is a per-cell scalar and r is unchanged -- which is
+        # why the panel comparison stayed valid. Anything NOT scale-invariant
+        # (MSE, NB likelihood, absolute expression) was wrong.
+        gene_ids  = getattr(test_batch, 'gene_ids', None)
+        gene_mask = self._per_cell_gene_mask(test_batch)
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, _logits) = self(
@@ -1005,6 +1017,8 @@ class VQNiche_Dual(BaseModel):
             adata_batch_ids_unseen_mask=unseen_mask,
             read_depth=test_batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
+            gene_ids=gene_ids,
+            gene_mask=gene_mask,
         )
         self._cache_inference_data(
             batch=test_batch, batch_size=batch_size,
@@ -1026,6 +1040,18 @@ class VQNiche_Dual(BaseModel):
         attr_decoder_conditions = getattr(predict_batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(predict_batch, 'adata_batch_ids',         None)
         unseen_mask             = getattr(predict_batch, 'adata_batch_ids_unseen_mask', None)
+        # Cross-panel: same pair `_step` passes. Omitting them here was a real
+        # bug -- `_perpanelrecon.py` caught `X_hat` non-zero at UNMEASURED genes
+        # (max 96.6 and 125 on the two 319-gene sections of xhc38-4b_1p), i.e.
+        # the softmax was normalising over all 419 and leaking mass onto genes
+        # those sections never measured. Nothing raised.
+        #
+        # Pearson happens to be immune -- softmax preserves the ratios among a
+        # subset, so the leak is a per-cell scalar and r is unchanged -- which is
+        # why the panel comparison stayed valid. Anything NOT scale-invariant
+        # (MSE, NB likelihood, absolute expression) was wrong.
+        gene_ids  = getattr(predict_batch, 'gene_ids', None)
+        gene_mask = self._per_cell_gene_mask(predict_batch)
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, _logits) = self(
@@ -1036,6 +1062,8 @@ class VQNiche_Dual(BaseModel):
             adata_batch_ids_unseen_mask=unseen_mask,
             read_depth=predict_batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
+            gene_ids=gene_ids,
+            gene_mask=gene_mask,
         )
         # Build a per-batch cache the predict-collator can fold together.
         return self._cache_inference_data(
