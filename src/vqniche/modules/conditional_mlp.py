@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.nn import MLP as MLP_Module
 from .film import FiLM
+from .mlp import _lin_or_gather, _lin_or_gather_out
 
 
 class ConditionalMLP(MLP_Module):
@@ -60,12 +61,19 @@ class ConditionalMLP(MLP_Module):
         batch_size: Optional[int] = None,
         return_emb: Optional[bool] = None,
         conditions: Optional[torch.Tensor] = None,  # optional
+        gene_ids: Optional[torch.Tensor] = None,
+        out_gene_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        `gene_ids`: cross-panel gather on the FIRST layer -- see
+        `vqniche.modules.mlp._lin_or_gather`, which both MLP variants share so
+        they cannot drift apart. `None` leaves this path unchanged.
+        """
         emb: Optional[torch.Tensor] = None
         film_on = self.films is not None and conditions is not None
 
         for i, (lin, norm) in enumerate(zip(self.lins, self.norms)):
-            x = lin(x)
+            x = _lin_or_gather(lin, x, gene_ids if i == 0 else None)
             if self.act is not None and self.act_first:
                 x = self.act(x)
             if self.supports_norm_batch:
@@ -83,7 +91,12 @@ class ConditionalMLP(MLP_Module):
                 emb = x
 
         if self.plain_last:
-            x = self.lins[-1](x)
+            # Also `lins[0]` when this MLP has a single layer, in which case the
+            # loop above did not run and the gather belongs here.
+            if len(self.lins) == 1 and gene_ids is not None:
+                x = _lin_or_gather(self.lins[-1], x, gene_ids)
+            else:
+                x = _lin_or_gather_out(self.lins[-1], x, out_gene_ids)
             if film_on and self.apply_to_last and len(self.films) > len(self.norms):
                 x = self.films[-1](x, conditions)
             x = F.dropout(x, p=self.dropout[-1], training=self.training)

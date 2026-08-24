@@ -5084,6 +5084,70 @@ def _patch_dual_spatch_subset(
     return cfg
 
 
+def _patch_dual_xhc38_4b(
+        cfg: dict,
+        train_batch_idx: Optional[List[int]] = None,
+        test_batch_idx=None,
+        batch_size: int = 512,
+        edge_sampling_ratio: float = 1.0,
+    ) -> dict:
+    """
+    Cross-panel dataset switch: xhc38-4b_1p (Xenium human colon, 4 sections).
+
+    Panels 419 and 319 with 319 a strict SUBSET of 419, so the block union is
+    419 and 100 genes are masked for the two 319-gene sections. Batch ids and
+    their panels: batch0=319, batch1=419, batch2=419, batch3=319.
+
+    Whichever holdout is chosen must leave BOTH panels in training -- otherwise
+    every block carries one panel, the mask is all-ones and the run does not
+    exercise cross-panel at all while appearing to succeed.
+
+    Unannotated dataset (`label_names=[]` at build): `SetExperimentDataKeys`
+    returns a 0-channel `y` (transforms.py:699), giving `num_classes=0`, which
+    is fine because the reference recipe registers no cross-entropy. Label-based
+    benchmark metrics are therefore not computable here.
+    """
+    return _patch_dual_spatch_subset(
+        cfg,
+        dataset_name="xhc38-4b_1p",
+        train_batch_idx=train_batch_idx,
+        test_batch_idx=test_batch_idx,
+        batch_size=batch_size,
+        edge_sampling_ratio=edge_sampling_ratio,
+        root_data_dir=str(DATA_ROOT),
+    )
+
+
+def _patch_dual_xhb42_3b(
+        cfg: dict,
+        train_batch_idx: Optional[List[int]] = None,
+        test_batch_idx=None,
+        batch_size: int = 256,
+        edge_sampling_ratio: float = 1.0,
+    ) -> dict:
+    """
+    Cross-panel dataset switch: xhb42-3b_1p (Xenium human brain, 3 sections).
+
+    The HARD case -- panels 350 and 317 with intersection 262, so 88 genes are
+    exclusive to one and 55 to the other and the union (405) is strictly WIDER
+    than either panel. `xhc38-4b_1p` cannot catch a bug that takes `max()`
+    instead of a real union; this can. Batch ids: batch0=350, batch1=317,
+    batch2=317.
+
+    Only 109,007 cells, hence the smaller default batch. Unannotated, same as
+    `_patch_dual_xhc38_4b`.
+    """
+    return _patch_dual_spatch_subset(
+        cfg,
+        dataset_name="xhb42-3b_1p",
+        train_batch_idx=train_batch_idx,
+        test_batch_idx=test_batch_idx,
+        batch_size=batch_size,
+        edge_sampling_ratio=edge_sampling_ratio,
+        root_data_dir=str(DATA_ROOT),
+    )
+
+
 def _patch_dual_xhs1000_39b(
         cfg: dict,
         train_batch_idx: Optional[List[int]] = None,
@@ -5675,6 +5739,73 @@ VARIANTS: dict = {
             # gives the contrastive / covariate terms far more cross-section
             # signal than the default 4. Sweep {4, 8, 16} in Phase 2 proper.
             sections_per_block=8,
+        ),
+    },
+
+    # ---- cross-panel (union + mask) smoke tests --------------------------
+    "smoke-xpanel+xhc38-4b_1p": {
+        "description": (
+            "First cross-panel training run: xhc38-4b_1p, Xenium human colon, "
+            "panels 419 and 319 where 319 is a strict SUBSET of 419 (block "
+            "union 419, 100 genes masked for the two 319-gene sections). "
+            "Exercises the model side end to end -- vocabulary-width weights "
+            "gathered per block, masked softmax, masked-sum NB. 300 steps."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhc38-4b_1p dataset, test_batches=[3]",
+            "+streaming(sections_per_block=4, num_workers=2)",
+            "+step-budget(max_steps=300)",
+        ],
+        "build": lambda: _patch_step_budget(
+            _patch_streaming(
+                _patch_dual_xhc38_4b(
+                    _r0_reference_stack(),
+                    # Hold out ONE 319-gene section, leaving batch0(319),
+                    # batch1(419) and batch2(419) in training. Both panels must
+                    # stay: with one panel every block's mask is all-ones and
+                    # the run would exercise nothing while appearing to pass.
+                    test_batch_idx=[3],
+                    batch_size=512,
+                ),
+                # All 4 sections co-resident, so every block spans both panels.
+                sections_per_block=4,
+                num_workers=2,
+            ),
+            max_steps=300,
+            val_checks=3,
+        ),
+    },
+    "smoke-xpanel+xhb42-3b_1p": {
+        "description": (
+            "The HARD cross-panel case: xhb42-3b_1p, Xenium human brain, panels "
+            "350 and 317 with intersection 262 -- 88 and 55 exclusive genes, so "
+            "the union (405) is strictly WIDER than either panel. xhc38 is "
+            "nested and cannot catch a max()-instead-of-union bug; this can. "
+            "300 steps."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhb42-3b_1p dataset, test_batches=[2]",
+            "+streaming(sections_per_block=3, num_workers=2)",
+            "+step-budget(max_steps=300)",
+        ],
+        "build": lambda: _patch_step_budget(
+            _patch_streaming(
+                _patch_dual_xhb42_3b(
+                    _r0_reference_stack(),
+                    # Hold out batch2(317), leaving batch0(350) + batch1(317):
+                    # both panels, and their union is wider than either.
+                    test_batch_idx=[2],
+                    batch_size=256,
+                ),
+                sections_per_block=3,
+                num_workers=2,
+            ),
+            max_steps=300,
+            val_checks=3,
         ),
     },
 
@@ -38291,9 +38422,23 @@ def train(
                 data_batch.adj_decoder_condition_dim
             )
 
+    # Cross-panel blobs build the model at the gene VOCABULARY width, not at
+    # this object's own gene width. `initialize_streaming_probe` attaches
+    # `gene_vocab_size` for exactly this; see the comment there for why it
+    # cannot be delivered via `num_features` (a shadowing @property). One value
+    # sizes every vocabulary-wide tensor, because they all derive from
+    # `in_channels`: the encoder trunks' first layers, both decoder output
+    # layers, `dispersion` and `dispersion_niche`.
+    _in_channels = getattr(data_batch, "gene_vocab_size", None)
+    if _in_channels is None:
+        _in_channels = data_batch.num_features
+    else:
+        print(f"Model input width: {_in_channels} (gene vocabulary), vs "
+              f"{data_batch.num_features} genes on the probe section.")
+
     model = initialize_model(
         config=cfg,
-        in_channels=data_batch.num_features,
+        in_channels=_in_channels,
         out_channels=data_batch.num_classes,
     )
 

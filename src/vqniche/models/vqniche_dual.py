@@ -73,6 +73,30 @@ from vqniche.utils.loss_utils import (
 )
 
 
+def _gather_genes(
+        param: torch.Tensor,
+        gene_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+    """
+    Narrow a per-GENE parameter to the genes a block carries.
+
+    Used for `dispersion` / `dispersion_niche`, which `base_model.py:149` and
+    `:335` size from the model's `in_channels` -- the gene VOCABULARY width V
+    under cross_panel. A block only carries W of those genes, so the NB loss
+    needs the matching W thetas rather than all V.
+
+    Skips the indexing when the widths already agree, so the single-panel path
+    is untouched: a sorted index set of size V drawn from [0, V) can only be
+    arange(V), making the gather an identity.
+    """
+    if gene_ids is None:
+        return param
+    ids = gene_ids.reshape(-1)
+    if param.shape[0] == ids.numel():
+        return param
+    return param[ids]
+
+
 class VQNiche_Dual(BaseModel):
     def __init__(
             self,
@@ -459,8 +483,18 @@ class VQNiche_Dual(BaseModel):
             adata_batch_ids_unseen_mask: Optional[torch.Tensor] = None,
             read_depth: Optional[torch.Tensor] = None,
             adata_batch_ids: Optional[torch.Tensor] = None,
+            gene_ids: Optional[torch.Tensor] = None,
+            gene_mask: Optional[torch.Tensor] = None,
         ):
         """
+        `gene_ids` / `gene_mask` are the cross-panel pair, both `None` on the
+        single-panel path. Under `cross_panel` the model is built at the gene-
+        VOCABULARY width V while a block carries only W genes (the union of its
+        panels), so `gene_ids` narrows the encoder's input layers and the
+        decoders' output layers to those columns, and `gene_mask` tells the
+        decoders which of them each CELL actually measured. The mask is per-cell
+        rather than per-block because one block deliberately mixes panels.
+
         Returns
         -------
         z_mlp, z_gnn, z_q_cell, z_q_niche, idx_cell, idx_niche,
@@ -470,6 +504,7 @@ class VQNiche_Dual(BaseModel):
             batch_x=batch_x,
             batch_edge_index=batch_edge_index,
             batch_encoder_conditions=batch_encoder_conditions,
+            gene_ids=gene_ids,
         )
 
         if read_depth is None:
@@ -542,6 +577,8 @@ class VQNiche_Dual(BaseModel):
             x=z_q_cell_in,
             read_depth=read_depth,
             conditions=batch_attr_decoder_conditions,
+            gene_ids=gene_ids,
+            gene_mask=gene_mask,
         )
         # Niche decoder: z_q_niche -> per-cell prediction. We compute the NB
         # loss on the *aggregated* (1-hop neighborhood mean) version of this
@@ -550,6 +587,8 @@ class VQNiche_Dual(BaseModel):
             x=z_q_niche_in,
             read_depth=read_depth,
             conditions=batch_attr_decoder_conditions,
+            gene_ids=gene_ids,
+            gene_mask=gene_mask,
         )
 
         logits = self.predictor(z_mlp)
@@ -561,6 +600,32 @@ class VQNiche_Dual(BaseModel):
     # ------------------------------------------------------------------
     # Training / validation / test / predict steps
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _per_cell_gene_mask(batch) -> Optional[torch.Tensor]:
+        """
+        Build the per-cell measured-gene mask from a block's panel table.
+
+        Blocks carry `panel_masks [P, W]` (one row per DISTINCT panel) plus
+        `panel_id [N]`, so the per-cell mask is one gather. Returns `None` on
+        the single-panel path, where neither attribute exists.
+
+        Both must be present or neither: half of the pair would mean the block
+        assembly changed without this consumer following, and silently training
+        with no mask is exactly the failure mode the mask exists to prevent.
+        """
+        panel_masks = getattr(batch, 'panel_masks', None)
+        panel_id = getattr(batch, 'panel_id', None)
+        if panel_masks is None and panel_id is None:
+            return None
+        if panel_masks is None or panel_id is None:
+            raise ValueError(
+                f"Cross-panel block carries only half the panel table "
+                f"(panel_masks={'set' if panel_masks is not None else 'None'}, "
+                f"panel_id={'set' if panel_id is not None else 'None'}). Both "
+                f"are required to build the per-cell measured-gene mask."
+            )
+        return panel_masks[panel_id]
 
     def _step(self, batch: torch_geometric.data.Data, mode: str):
         """
@@ -574,11 +639,26 @@ class VQNiche_Dual(BaseModel):
         adata_batch_ids         = getattr(batch, 'adata_batch_ids',         None)
         unseen_mask             = getattr(batch, 'adata_batch_ids_unseen_mask', None)
 
+        # ---- cross-panel -----------------------------------------------------
+        # `gene_ids` and `panel_masks`/`panel_id` are stamped on the block by
+        # `KSectionBlockLoader._build_block` and survive NeighborLoader
+        # (asserted in tests/test_gene_vocab_pyg_contract.py). Absent on the
+        # single-panel path, where both stay None and nothing changes.
+        #
+        # The mask is materialised HERE rather than carried per-cell through the
+        # block: `panel_masks` is [P, W] (kilobytes) while a per-cell [N, W]
+        # block mask would be ~530 MB at K=8, and the gather is trivial at
+        # mini-batch size.
+        gene_ids = getattr(batch, 'gene_ids', None)
+        gene_mask = self._per_cell_gene_mask(batch)
+
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, logits) = self(
             batch_x=batch.x,
             batch_edge_index=batch.edge_index,
+            gene_ids=gene_ids,
+            gene_mask=gene_mask,
             batch_encoder_conditions=encoder_conditions,
             batch_attr_decoder_conditions=attr_decoder_conditions,
             adata_batch_ids_unseen_mask=unseen_mask,
@@ -729,13 +809,25 @@ class VQNiche_Dual(BaseModel):
             'edge_index':      batch.edge_index,
             'batch_edge_index': batch.edge_index,
             'batch_size':      batch_size,
+            # Sliced to `batch_size` for the same reason `pred_attr` and
+            # `target_attr` are (loss_utils.batch_pred_attr_and_target_attr):
+            # the losses score only the SEED cells, and an unsliced mask would
+            # not line up with them. Always present -- `_loss_fn_data` builds
+            # its dict by key lookup and would KeyError on a missing one -- and
+            # `None` on the single-panel path, which the NB loss reads as "no
+            # mask" and leaves its reduction untouched.
+            'gene_mask':       None if gene_mask is None else gene_mask[:batch_size],
             # Cell-branch NB reads `dispersion`; niche-branch NB reads
             # `dispersion_niche`. The two are decoupled per-gene parameters
             # so the niche-side gradient cannot drag the cell-branch theta
             # up (which was making the cell NB loss drift up over training
             # even when the cell decoder predictions weren't moving).
-            'dispersion':       torch.exp(self.dispersion),
-            'dispersion_niche': torch.exp(self.dispersion_niche),
+            # Both are per-GENE parameters sized at the vocabulary width V
+            # (base_model.py:149 and :335, from the model's in_channels), so
+            # under cross_panel they are narrowed to the block's genes for the
+            # same reason the decoder output layers are.
+            'dispersion':       torch.exp(_gather_genes(self.dispersion, gene_ids)),
+            'dispersion_niche': torch.exp(_gather_genes(self.dispersion_niche, gene_ids)),
             # Two commit losses (disjoint)
             'quantizer_input_cell':  z_mlp[:batch_size],
             'quantizer_output_cell': z_q_cell[:batch_size],

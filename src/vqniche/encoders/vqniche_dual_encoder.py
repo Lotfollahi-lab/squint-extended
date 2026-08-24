@@ -643,6 +643,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
+            gene_ids: Optional[torch.Tensor] = None,
         ):
         """
         Parameters
@@ -650,6 +651,16 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         batch_x: (N, n_genes)
         batch_edge_index: (2, num_edges)  — local node-IDs of the batch
         batch_encoder_conditions: optional FiLM conditioning tensor.
+        gene_ids: optional cross-panel gather, (1, W) or (W,). Under
+            `cross_panel` every input trunk is built at the gene-vocabulary
+            width V while `batch_x` is only W wide — the union of the current
+            block's panels — so each trunk's first layer is indexed down to
+            those columns. Passed to ALL trunks that consume `batch_x`
+            directly: `shared_mlp_module` (Y-shape mode), `mlp_module` (cell
+            path) and `niche_mlp_module` (decoupled mode). Missing any one of
+            them would leave that trunk expecting V columns and raise a shape
+            error, so this is fail-loud rather than silent. `None` leaves every
+            path unchanged.
 
         Returns
         -------
@@ -665,7 +676,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # `batch_x` and apply FiLM (if any) here. The result will be
         # concatenated with each path-specific MLP's output below.
         if self.shared_mlp_module is not None:
-            z_shared = self.shared_mlp_module(batch_x)
+            z_shared = self.shared_mlp_module(batch_x, gene_ids=gene_ids)
             if self.conditioning_module is not None:
                 z_shared = self.conditioning_module(
                     x=z_shared, conditions=batch_encoder_conditions,
@@ -675,7 +686,8 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
 
         # ---- cell-side MLP --------------------------------------------------
         z_mlp_cell_path = (
-            self.mlp_module(batch_x) if self.mlp_module is not None else batch_x
+            self.mlp_module(batch_x, gene_ids=gene_ids)
+            if self.mlp_module is not None else batch_x
         )
 
         # FiLM on the cell-path output ONLY when the shared MLP is
@@ -706,7 +718,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # behaviour) — the cell-VQ input is gradient-coupled to the
         # spatial losses via the shared MLP weights.
         if self.niche_mlp_module is not None:
-            z_mlp_niche_path = self.niche_mlp_module(batch_x)
+            z_mlp_niche_path = self.niche_mlp_module(batch_x, gene_ids=gene_ids)
             # FiLM on the niche path only in NON-Y-shape mode
             # (mirrors the cell-path policy above).
             if self.conditioning_module is not None and self.shared_mlp_module is None:

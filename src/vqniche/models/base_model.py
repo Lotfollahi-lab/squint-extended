@@ -215,7 +215,14 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'nb_attribute_reconstruction_loss':
                 loss_fn = nb_attribute_reconstruction_loss
 
-                loss_fn_data_keys = ['pred_attr', 'target_attr', 'edge_index', 'batch_size', 'dispersion']
+                # `gene_mask` is the cross-panel measured-gene mask, and all
+                # three NB entries request it unconditionally: `_loss_fn_data`
+                # builds its dict by key lookup, so an absent key raises
+                # KeyError. `loss_data` supplies None on the single-panel path
+                # and the loss reads that as "no mask", leaving its reduction
+                # byte-identical to before.
+                loss_fn_data_keys = ['pred_attr', 'target_attr', 'edge_index', 'batch_size', 'dispersion',
+                                     'gene_mask']
 
                 k_hop_nb_loss = loss_kwargs.get('k_hop_nb_loss')
                 if k_hop_nb_loss is not None:
@@ -233,7 +240,8 @@ class BaseModel(pl.LightningModule):
                 # branch's pred_attr / target_attr keys.
                 loss_fn = nb_nbr_attribute_reconstruction_loss
 
-                loss_fn_data_keys = ['pred_attr_nbr', 'target_attr_nbr', 'edge_index', 'batch_size', 'dispersion']
+                loss_fn_data_keys = ['pred_attr_nbr', 'target_attr_nbr', 'edge_index', 'batch_size', 'dispersion',
+                                     'gene_mask']
 
                 # k_hop_nb_loss=0: aggregation was done upstream in
                 # training_step; the wrapper must NOT re-aggregate.
@@ -300,7 +308,8 @@ class BaseModel(pl.LightningModule):
                 # per-cell and neighbourhood-mean targets).
                 loss_fn = nb_nbr_attribute_reconstruction_loss_dual
                 loss_fn_data_keys = ['pred_attr_nbr', 'target_attr_nbr',
-                                     'edge_index', 'batch_size', 'dispersion_niche']
+                                     'edge_index', 'batch_size', 'dispersion_niche',
+                                     'gene_mask']
                 loss_fn_params['k_hop_nb_loss'] = 0
                 wt_attr_reconstr_nbr = loss_kwargs.get('wt_attr_reconstr_nbr')
                 if wt_attr_reconstr_nbr is not None:

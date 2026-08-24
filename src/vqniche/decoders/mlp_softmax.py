@@ -99,6 +99,8 @@ class MLPSoftmax(pl.LightningModule):
             x: torch.Tensor,
             read_depth: torch.Tensor,
             conditions: Optional[torch.Tensor] = None,
+            gene_ids: Optional[torch.Tensor] = None,
+            gene_mask: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the decoder.
@@ -114,15 +116,35 @@ class MLPSoftmax(pl.LightningModule):
         - conditions: Optional[torch.Tensor]
             The conditions tensor.
             Dimensions: (batch_size, condition_dim)
+        - gene_ids: Optional[torch.Tensor]
+            Cross-panel gather on the OUTPUT layer. This decoder is built at the
+            gene-vocabulary width `V`, but a block only carries `W` genes, so the
+            final layer's weight ROWS and bias are indexed down to them.
+            Dimensions: (1, W) or (W,)
+        - gene_mask: Optional[torch.Tensor]
+            Per-cell measured-gene mask, `True` where the cell's section
+            measured that gene. REQUIRED whenever `gene_ids` is given, and the
+            reason this decoder needed changing at all: the softmax below
+            normalises across the gene axis, so without masking, probability
+            mass leaks onto genes the section never measured and every measured
+            prediction is systematically deflated. Nothing raises -- the
+            reconstructions are just quietly wrong.
+            Dimensions: (batch_size, W)
 
         Returns:
         -------
         - torch.Tensor:
             Output of the MLP followed by a softmax and a multiplication with the read depth.
         """
+        # `out_gene_ids` narrows the OUTPUT layer to the block's genes. It is
+        # the LAST layer that is vocabulary-wide here (the encoder's is its
+        # first), and the gather is applied to that layer's weight rows rather
+        # than to the emitted logits -- see `_lin_or_gather_out` for why that
+        # distinction is worth ~115 MB per decoder at V=9,571.
+        #
         # MLP without conditioning
         if self.apply_conditioning is None:
-            xhat = self.mlp_module(x)
+            xhat = self.mlp_module(x, out_gene_ids=gene_ids)
         
         # conditioning before MLP
         elif self.apply_conditioning == 'pre-MLP':
@@ -131,7 +153,7 @@ class MLPSoftmax(pl.LightningModule):
                 x=x,
                 conditions=conditions,
             )
-            xhat = self.mlp_module(x)
+            xhat = self.mlp_module(x, out_gene_ids=gene_ids)
         
         # conditioning within MLP
         elif self.apply_conditioning == 'in-MLP':
@@ -139,12 +161,38 @@ class MLPSoftmax(pl.LightningModule):
             xhat = self.mlp_module(
                 x=x,
                 conditions=conditions,
+                out_gene_ids=gene_ids,
             )
         
         # temperature annealing
         if self.temperature_annealer is not None:
             self.temperature = self.temperature_annealer.get_temp()
             self.temperature_annealer.step()
+        # ---- masked softmax --------------------------------------------------
+        # The softmax normalises ACROSS GENES, so with a cross-panel block the
+        # unmeasured columns would absorb probability mass that belongs to the
+        # measured ones, deflating every measured prediction. Masking the logits
+        # to -inf removes those columns from the normaliser entirely, so the
+        # measured genes' predictions sum to `read_depth` exactly -- which is
+        # what makes the NB target and prediction comparable.
+        if gene_mask is not None:
+            if gene_mask.shape != xhat.shape:
+                raise ValueError(
+                    f"gene_mask {tuple(gene_mask.shape)} must match the decoder "
+                    f"output {tuple(xhat.shape)}; a mismatch would mask the "
+                    f"wrong genes."
+                )
+            # A row with nothing measured would make the whole softmax NaN.
+            # Cannot arise (a section measures its own panel by construction),
+            # so this is a guard against a future upstream bug, not a case to
+            # handle silently.
+            if not bool(gene_mask.any(dim=-1).all()):
+                raise ValueError(
+                    "gene_mask has a row with no measured gene; softmax over an "
+                    "all -inf row is NaN."
+                )
+            xhat = xhat.masked_fill(~gene_mask, float("-inf"))
+
         xhat = F.softmax(xhat / self.temperature, dim=-1)
 
         # scale by empirical read depth

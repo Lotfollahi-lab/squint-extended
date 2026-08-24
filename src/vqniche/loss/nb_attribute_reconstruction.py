@@ -2,7 +2,7 @@
 Negative binomial attribute reconstruction loss function.
 """
 
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +17,8 @@ def nb_attribute_reconstruction_loss(
         batch_size: int,
         dispersion: torch.Tensor,
         k_hop_nb_loss: Literal[0, 1] = 0,
-        wt_attr_reconstr: float = 0.1
+        wt_attr_reconstr: float = 0.1,
+        gene_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
     """
     Compute the negative binomial (NB) loss between the estimated attributes from the decoder module and the target attributes.
@@ -38,6 +39,14 @@ def nb_attribute_reconstruction_loss(
     dispersion: torch.Tensor
         The dispersion parameter.
         Dimensions: (num_genes,)
+    gene_mask: Optional[torch.Tensor]
+        Cross-panel measured-gene mask, `True` where the cell's section measured
+        that gene. Unmeasured entries are zeroed before the per-cell sum, so they
+        contribute nothing; without it their (predicted, target=0) pairs would be
+        scored as if observed. Must already be sliced to `batch_size`, like
+        `pred_attr` / `target_attr`. `None` on the single-panel path leaves the
+        reduction untouched.
+        Dimensions: (batch_size, num_genes)
     k_hop_nb_loss: Literal[0, 1]
         The number of hops to consider for the neighbor features. 0 indicates individual node attributes, 1 indicates 1-hop neighbor features.
     wt_attr_reconstr: float
@@ -89,6 +98,33 @@ def nb_attribute_reconstruction_loss(
         - torch.lgamma(dispersion)
         - torch.lgamma(target_attr + 1))
 
+    # ---- reduction ---------------------------------------------------------
+    # Cross-panel: sum over the MEASURED genes only. Zeroing the unmeasured
+    # terms before the sum keeps this the log-likelihood of the OBSERVED data --
+    # a cell whose section measures 169 genes contributes less than one
+    # measuring 4,949 because it carries less information, which is correct
+    # rather than an imbalance to correct for.
+    #
+    # A MEAN over measured genes was the earlier plan and is wrong here: it
+    # would divide the term by ~W. R0 logs nb_cell ~= 844 against an adjacency
+    # BCE of ~517, so a mean over 4,948 genes gives ~0.17 and the BCE would
+    # outweigh reconstruction by ~3,000x -- training would stop reconstructing
+    # unless every wt_* were retuned. Panel imbalance, if it ever proves
+    # harmful, belongs in block composition or an explicit per-panel weight, not
+    # in a distorted likelihood.
+    #
+    # With an all-ones mask this is arithmetically identical to the unmasked
+    # expression, which is what keeps the single-panel path bit-identical.
+    if gene_mask is not None:
+        if gene_mask.shape != log_likelihood_nb.shape:
+            raise ValueError(
+                f"gene_mask {tuple(gene_mask.shape)} must match the NB term "
+                f"{tuple(log_likelihood_nb.shape)}. A mismatch would score the "
+                f"wrong genes -- most likely the mask was not sliced to "
+                f"`batch_size` the way pred_attr / target_attr are."
+            )
+        log_likelihood_nb = log_likelihood_nb * gene_mask
+
     nb_loss = torch.mean(-log_likelihood_nb.sum(-1))
 
     return nb_loss * wt_attr_reconstr
@@ -102,6 +138,7 @@ def nb_nbr_attribute_reconstruction_loss(
         dispersion: torch.Tensor,
         k_hop_nb_loss: int = 0,
         wt_attr_reconstr: float = 0.1,
+        gene_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
     """
     Thin wrapper around `nb_attribute_reconstruction_loss` for the
@@ -126,6 +163,10 @@ def nb_nbr_attribute_reconstruction_loss(
         dispersion=dispersion,
         k_hop_nb_loss=k_hop_nb_loss,
         wt_attr_reconstr=wt_attr_reconstr,
+        # Same mask as the cell branch: spatial graphs never cross sections, so
+        # a cell's 1-hop neighbours always share its panel and the neighbourhood
+        # mean is taken over the identical measured-gene set.
+        gene_mask=gene_mask,
     )
 
 
@@ -137,6 +178,7 @@ def nb_nbr_attribute_reconstruction_loss_dual(
         dispersion_niche: torch.Tensor,
         k_hop_nb_loss: int = 0,
         wt_attr_reconstr: float = 0.1,
+        gene_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
     """
     Same as `nb_nbr_attribute_reconstruction_loss` but reads its NB-
@@ -170,4 +212,8 @@ def nb_nbr_attribute_reconstruction_loss_dual(
         dispersion=dispersion_niche,
         k_hop_nb_loss=k_hop_nb_loss,
         wt_attr_reconstr=wt_attr_reconstr,
+        # Same mask as the cell branch: spatial graphs never cross sections, so
+        # a cell's 1-hop neighbours always share its panel and the neighbourhood
+        # mean is taken over the identical measured-gene set.
+        gene_mask=gene_mask,
     )

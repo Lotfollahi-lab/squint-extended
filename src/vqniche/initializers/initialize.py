@@ -603,10 +603,16 @@ def initialize_streaming_probe(
     dims, and the number of distinct batches) before building the model.
 
     All of those except the batch count are properties of the feature/label
-    layout, which is identical across sections — the blob enforces one shared
-    gene panel and one label vocabulary at build time. So one transformed
-    section is enough. The batch count must span the WHOLE corpus, so it comes
-    from the manifest's batch labels and is attached as `n_distinct_batches`.
+    layout, which is identical across sections — on a single-panel blob, which
+    enforces one shared gene panel and one label vocabulary at build time. So
+    one transformed section is enough. The batch count must span the WHOLE
+    corpus, so it comes from the manifest's batch labels and is attached as
+    `n_distinct_batches`.
+
+    CROSS-PANEL blobs break that assumption, which is why `gene_vocab_size` is
+    attached below: sections deliberately differ in gene width, so one section's
+    `num_features` is its OWN panel (319 or 419 on `xhc38-4b_1p`) rather than
+    the vocabulary the model must be built at.
 
     Returns a single-section `Data` intended ONLY for dimension lookup, never
     for training.
@@ -627,6 +633,34 @@ def initialize_streaming_probe(
     dense = dataset_blob.batch_label_to_dense()[label]
     n_cells = probe.x.shape[0] if getattr(probe, 'x', None) is not None else probe.num_nodes
     probe.adata_batch_ids = torch.full((n_cells,), int(dense), dtype=torch.long)
+
+    # ---- cross-panel: the model must be built at the VOCABULARY width ----
+    # A NEW attribute, not `probe.num_features`, because `Data.num_features` is
+    # a @property (torch_geometric/data/data.py:915) computed from `x.size(1)`:
+    # assigning it lands in `_store` and is shadowed on read, the same trap as
+    # `Batch.batch_size` shadowing the seed count. Left to `num_features`, the
+    # model would be built at the first section's width and then handed blocks
+    # of the union's width.
+    #
+    # One value is enough because every vocabulary-wide tensor derives from the
+    # model's `in_channels`: the encoder trunks' first layers, both decoder
+    # output layers (vqniche_dual.py:223,229), `dispersion` (base_model.py:149)
+    # and `dispersion_niche` (:335).
+    gene_vocab = getattr(dataset_blob, 'gene_vocab', None)
+    if getattr(dataset_blob, 'cross_panel', False):
+        if gene_vocab is None:
+            raise ValueError(
+                "Blob reports cross_panel=True but carries no `gene_vocab`. "
+                "The vocabulary sidecar (gene_vocab.pkl) is missing; rebuild "
+                "with overwrite=True."
+            )
+        probe.gene_vocab_size = int(len(gene_vocab))
+        print(
+            f"Streaming probe: cross-panel blob, gene_vocab_size="
+            f"{probe.gene_vocab_size} (this section carries "
+            f"{probe.num_features} genes) — the model is built at the "
+            f"vocabulary width and gathers per block."
+        )
 
     print(
         f"Streaming probe: num_features={probe.num_features}, "
