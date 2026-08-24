@@ -38756,6 +38756,7 @@ def _build_clean_adata_from_inference(
     source_paths: list | None = None,
     obs_per_batch_id: dict | None = None,
     obs_per_filename: dict | None = None,
+    cross_panel: bool = False,
 ) -> "ad.AnnData":
     """
     Build the predicted AnnData by starting from the source AnnDatas
@@ -38908,14 +38909,55 @@ def _build_clean_adata_from_inference(
         sub = source[src_rows].copy()
         if gene_names is not None:
             if list(sub.var_names) != list(gene_names):
-                try:
-                    sub = sub[:, list(gene_names)].copy()
-                except KeyError as exc:
-                    raise RuntimeError(
-                        f"Source for adata_batch_id={bid} (file "
-                        f"{id_to_path[bid].name}) is missing genes from the "
-                        f"canonical panel: {exc}"
+                missing = [g for g in gene_names if g not in set(sub.var_names)]
+                if missing and cross_panel:
+                    # CROSS-PANEL: a narrow section legitimately lacks part of
+                    # the vocabulary. `gene_names` is the union over the built
+                    # sections, so a 319-gene section is missing 100 of the 419
+                    # by construction -- not a corrupt silver file.
+                    #
+                    # Reindex WITH zero fill, which is the same widening the
+                    # model input got (`scatter_sections_to_columns`), so `.X`
+                    # and `.layers['X_hat']` line up column-for-column at
+                    # vocabulary width with exact zeros at unmeasured genes.
+                    # That keeps every existing consumer working unchanged --
+                    # `compute_inference_metrics.py` and the Pearson variants
+                    # pair columns positionally -- and lets a per-panel analysis
+                    # restrict to a section's measured genes when it wants to.
+                    #
+                    # The zeros are not a prediction of zero expression; they
+                    # mark "not measured". Anything comparing X to X_hat over
+                    # the FULL vocabulary would count them as perfect
+                    # agreement and inflate its score, so per-panel work must
+                    # mask (see `_perpanelrecon.py`).
+                    sub = ad.AnnData(
+                        X=np.zeros((sub.n_obs, len(gene_names)),
+                                   dtype=np.float32),
+                        obs=sub.obs.copy(),
+                        var=pd.DataFrame(index=list(gene_names)),
                     )
+                    present = [g for g in gene_names
+                               if g in set(source.var_names)]
+                    src_sub = source[src_rows][:, present]
+                    src_X = src_sub.X
+                    if hasattr(src_X, "toarray"):
+                        src_X = src_X.toarray()
+                    cols = [list(gene_names).index(g) for g in present]
+                    sub.X[:, cols] = np.asarray(src_X, dtype=np.float32)
+                    print(
+                        f"  adata_batch_id={bid}: widened {len(present)} "
+                        f"measured genes to the {len(gene_names)}-gene "
+                        f"vocabulary ({len(missing)} unmeasured, zero-filled)."
+                    )
+                else:
+                    try:
+                        sub = sub[:, list(gene_names)].copy()
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            f"Source for adata_batch_id={bid} (file "
+                            f"{id_to_path[bid].name}) is missing genes from the "
+                            f"canonical panel: {exc}"
+                        )
             # After reindex, var_names MUST match the canonical panel
             # exactly (same order, same set). Mismatch here means the
             # earlier reindex failed silently — better to crash than to
@@ -39724,6 +39766,9 @@ def predict(
         gene_names=gene_names,
         test_batch_ids=list(test_batch_ids),
         test_regions=test_regions,
+        # Narrow sections legitimately lack part of the vocabulary; reindex
+        # with zero fill instead of demanding every gene be present.
+        cross_panel=bool(getattr(dataset_blob, 'cross_panel', False))
     )
     adata.uns["squint"]["run_dir"] = run_dir
     adata.uns["squint"]["ckpt"] = str(config["model"]["model_ckpt_fname"])
