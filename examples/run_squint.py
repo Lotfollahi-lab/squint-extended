@@ -787,6 +787,66 @@ def make_dataset_blob_config_xhs1000_39b() -> dict:
     )
 
 
+def make_dataset_blob_config_xhc38_4b() -> dict:
+    """
+    Cross-panel milestone 1: `xhc38-4b_1p`, Xenium human colon, 4 sections.
+
+    The NESTED case, and the gentler of the two: two panels of 419 and 319
+    genes where 319 is a strict SUBSET of 419, so the block union is 419 and the
+    mask hides exactly 100 of those genes for half the sections. Measured from
+    the silver `.var` indices, not assumed.
+
+    1,725,440 cells over 4 sections (576,336 / 619,349 / 272,341 / 257,414), so
+    ~2.9 GB dense at 419 genes -- bigger than R0 in cells, far smaller in bytes.
+
+    `label_names=[]` because these sections carry NO annotation: `obs` holds
+    only Xenium QC columns (`cell_area`, `transcript_counts`, ...), with no
+    cell-type or niche column. That is supported -- `SetExperimentDataKeys`
+    returns a 0-channel `y` placeholder, giving `num_classes=0` -- and it costs
+    nothing here, because the R0 reference recipe's `loss_names` contain no
+    cross-entropy, so labels never enter training. It does mean the label-based
+    benchmark metrics (NMI / ARI against cell type) are not computable on this
+    dataset; it exists to validate the cross-panel DATA PATH, not to produce
+    biology.
+    """
+    return _make_spatch_blob_config(
+        name="xhc38-4b_1p",
+        description="xhc38-4b_1p -- Xenium human colon, 4 sections, panels "
+                    "419 and 319 (nested). Cross-panel milestone 1.",
+        label_names=[],
+        data_directory_path=str(DATA_ROOT),
+        n_neighs_list=[8, 16],
+        k={},
+    )
+
+
+def make_dataset_blob_config_xhb42_3b() -> dict:
+    """
+    Cross-panel milestone 2: `xhb42-3b_1p`, Xenium human brain, 3 sections.
+
+    The HARD case -- a genuine two-way union where neither panel contains the
+    other. Panels of 350 and 317 genes with intersection 262, so 88 genes are
+    exclusive to one and 55 to the other, and the block union is 405 -- strictly
+    larger than either panel. `xhc38` cannot test that: being nested, its union
+    is just the wider panel, so a bug that quietly took `max` instead of the
+    union would pass there and fail here.
+
+    109,007 cells over 3 sections, ~153 MB dense. Minutes to build.
+
+    `label_names=[]` for the same reason as `xhc38-4b_1p` -- see that config.
+    """
+    return _make_spatch_blob_config(
+        name="xhb42-3b_1p",
+        description="xhb42-3b_1p -- Xenium human brain, 3 sections, panels 350 "
+                    "and 317 with 88/55 exclusive genes (true union). "
+                    "Cross-panel milestone 2.",
+        label_names=[],
+        data_directory_path=str(DATA_ROOT),
+        n_neighs_list=[8, 16],
+        k={},
+    )
+
+
 def make_dataset_blob_config_spatch() -> dict:
     """
     Dataset-blob build config for the `spatch_1p` dataset
@@ -37605,7 +37665,8 @@ def harmonize_anndata_var():
 # ---------------------------------------------------------------------------
 
 def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
-               container: str = "file"):
+               container: str = "file", cross_panel: bool = False,
+               exclude_sections: Optional[List[str]] = None):
     """
     Build the in-memory PyG DatasetBlob in-process.
 
@@ -37668,6 +37729,12 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
     elif dataset == "xhs1000-39b_1p":
         cfg = make_dataset_blob_config_xhs1000_39b()
         cfg_path = CONFIG_OUT_DIR / "build_blob_xhs1000-39b_1p.yaml"
+    elif dataset == "xhc38-4b_1p":
+        cfg = make_dataset_blob_config_xhc38_4b()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_xhc38-4b_1p.yaml"
+    elif dataset == "xhb42-3b_1p":
+        cfg = make_dataset_blob_config_xhb42_3b()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_xhb42-3b_1p.yaml"
     elif dataset == "xhs1000-3b_1p":
         cfg = make_dataset_blob_config_xhs_3b()
         cfg_path = CONFIG_OUT_DIR / "build_blob_xhs1000-3b_1p.yaml"
@@ -37715,6 +37782,8 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
             overwrite=ds_cfg["overwrite"],
             software_paths=cfg["software_paths"],
             backend=container,
+            cross_panel=cross_panel,
+            exclude_sections=exclude_sections,
         )
         print(f"Built {len(dataset_blob)} sections; "
               f"section ids: {getattr(dataset_blob, 'section_ids', None)}")
@@ -40064,6 +40133,13 @@ def main():
                        "mmb0-1b_smb1-20b_1p",
                        "mmb0-239b_1p",
                        "hst_corpus_110m",
+                       # Cross-panel test targets: xhc38 is NESTED (419 with
+                       # 319 a strict subset), xhb42 is a TRUE two-way union
+                       # (350 / 317, intersection 262). Both need
+                       # --cross-panel; without it the builder hard-raises on
+                       # the panel mismatch, which is the correct default.
+                       "xhc38-4b_1p",
+                       "xhb42-3b_1p",
                        "smb1-20b_1p",
                        "spatch_1p",
                        "spatch_ov_1p",
@@ -40111,6 +40187,26 @@ def main():
                         "(default, OOMs on very large corpora); on-disk = "
                         "streaming OnDiskDataset, one section per DB row "
                         "(use for hst_corpus_110m).")
+    p.add_argument("--cross-panel", action="store_true",
+                   help=(
+                       "Build an on-disk blob whose sections may carry "
+                       "DIFFERENT gene panels: the vocabulary becomes the union "
+                       "over the built sections, each section is stored at its "
+                       "own width with a `gene_ids` index into it, and the "
+                       "union is assembled per block at load time. Off by "
+                       "default, where mismatched panels hard-raise. Note the "
+                       "vocabulary is derived from the sections you build, so "
+                       "`--exclude-sections` is what sets it."
+                   ))
+    p.add_argument("--exclude-sections", type=str, nargs="*", default=None,
+                   help=(
+                       "Section file stems to leave out of the build (e.g. "
+                       "chp60-1b_1p's one 18,893-gene section, which "
+                       "contributes ~9,366 genes nothing else measures and so "
+                       "doubles the vocabulary). Applied BEFORE the vocabulary "
+                       "is computed, so a built section can never carry a gene "
+                       "outside it."
+                   ))
     p.add_argument("--container", type=str,
                    default="file",
                    choices=["file", "sqlite"],
@@ -40416,6 +40512,8 @@ def main():
     if args.build_blob:
         build_blob(dataset=args.build_blob_dataset,
                    backend=args.build_blob_backend,
+                   cross_panel=args.cross_panel,
+                   exclude_sections=args.exclude_sections,
                    container=args.container)
     # Resolve --compile / --no-compile into a tri-state override:
     #   `--no-compile`               → False (always wins)
