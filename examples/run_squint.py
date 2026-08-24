@@ -4755,6 +4755,32 @@ def _patch_no_val(
     return cfg
 
 
+def _patch_no_logging(cfg: dict) -> dict:
+    """
+    Turn off wandb entirely for this run (`cfg['logging']['enabled'] = False`,
+    consumed at `train()`'s logger block).
+
+    For MEASUREMENT runs -- short comparisons whose output is a number, not a
+    tracked experiment -- wandb contributes nothing and adds a failure mode.
+    `WANDB_MODE=offline` is not enough: wandb still spawns a local service
+    process, and on a busy node that can miss its 30 s startup window and take
+    the whole job with it:
+
+        wandb.sdk.lib.service.service_port_file.ServicePollForTokenError:
+        Failed to read port info after 30.0 seconds
+
+    which is exactly how `smoke-xpanel-holdout+xhc38-4b_1p` died on its first
+    submission, after the model had already been built correctly. Nothing to do
+    with training; just an avoidable dependency.
+
+    Deliberately NOT applied to the existing `smoke-xpanel+*` variants: those
+    have already been run, and changing their resolved config would make the
+    runs on disk irreproducible from the registry.
+    """
+    cfg["logging"]["enabled"] = False
+    return cfg
+
+
 def _patch_step_budget(
         cfg: dict,
         max_steps: int,
@@ -5796,9 +5822,9 @@ VARIANTS: dict = {
             "diversity-w10, contrastWB-w10-k5)",
             "+xhc38-4b_1p dataset, test_batches=[3, 1] (one per panel)",
             "+streaming(sections_per_block=4, num_workers=2)",
-            "+step-budget(max_steps=300)",
+            "+step-budget(max_steps=300)", "+no-logging (wandb off)",
         ],
-        "build": lambda: _patch_step_budget(
+        "build": lambda: _patch_no_logging(_patch_step_budget(
             _patch_streaming(
                 _patch_dual_xhc38_4b(
                     _r0_reference_stack(),
@@ -5810,7 +5836,7 @@ VARIANTS: dict = {
             ),
             max_steps=300,
             val_checks=3,
-        ),
+        )),
     },
     "smoke-xpanel+xhb42-3b_1p": {
         "description": (
