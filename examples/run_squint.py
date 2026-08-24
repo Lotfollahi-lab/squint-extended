@@ -5777,6 +5777,41 @@ VARIANTS: dict = {
             val_checks=3,
         ),
     },
+    "smoke-xpanel-holdout+xhc38-4b_1p": {
+        "description": (
+            "xhc38-4b_1p with ONE SECTION OF EACH PANEL held out, so the "
+            "panel-width comparison can be made on held-out data with both "
+            "condition and split controlled. The earlier smoke-xpanel run held "
+            "out only batch3, which put the sole test section in the 319 group "
+            "and confounded panel width with train/test. Holding out batch3 "
+            "(319) + batch1 (419) -- BOTH Non-diseased -- leaves batch0 (319) + "
+            "batch2 (419), both Cancer, in training: panel diversity survives "
+            "on both sides, and the two test sections differ ONLY in panel "
+            "width. ([0, 2] would serve equally, both Cancer; the other two "
+            "one-of-each pairings mix conditions and reintroduce the confound.) "
+            "300 steps."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+xhc38-4b_1p dataset, test_batches=[3, 1] (one per panel)",
+            "+streaming(sections_per_block=4, num_workers=2)",
+            "+step-budget(max_steps=300)",
+        ],
+        "build": lambda: _patch_step_budget(
+            _patch_streaming(
+                _patch_dual_xhc38_4b(
+                    _r0_reference_stack(),
+                    test_batch_idx=[3, 1],
+                    batch_size=512,
+                ),
+                sections_per_block=4,
+                num_workers=2,
+            ),
+            max_steps=300,
+            val_checks=3,
+        ),
+    },
     "smoke-xpanel+xhb42-3b_1p": {
         "description": (
             "The HARD cross-panel case: xhb42-3b_1p, Xenium human brain, panels "
