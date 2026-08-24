@@ -403,6 +403,12 @@ class InMemoryDataModule(LightningNodeData):
         if getattr(data, 'adata_batch_ids_raw', None) is not None:
             base_data['adata_batch_ids_raw'] = data.adata_batch_ids_raw
 
+        # NOTE this is an ALLOW-LIST: anything not named here is dropped when
+        # `data_for_loader` is rebuilt below. A cross-panel attribute left out
+        # would not raise -- the model would simply see no mask and score the
+        # unmeasured genes as if observed, which is precisely the silent failure
+        # the masking exists to prevent. So `panel_masks` / `panel_id` must be
+        # listed.
         optional_data_keys = [
             # 'y_cell_types',
             # 'y_niche_types',
@@ -410,6 +416,13 @@ class InMemoryDataModule(LightningNodeData):
             'spatial_prior_features',
             'attr_decoder_conditions',
             'adj_decoder_conditions',
+            # Cross-panel: [P, W] panel table + per-cell index into it. Neither
+            # is a node attr at [P, W], so PyG passes it through untouched;
+            # `panel_id` is [N] and gets sliced per mini-batch. Both verified
+            # through a NeighborLoader round trip in
+            # tests/test_gene_vocab_pyg_contract.py.
+            'panel_masks',
+            'panel_id',
         ]
         
         data_dict_for_loader = {

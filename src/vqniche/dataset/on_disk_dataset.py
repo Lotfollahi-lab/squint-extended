@@ -792,6 +792,91 @@ class _ObsLazyMap:
         return self[key] if key in self._index else default
 
 
+GENE_WIDTH_ATTRS = ("x", "x_cell_gene_counts")
+
+
+def scatter_sections_to_columns(
+        views,
+        section_gene_ids,
+        target_ids: torch.Tensor,
+        gene_width_attrs=GENE_WIDTH_ATTRS,
+    ):
+    """
+    Scatter each section's gene-width tensors onto a shared column set, in place.
+
+    Shared by the two cross-panel consumers, which differ only in what they
+    scatter ONTO:
+
+      * `KSectionBlockLoader._widen_to_block_union` passes the union of the
+        block's panels, keeping a block as narrow as its contents allow;
+      * `initialize_databatch` passes `arange(V)` -- the whole vocabulary --
+        because predict collates every section into one object and the model's
+        weights are V-wide, so no gather is needed there at all.
+
+    `target_ids` MUST be sorted ascending: `searchsorted` locates each section's
+    columns in it, which is what avoids a dict and a Python loop over genes.
+
+    Returns `(panel_masks, panel_of_section)`:
+      panel_masks      BoolTensor[P, W] one row per DISTINCT panel among `views`
+      panel_of_section list[int]        index into `views` -> panel row
+
+    Masks are per PANEL, not per cell: [P, W] is kilobytes where a per-cell
+    [N, W] mask would be ~530 MB at K=8, and the per-cell view is one gather at
+    mini-batch size. Deduplicating matters because panels repeat heavily -- 150
+    corpus sections share the 4,949-gene panel.
+    """
+    W = int(target_ids.numel())
+    masks: List[torch.Tensor] = []
+    panel_of_section: List[int] = []
+    key_to_panel: dict = {}
+
+    for view, ids in zip(views, section_gene_ids):
+        cols = torch.searchsorted(target_ids, ids)
+        g = int(ids.numel())
+        if int(cols.max()) >= W or not bool((target_ids[cols] == ids).all()):
+            raise ValueError(
+                "A section carries gene ids absent from the target column set. "
+                "The vocabulary is the union over the sections in the build, so "
+                "this cannot happen unless the blob and the vocabulary sidecar "
+                "disagree -- rebuild with overwrite=True."
+            )
+
+        for key in [k for k in gene_width_attrs if k in view]:
+            src = view[key]
+            if src.shape[1] != g:
+                raise ValueError(
+                    f"`{key}` has {src.shape[1]} columns but the section "
+                    f"records {g} gene ids. They must correspond exactly, or "
+                    f"counts would scatter into the wrong genes."
+                )
+            # Unmeasured positions stay EXACTLY zero. Load-bearing:
+            # `read_depth = batch.x.sum(dim=-1)` (vqniche_dual.py:476) is only
+            # the measured-gene depth because of it, so no separate masked sum
+            # is needed there.
+            wide = src.new_zeros((src.shape[0], W))
+            wide[:, cols] = src
+            view[key] = wide
+
+        # Exactly ONE of the two is ever present, so this widens one matrix per
+        # section rather than two. `SetExperimentDataKeys.forward` deletes every
+        # `x_*` key at the end (dataset/transforms.py:874-877), so once it has
+        # run the raw counts are gone and only `x` remains. With NO section
+        # transform they are never copied into `x` and they ARE the features.
+        # Hence the allow-list rather than a hardcoded "x".
+
+        key = tuple(ids.tolist())
+        panel = key_to_panel.get(key)
+        if panel is None:
+            panel = len(masks)
+            key_to_panel[key] = panel
+            m = torch.zeros(W, dtype=torch.bool)
+            m[cols] = True
+            masks.append(m)
+        panel_of_section.append(panel)
+
+    return torch.stack(masks), panel_of_section
+
+
 class KSectionBlockLoader:
     """
     Streaming, section-mixing loader for `OnDiskDatasetBlob` (Direction 1).
@@ -1054,7 +1139,7 @@ class KSectionBlockLoader:
     # than "any [n, G] tensor": `y_cell_types` is [n, n_classes], so a shape
     # heuristic would silently widen the labels of any dataset whose class count
     # happened to equal its gene count.
-    _GENE_WIDTH_ATTRS = ("x", "x_cell_gene_counts")
+    _GENE_WIDTH_ATTRS = GENE_WIDTH_ATTRS
 
     def _widen_to_block_union(self, views, section_gene_ids):
         """
@@ -1079,55 +1164,12 @@ class KSectionBlockLoader:
         grouping is a possible future knob.
         """
         # `unique` returns SORTED values, which is what makes `searchsorted`
-        # below valid -- no dict and no Python loop over genes.
+        # inside `scatter_sections_to_columns` valid -- no dict and no Python
+        # loop over genes.
         union = torch.unique(torch.cat(section_gene_ids))
-        W = int(union.numel())
-
-        masks: List[torch.Tensor] = []
-        panel_of_section: List[int] = []
-        key_to_panel: dict = {}
-
-        for view, ids in zip(views, section_gene_ids):
-            cols = torch.searchsorted(union, ids)
-            g = int(ids.numel())
-
-            present = [k for k in self._GENE_WIDTH_ATTRS if k in view]
-            for key in present:
-                src = view[key]
-                if src.shape[1] != g:
-                    raise ValueError(
-                        f"`{key}` has {src.shape[1]} columns but the section "
-                        f"records {g} gene ids. They must correspond exactly, "
-                        f"or counts would scatter into the wrong genes."
-                    )
-                # Unmeasured positions stay EXACTLY zero. Load-bearing:
-                # `read_depth = batch.x.sum(dim=-1)` (vqniche_dual.py:476) is
-                # only the measured-gene depth because of it, so no separate
-                # masked sum is needed there.
-                wide = src.new_zeros((src.shape[0], W))
-                wide[:, cols] = src
-                view[key] = wide
-
-            # Exactly ONE of the two is ever present, so this widens one matrix
-            # per section rather than two. `SetExperimentDataKeys.forward`
-            # deletes every `x_*` key at the end (dataset/transforms.py:874-877,
-            # "to reduce memory footprint during training"), so once it has run
-            # the raw counts are gone and only `x` remains. With NO section
-            # transform they are never copied into `x` and they ARE the
-            # features, so they become the thing to widen. Hence the allow-list
-            # rather than a hardcoded "x".
-
-            key = tuple(ids.tolist())
-            panel = key_to_panel.get(key)
-            if panel is None:
-                panel = len(masks)
-                key_to_panel[key] = panel
-                m = torch.zeros(W, dtype=torch.bool)
-                m[cols] = True
-                masks.append(m)
-            panel_of_section.append(panel)
-
-        return union, torch.stack(masks), panel_of_section
+        return (union,) + scatter_sections_to_columns(
+            views, section_gene_ids, union, self._GENE_WIDTH_ATTRS,
+        )
 
     def _stamp_panel_attrs(self, block: Data, union, panel_masks,
                            panel_of_section, sizes: List[int]) -> None:

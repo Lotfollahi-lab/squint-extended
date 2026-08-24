@@ -432,6 +432,63 @@ def initialize_databatch(
             adata_batch_idx = [adata_batch_idx]
     data_list = [dataset_blob[idx] for idx in adata_batch_idx]
 
+    # ---- cross-panel: widen every section to the VOCABULARY before collating -
+    # `BatchBuilder.collate_fn` concatenates node attributes along dim 0, so
+    # sections stored at their own gene widths (319 and 419 on xhc38-4b_1p)
+    # cannot be collated at all -- torch.cat raises on the mismatched second
+    # dimension. Widening to `arange(V)` rather than to the union of the
+    # sections present is deliberate on two counts:
+    #
+    #   * the model's weights are V-wide, so a V-wide batch needs NO gather --
+    #     `gene_ids` stays None and the encoder/decoder run their full weights,
+    #     which is both simpler and exactly equivalent;
+    #   * it does not depend on which subset of sections was requested, so a
+    #     partial predict (`--silver-dir`, a single section) still lines up with
+    #     the checkpoint's weights.
+    #
+    # The masks still matter: each cell may only be scored on the genes ITS
+    # section measured, so `panel_masks` / `panel_id` are stamped below and the
+    # model's `_per_cell_gene_mask` picks them up exactly as it does for a
+    # streaming block.
+    #
+    # SCALE CAVEAT, same one the predict path already carries: this materialises
+    # [N_total, V] dense. Fine at test scale (1,725,440 x 419 ~= 2.9 GB on
+    # xhc38-4b_1p) and impossible for the corpus (110M x 9,571 ~= 4.2 TB), which
+    # needs predict routed through OnDiskStreamingDataModule.predict_dataloader.
+    panel_masks = panel_of_section = None
+    if getattr(dataset_blob, 'cross_panel', False):
+        from ..dataset.on_disk_dataset import scatter_sections_to_columns
+
+        vocab = getattr(dataset_blob, 'gene_vocab', None)
+        if vocab is None:
+            raise ValueError(
+                "Blob reports cross_panel=True but carries no `gene_vocab`; the "
+                "sidecar is missing. Rebuild with overwrite=True."
+            )
+        section_gene_ids = []
+        for pos, d in zip(adata_batch_idx, data_list):
+            ids = getattr(d, 'gene_ids', None)
+            if ids is None:
+                raise KeyError(
+                    f"Section at position {pos} has no `gene_ids` but the blob "
+                    f"is cross_panel; it predates the vocabulary build. Rebuild "
+                    f"with overwrite=True."
+                )
+            section_gene_ids.append(ids.reshape(-1))
+        target = torch.arange(len(vocab), dtype=torch.long)
+        panel_masks, panel_of_section = scatter_sections_to_columns(
+            data_list, section_gene_ids, target,
+        )
+        widths = sorted({int(i.numel()) for i in section_gene_ids})
+        print(f"Cross-panel collate: widened {len(data_list)} sections "
+              f"(native widths {widths}) to the {len(vocab)}-gene vocabulary; "
+              f"{panel_masks.shape[0]} distinct panel(s).")
+        # `gene_ids` is per-section and now meaningless (every section is
+        # V-wide); leaving it would collate into nonsense.
+        for d in data_list:
+            if 'gene_ids' in d:
+                del d['gene_ids']
+
     # collate the list of Data objects into a single Batch object
     # i.e. concatenate tissue sections into one big graph with disconnected components
     data_batch = BatchBuilder(
@@ -448,6 +505,16 @@ def initialize_databatch(
          for d in data_list],
         dtype=torch.long
     )
+
+    # Cross-panel panel table, stamped AFTER collation for the same reason the
+    # streaming path does it (see `_stamp_panel_attrs`): `panel_id` is only a
+    # per-CELL quantity once the sections are concatenated.
+    if panel_masks is not None:
+        data_batch.panel_masks = panel_masks
+        data_batch.panel_id = torch.cat([
+            torch.full((int(d.num_nodes),), int(p), dtype=torch.long)
+            for p, d in zip(panel_of_section, data_list)
+        ])
 
     # PER-CELL raw `adata_batch_id` (broadcast from per-section vector
     # via PyG's auto-built `data_batch.batch` index). Used by predict()
