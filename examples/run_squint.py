@@ -38731,6 +38731,11 @@ def train(
     trainer = pl.Trainer(
         accelerator="auto",
         devices="auto",
+        # Where Lightning puts anything it writes without an explicit path.
+        # Set so `BaseModel.on_fit_end`'s fallback lands in the RUN dir rather
+        # than the cwd (i.e. the repo root) when no logger is attached -- see
+        # that hook for why the no-logger case exists.
+        default_root_dir=str(run_dir),
         deterministic=_train_deterministic,
         benchmark=_train_benchmark,
         precision=_train_precision,

@@ -1205,7 +1205,34 @@ class BaseModel(pl.LightningModule):
         - We use this hook to save the on_train_epoch_end_logs_df dataframe to a CSV file.
         """
         # save epoch-wise logged loss terms and metrics to a CSV file
-        results_dir = Path(self.logger.experiment.dir) / 'results'
+        #
+        # `self.logger` is None whenever no logger was attached -- which
+        # `train()` does deliberately for `cfg['logging']['enabled'] = False`
+        # (`_patch_no_logging`, used by measurement runs where wandb adds only a
+        # failure mode). That config option had therefore never actually worked:
+        # training ran to completion and then this hook raised
+        # `AttributeError: 'NoneType' object has no attribute 'experiment'`,
+        # losing the run at the very last step.
+        #
+        # Fall back to the Trainer's `default_root_dir`, which points at the run
+        # directory, so the CSV still lands somewhere sensible. Skip entirely
+        # only if there is no directory to be had at all.
+        log_dir = None
+        if self.logger is not None:
+            experiment = getattr(self.logger, 'experiment', None)
+            log_dir = getattr(experiment, 'dir', None)
+            if log_dir is None:
+                log_dir = getattr(self.logger, 'log_dir', None) \
+                    or getattr(self.logger, 'save_dir', None)
+        if log_dir is None:
+            trainer = getattr(self, 'trainer', None)
+            log_dir = getattr(trainer, 'default_root_dir', None) if trainer else None
+        if log_dir is None:
+            print("on_fit_end: no logger and no default_root_dir; skipping the "
+                  "on_train_epoch_end_logs CSV.")
+            return super().on_fit_end()
+
+        results_dir = Path(log_dir) / 'results'
         results_dir.mkdir(parents=True, exist_ok=True)
 
         on_train_epoch_end_logs_fname = results_dir / 'on_train_epoch_end_logs.csv'
