@@ -1007,3 +1007,50 @@ def test_no_budget_is_the_old_behaviour(tmp_path):
     blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
     assert _blk(blob, sections_per_block=2) == [[0, 1], [2]]
     assert _blk(blob, sections_per_block=2, max_cells_per_block=None) == [[0, 1], [2]]
+
+
+# --------------------------------------------------------------------------- #
+# step heartbeat — a corpus epoch is 187,562 steps, so nothing else prints
+# --------------------------------------------------------------------------- #
+
+class _FakeTrainer:
+    def __init__(self, max_steps=200_000):
+        self.max_steps = max_steps
+
+
+def _hb(step, every, capsys, loss=None, t0_ago=10.0):
+    """Drive the heartbeat directly — no LightningModule needed."""
+    import time as _t
+
+    from vqniche.models.base_model import BaseModel
+
+    class M:
+        heartbeat_every_n_steps = every
+        global_step = step
+        trainer = _FakeTrainer()
+        _epoch_t0 = (_t.time() - t0_ago) if t0_ago else None
+        _epoch_step0 = 0
+    out_val = {"loss": torch.tensor(1.25)} if loss is None else loss
+    BaseModel._maybe_log_heartbeat(M(), out_val)
+    return capsys.readouterr().out
+
+
+def test_heartbeat_prints_on_the_interval(capsys):
+    out = _hb(2000, 2000, capsys)
+    assert "step 2,000/200,000 (1.0%)" in out
+    assert "steps/s" in out and "ETA" in out and "loss 1.25" in out
+
+
+def test_heartbeat_silent_off_interval(capsys):
+    assert _hb(1999, 2000, capsys) == ""
+
+
+def test_heartbeat_disabled_by_default(capsys):
+    """0 must mean silent, so short runs and the test suite stay quiet."""
+    assert _hb(2000, 0, capsys) == ""
+
+
+def test_heartbeat_survives_an_unusable_loss(capsys):
+    """Loss shape varies by variant; a heartbeat must never break a run."""
+    out = _hb(10, 10, capsys, loss={"loss": object()}, t0_ago=None)
+    assert "step 10" in out and "loss" not in out

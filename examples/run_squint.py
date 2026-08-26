@@ -4898,6 +4898,7 @@ def _patch_step_budget(
         val_check_interval: Optional[int] = None,
         val_checks: int = 10,
         max_epochs: int = 1000,
+        heartbeat_every_n_steps: int = 0,
     ) -> dict:
     """
     Train to a STEP budget rather than an epoch count.
@@ -4985,6 +4986,10 @@ def _patch_step_budget(
     if val_check_interval is None:
         val_check_interval = max(1, int(max_steps) // max(1, int(val_checks)))
     cfg["trainer"]["max_steps"] = int(max_steps)
+    # Periodic step log. A corpus epoch is 187,562 steps, so the whole
+    # budget finishes inside epoch 0 and nothing else prints between the
+    # epoch banners -- a healthy run looks identical to a hung one.
+    cfg["trainer"]["heartbeat_every_n_steps"] = int(heartbeat_every_n_steps)
     cfg["trainer"]["max_epochs"] = int(max_epochs)
     # MUST be None, not 1. With an int here Lightning treats
     # `val_check_interval` as an offset WITHIN one epoch and hard-raises if it
@@ -6081,6 +6086,13 @@ VARIANTS: dict = {
                 max_cells_per_block=900_000,
             ),
             max_steps=200_000,
+            # Every 2,000 steps is ~4.6 min at the 7.23 steps/s measured on the
+            # first corpus run -- often enough that a stall is obvious, rare
+            # enough not to bloat the log over 200,000 steps. Without it the job
+            # log shows one "Start of Epoch 0" and then nothing for hours,
+            # because a corpus epoch is 187,562 steps and the whole budget
+            # finishes inside epoch 0.
+            heartbeat_every_n_steps=2_000,
             # 10 validation passes over the run. Affordable only because Part D
             # restricts the val loader to the 32 val SECTIONS -- unrestricted it
             # would rebuild every block in the corpus to reach them, ~51 min a

@@ -933,6 +933,12 @@ def initialize_model(
     # --------------------- Initialize Model ---------------------
     Model = set_model_class(model_name=model_name)
     model = Model(**model_param_dict)
+    # Step heartbeat interval. Set as an attribute rather than a constructor
+    # argument so every model class picks it up without touching its signature
+    # (and so `save_hyperparameters()` does not record a logging knob as part of
+    # the model definition).
+    model.heartbeat_every_n_steps = int(
+        config.get('trainer', {}).get('heartbeat_every_n_steps', 0) or 0)
     return model
 
 

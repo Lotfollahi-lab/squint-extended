@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from typing import List, Tuple, Callable, Optional, Literal
 
@@ -1130,9 +1131,56 @@ class BaseModel(pl.LightningModule):
         - We use this hook to print the start of the current training epoch.
         """        
         print(f"--------------------------------Start of Epoch {self.current_epoch}--------------------------------------")
+        self._epoch_t0 = time.time()
 
         # call the parent class method to complete default behavior
         return super().on_train_epoch_start()
+
+
+    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
+        self._maybe_log_heartbeat(outputs)
+        return super().on_train_batch_end(outputs, batch, batch_idx)
+
+
+    def _maybe_log_heartbeat(self, outputs) -> None:
+        """
+        Periodic step heartbeat: step, rate and ETA to the step budget.
+
+        WHY. Nothing else prints between epoch boundaries, and on a corpus a
+        single epoch is enormous -- 187,562 steps at batch 512 over the 96M
+        training cells -- so the whole 200,000-step budget completes inside
+        epoch 0 and the log shows one "Start of Epoch 0" and then nothing for
+        hours. The only other progress signals are checkpoints (every 20,000
+        steps) and wandb, neither visible in the job log, which makes a healthy
+        run indistinguishable from a hung one.
+
+        Off unless `heartbeat_every_n_steps` is set (0 disables), so short runs
+        and the test suite stay quiet. Split out of `on_train_batch_end` so it
+        is testable without constructing a LightningModule.
+        """
+        n = int(getattr(self, "heartbeat_every_n_steps", 0) or 0)
+        if not n or not self.global_step or self.global_step % n:
+            return
+        t0 = getattr(self, "_epoch_t0", None)
+        budget = getattr(self.trainer, "max_steps", -1) or -1
+        msg = f"  step {self.global_step:,}"
+        if budget and budget > 0:
+            msg += f"/{budget:,} ({100.0 * self.global_step / budget:.1f}%)"
+        if t0:
+            el = time.time() - t0
+            # Rate over THIS epoch, and ETA to the BUDGET rather than the epoch
+            # end -- the budget is what actually stops the run.
+            done = self.global_step - getattr(self, "_epoch_step0", 0)
+            rate = done / max(el, 1e-9)
+            msg += f" | {rate:.2f} steps/s | elapsed {el / 3600:.2f} h"
+            if budget and budget > 0 and rate > 0:
+                msg += f" | ETA {(budget - self.global_step) / rate / 3600:.2f} h"
+        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs
+        try:
+            msg += f" | loss {float(loss):.2f}"
+        except Exception:  # noqa: BLE001 - loss shape varies by variant
+            pass
+        print(msg, flush=True)
 
 
     def training_step(
