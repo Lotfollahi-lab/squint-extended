@@ -936,11 +936,23 @@ def make_dataset_blob_config() -> dict:
         "dataset": {
             "name": DATASET_NAME,
             "feature_names": ["cell_gene_counts"],
-            "label_names": [
-                "cell_types=cell_type",
-                # If your AnnData also has e.g. region labels in obs['region'],
-                # add: "niche_types=region"
-            ],
+            # EMPTY for the corpus, deliberately. `cell_type` is present on
+            # only 143 of the 636 sections (`_annocoverage.json`), and a
+            # partially-present label produces a blob that builds cleanly over
+            # ~48 h and then fails during TRAINING: PyG's `collate` takes its
+            # key set from the first `Data` in a block, so a block mixing a
+            # labelled and an unlabelled section raises KeyError -- or, if the
+            # unlabelled one happens to come first, trains without labels and
+            # says nothing. `OnDiskDatasetBlob.process()` now refuses this at
+            # build time.
+            #
+            # Nothing is lost. No SQUINT variant registers a cross-entropy
+            # loss, so `y_*` is unused during training; and expert labels reach
+            # the predicted AnnData through the per-section `.obs` sidecars,
+            # where every column appearing in ANY section is propagated and
+            # NaN-filled elsewhere (type_conversions.py:296-304). NMI/ARI
+            # benchmarking reads them from there.
+            "label_names": [],
             "graph_kwargs": {
                 "coord_type": "generic",
                 "spatial_key": "spatial",     # adata.obsm['spatial']

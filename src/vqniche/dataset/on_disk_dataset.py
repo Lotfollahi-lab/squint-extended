@@ -80,6 +80,7 @@ import math
 import pickle
 import random
 import shutil
+import time
 from pathlib import Path
 from typing import Callable, List, Optional, Iterator, Tuple
 
@@ -614,6 +615,11 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # ~13 MB, versus ~32 MB of interned strings).
         vocab: set = set()
         var_index_per_batch: dict = {}
+        # Which sections carry each label, so a partially-present label can be
+        # refused at build time rather than at training time. See the check
+        # after pass 1.
+        _label_present: dict = {}
+        _label_absent: dict = {}
 
         for adata_batch_file in raw_files:
             # BACKED read: pass 1 only needs .var (gene panel), .obs (spilled
@@ -673,7 +679,11 @@ class OnDiskDatasetBlob(OnDiskDataset):
                     print(f"WARNING: obs column '{label_key}' missing from "
                           f"{Path(adata_batch_file).name}; skipping "
                           f"y_{label_name} for this section.")
+                    _label_absent.setdefault(label_name, []).append(
+                        _rel_section_name(adata_batch_file, self.raw_dir))
                     continue
+                _label_present.setdefault(label_name, []).append(
+                    _rel_section_name(adata_batch_file, self.raw_dir))
                 _vals = pd.Series(adata_batch.obs[label_key].unique()).dropna().tolist()
                 self.label_categories[label_name].update(_vals)
 
@@ -688,6 +698,39 @@ class OnDiskDatasetBlob(OnDiskDataset):
 
         for label_name in self.label_names:
             self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
+
+        # A label present on SOME sections and absent on others builds happily
+        # and then fails at TRAINING time, which is the worst possible place for
+        # it: the corpus build is ~48 h and not resumable.
+        #
+        # The mechanism: `SetExperimentDataKeys.set_node_labels` returns the real
+        # one-hot when `y_<label>` exists and a (N, 0) placeholder when it does
+        # not, and PyG's `collate` takes its key set from the FIRST `Data` in a
+        # block and demands the rest match (torch_geometric/data/collate.py:95).
+        # So a block whose first section lacks the label proceeds silently
+        # WITHOUT labels, while one whose first section has it raises
+        # KeyError on the first section that does not. Which happens depends on
+        # the shuffle, so a corpus run would die at an arbitrary point in epoch
+        # 1 -- or, worse, train some blocks unlabelled without complaint.
+        #
+        # hst_corpus_110m is exactly this case: `cell_type` is on 143 of 636
+        # sections. Refuse at build time and name the fix.
+        for label_name in self.label_names:
+            have = _label_present.get(label_name, [])
+            lack = _label_absent.get(label_name, [])
+            if have and lack:
+                raise ValueError(
+                    f"Label {label_name!r} is present on {len(have)} section(s) "
+                    f"and ABSENT on {len(lack)} (e.g. present {have[:2]}, absent "
+                    f"{lack[:2]}). A partially-present label produces a blob "
+                    f"that builds cleanly and then fails during training, "
+                    f"because a block mixing the two cannot be collated.\n"
+                    f"  Either drop it from `label_names` -- expert labels reach "
+                    f"the predicted AnnData through the per-section `.obs` "
+                    f"sidecars, not through `y_*`, so NMI/ARI benchmarking is "
+                    f"unaffected -- or restrict the build to sections that "
+                    f"carry it via `exclude_sections`."
+                )
 
         # ---- finalise the cross-panel vocabulary --------------------------
         if self.cross_panel:
@@ -819,8 +862,17 @@ class OnDiskDatasetBlob(OnDiskDataset):
         if self.cross_panel:
             self.gene_panel = None
 
-        for adata_batch_file in raw_files:
+        # Per-section timing with a running ETA. A corpus build is SERIAL and
+        # cannot resume — `process()` appends, so a partial build has to be
+        # discarded — which makes a multi-hour run with no progress signal a
+        # bad bet: a stall is indistinguishable from slow work until the
+        # wall-clock limit kills it. The cost is one `time.time()` per section.
+        _t_build0 = time.time()
+        _cells_done = 0
+
+        for _i_sec, adata_batch_file in enumerate(raw_files):
             print(f"Processing {adata_batch_file}...")
+            _t_sec = time.time()
             # Inherited; pre_filter/pre_transform already applied inside it
             # (in_memory_dataset_blob.py:579-585).
             data_batch = self.process_anndata_batch(adata_batch_file)
@@ -844,6 +896,20 @@ class OnDiskDatasetBlob(OnDiskDataset):
             node_counts.append(int(data_batch["x_cell_gene_counts"].shape[0]))
             batch_labels.append(_section_batch_identity(data_batch, self.batch_key))
             del data_batch   # never hold two sections at once
+
+            _n = node_counts[-1]
+            _cells_done += _n
+            _dt = time.time() - _t_sec
+            _elapsed = time.time() - _t_build0
+            _left = len(raw_files) - (_i_sec + 1)
+            _eta = (_elapsed / (_i_sec + 1)) * _left
+            print(
+                f"  [{_i_sec + 1}/{len(raw_files)}] {rel} — {_n:,} cells in "
+                f"{_dt:.1f}s ({_n / max(_dt, 1e-9):,.0f} cells/s); "
+                f"elapsed {_elapsed / 60:.1f} min, "
+                f"{_cells_done:,} cells done, ETA {_eta / 60:.1f} min",
+                flush=True,
+            )
 
         # Row order == append order == sorted(raw_files) order.
         #

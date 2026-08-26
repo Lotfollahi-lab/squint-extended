@@ -566,3 +566,71 @@ def test_predict_still_spans_everything(tmp_path):
     dm = _dm(blob, split_sections={"test": ["section_2.h5ad"]})
     ld = dm.predict_dataloader()
     assert ld.input_mask_attr is None and ld.section_rows is None
+
+
+# --------------------------------------------------------------------------- #
+# partially-present labels — a blob that builds and then fails at training
+# --------------------------------------------------------------------------- #
+
+def _write_mixed_labels(root, name="mix"):
+    """Section 0 carries `cell_type`, section 1 does not — the corpus case,
+    where 143 of 636 sections have it."""
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    silver = root / "silver" / name
+    silver.mkdir(parents=True, exist_ok=True)
+    for i, has_label in enumerate([True, False]):
+        n = 12 + i
+        a = ad.AnnData(np.tile(np.arange(1, 4, dtype="float32"), (n, 1)))
+        a.var.index = ["a", "b", "c"]
+        a.obs["cell_id"] = [f"b{i}_c{j}" for j in range(n)]
+        if has_label:
+            a.obs["cell_type"] = rng.choice(["A", "B"], size=n)
+        a.obsm["spatial"] = rng.random((n, 2)) * 100
+        a.uns.update(batch=f"batch{i}", dataset_id=name, tissue="t", species="s")
+        a.write_h5ad(silver / f"section_{i}.h5ad")
+    return name
+
+
+def test_partially_present_label_is_refused_at_build_time(tmp_path):
+    """
+    Building would succeed and TRAINING would fail — after ~48 h for the
+    corpus. PyG's collate takes its key set from the first Data in a block, so
+    a block mixing labelled and unlabelled sections raises KeyError, and one
+    where the unlabelled section comes first silently trains without labels.
+    """
+    name = _write_mixed_labels(tmp_path)
+    with pytest.raises(ValueError, match="present on 1 section"):
+        _build(tmp_path, name, cross_panel=True)
+
+
+def test_the_refusal_names_both_ways_out(tmp_path):
+    name = _write_mixed_labels(tmp_path)
+    with pytest.raises(ValueError) as e:
+        _build(tmp_path, name, cross_panel=True)
+    msg = str(e.value)
+    assert "label_names" in msg and "exclude_sections" in msg
+    # and states why dropping the label costs nothing
+    assert "sidecar" in msg and "NMI/ARI" in msg
+
+
+def test_no_labels_at_all_is_fine(tmp_path):
+    """`label_names=[]` is the corpus setting: consistent across sections."""
+    name = _write_mixed_labels(tmp_path)
+    blob = OnDiskDatasetBlob(
+        name=name, feature_names=["cell_gene_counts"], label_names=[],
+        graph_kwargs=GRAPH_KWARGS, data_directory_path=tmp_path,
+        pre_filter=None, overwrite=True,
+        software_paths={"deepwalk": "", "gosh": ""}, cross_panel=True,
+    )
+    assert len(blob) == 2
+    for r in range(2):
+        assert not any(k.startswith("y_") for k in blob.get(r).keys())
+
+
+def test_label_on_every_section_still_works(tmp_path):
+    """The guard must not fire when the label is uniformly present."""
+    blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
+    assert len(blob) == 3
+    assert "y_cell_types" in blob.get(0).keys()
