@@ -673,3 +673,105 @@ def test_edgelists_still_written_when_deepwalk_is_configured(tmp_path):
             cross_panel=True,
         )
     assert list(gold.rglob("*.edgelist")), "gate suppressed a needed edgelist"
+
+
+# --------------------------------------------------------------------------- #
+# colliding adata_batch_id — what actually broke the first corpus build
+# --------------------------------------------------------------------------- #
+
+def _write_colliding_ids(root):
+    """
+    Two datasets, each with its own `batch0`/`batch1`, and DIFFERENT panels.
+
+    This is hst_corpus_110m in miniature: `adata_batch_id` is parsed from
+    `uns['batch']`, a within-dataset counter, so 561 of its 636 sections shared
+    an id with another section (80 on id 0).
+    """
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    panels = {("ds1", "batch0"): ["a", "b", "c", "d"],
+              ("ds1", "batch1"): ["a", "b", "c"],
+              ("ds2", "batch0"): ["a", "b", "e"],
+              ("ds2", "batch1"): ["a", "b"]}
+    for (ds, batch), genes in panels.items():
+        silver = root / "silver" / ds
+        silver.mkdir(parents=True, exist_ok=True)
+        n = 12
+        a = ad.AnnData(np.tile(np.arange(1, len(genes) + 1, dtype="float32"), (n, 1)))
+        a.var.index = list(genes)
+        a.obs["cell_id"] = [f"{ds}_{batch}_c{j}" for j in range(n)]
+        a.obs["marker"] = f"{ds}/{batch}"          # traces obs back to its file
+        a.obsm["spatial"] = rng.random((n, 2)) * 100
+        a.uns.update(batch=batch, dataset_id=ds, tissue="t", species="s")
+        a.write_h5ad(silver / f"{batch}.h5ad")
+
+
+def _build_flat(root, **kw):
+    """Build over BOTH dataset subdirs (name="" => raw_dir is silver/)."""
+    return OnDiskDatasetBlob(
+        name="", feature_names=["cell_gene_counts"], label_names=[],
+        graph_kwargs=GRAPH_KWARGS, data_directory_path=root, pre_filter=None,
+        overwrite=True, software_paths={"deepwalk": "", "gosh": ""}, **kw,
+    )
+
+
+def test_colliding_ids_do_not_lose_sections(tmp_path):
+    """
+    Keyed by `adata_batch_id`, pass 1 kept only ONE gene list per colliding id:
+    the real build reported "7 distinct panels over 75 sections" for a corpus
+    of 46 panels over 636 sections, and produced a 5,106-gene vocabulary
+    instead of 9,574.
+    """
+    _write_colliding_ids(tmp_path)
+    blob = _build_flat(tmp_path, cross_panel=True)
+    assert len(blob) == 4, "a section was lost to an id collision"
+    # union over all four panels, none dropped by an overwritten gene list
+    assert list(blob.gene_vocab) == ["a", "b", "c", "d", "e"]
+
+
+def test_colliding_ids_are_renumbered_uniquely(tmp_path, capsys):
+    _write_colliding_ids(tmp_path)
+    blob = _build_flat(tmp_path, cross_panel=True)
+    out = capsys.readouterr().out
+    assert "adata_batch_id collisions" in out
+    ids = [int(blob.get(r).adata_batch_id) for r in range(len(blob))]
+    assert sorted(ids) == [0, 1, 2, 3], f"ids not unique per section: {ids}"
+
+
+def test_each_section_keeps_its_own_gene_ids(tmp_path):
+    """
+    The crash was pass 2 slicing a section with ANOTHER section's column list
+    ("INDICES element is out of DATA bounds"). Every section's ids must index
+    its own stored columns.
+    """
+    _write_colliding_ids(tmp_path)
+    blob = _build_flat(tmp_path, cross_panel=True)
+    seen = set()
+    for r in range(len(blob)):
+        sec = blob.get(r)
+        assert sec["x_cell_gene_counts"].shape[1] == sec.gene_ids.numel()
+        seen.add(tuple(blob.gene_vocab[i] for i in sec.gene_ids.view(-1).tolist()))
+    assert seen == {("a", "b", "c", "d"), ("a", "b", "c"),
+                    ("a", "b", "e"), ("a", "b")}
+
+
+def test_each_section_keeps_its_own_obs(tmp_path):
+    """80 corpus sections wrote to ONE obs sidecar — and obs is where the
+    expert labels live, so NMI/ARI would have scored the wrong annotations."""
+    _write_colliding_ids(tmp_path)
+    blob = _build_flat(tmp_path, cross_panel=True)
+    markers = set()
+    for r in range(len(blob)):
+        bid = int(blob.get(r).adata_batch_id)
+        markers.add(blob.obs_per_batch_id[bid]["marker"].iloc[0])
+    assert markers == {"ds1/batch0", "ds1/batch1", "ds2/batch0", "ds2/batch1"}
+
+
+def test_unique_ids_are_left_alone(tmp_path, capsys):
+    """A single-dataset blob (the paper's setting) must keep its parsed ids, so
+    variant selections like `test_batch_idx=[3, 1]` keep meaning."""
+    blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
+    assert "adata_batch_id collisions" not in capsys.readouterr().out
+    assert sorted(int(blob.get(r).adata_batch_id)
+                  for r in range(len(blob))) == [0, 1, 2]

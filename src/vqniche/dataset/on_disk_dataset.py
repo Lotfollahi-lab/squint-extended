@@ -608,7 +608,11 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # ---------------- Pass 1: gene panel + label vocab (streamed) ------
         self.gene_panel = None
         self.label_categories = {ln: set() for ln in self.label_names}
-        obs_index: dict = {}   # batch_id -> obs sidecar relpath
+        # rel path -> sidecar relpath during pass 1; remapped to
+        # {resolved adata_batch_id -> relpath} once ids are final, because
+        # that is how `inference_data_dict_to_adata` looks it up
+        # (type_conversions.py:440).
+        obs_index: dict = {}
         # cross_panel only: accumulate the vocabulary and remember each
         # section's own gene order. Strings are held only until pass 1 ends,
         # then collapsed to integer ids (636 sections x ~5k genes x int32 is
@@ -620,6 +624,10 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # after pass 1.
         _label_present: dict = {}
         _label_absent: dict = {}
+        # Derived ids and rel paths in raw_files order, so uniqueness can be
+        # checked once pass 1 has seen every section.
+        _derived_ids: List[int] = []
+        _rels_pass1: List[str] = []
 
         for adata_batch_file in raw_files:
             # BACKED read: pass 1 only needs .var (gene panel), .obs (spilled
@@ -634,11 +642,21 @@ class OnDiskDatasetBlob(OnDiskDataset):
             batch_id = self._derive_adata_batch_id(
                 adata_batch=adata_batch, adata_batch_file=adata_batch_file,
             )
+            _rel = _rel_section_name(adata_batch_file, self.raw_dir)
+            _derived_ids.append(batch_id)
+            _rels_pass1.append(_rel)
 
-            obs_rel = f"obs/section_{batch_id:05d}.pkl"
+            # Sidecar named by POSITION, not by `adata_batch_id`. The id is
+            # parsed from `uns['batch']`, which is a within-dataset counter:
+            # across hst_corpus_110m 561 of 636 sections share an id with
+            # another (80 of them are id 0). Naming the file by the id made 80
+            # sections overwrite ONE pickle -- and this is where the expert
+            # labels live, so NMI/ARI would have scored against another
+            # section's annotations. Position is unique by construction.
+            obs_rel = f"obs/section_{len(_rels_pass1) - 1:05d}.pkl"
             with open(meta / obs_rel, "wb") as f:
                 pickle.dump(adata_batch.obs.copy(), f)
-            obs_index[batch_id] = obs_rel
+            obs_index[_rel] = obs_rel
 
             if self.cross_panel:
                 # Union, not intersection. Intersection is not merely lossy
@@ -654,7 +672,12 @@ class OnDiskDatasetBlob(OnDiskDataset):
                         f"names in .var; the vocabulary maps name -> column, "
                         f"so duplicates would make `gene_ids` ambiguous."
                     )
-                var_index_per_batch[batch_id] = names
+                # Keyed by rel path for the same reason as the obs sidecar:
+                # keyed by `adata_batch_id` only 75 of 636 entries survived,
+                # which silently produced a 5,106-gene vocabulary over 7
+                # "panels" instead of 9,574 over 46 -- and left pass 2 slicing
+                # each section with another section's column list.
+                var_index_per_batch[_rel] = names
                 vocab.update(names)
             elif self.gene_panel is None:
                 self.gene_panel = adata_batch.var
@@ -732,6 +755,53 @@ class OnDiskDatasetBlob(OnDiskDataset):
                     f"carry it via `exclude_sections`."
                 )
 
+        # ---- `adata_batch_id` must be unique per SECTION -------------------
+        # It is parsed from `uns['batch']`, a WITHIN-DATASET counter, so on a
+        # multi-dataset corpus it collides hard: 561 of hst_corpus_110m's 636
+        # sections share an id with another section, 80 of them on id 0.
+        #
+        # A colliding id is not merely untidy — it is unusable. Per-cell
+        # `adata_batch_ids` is what predict uses to look up a cell's `.obs`
+        # (`type_conversions.py:440`), so with collisions a cell cannot be
+        # traced back to its own section at all.
+        #
+        # Single-dataset blobs (the paper's setting) are unaffected: their ids
+        # are already unique, so the parsed value is kept and variant
+        # selections like `test_batch_idx=[3, 1]` keep meaning exactly what
+        # they meant. Only when the parsed ids collide are they replaced, by
+        # POSITION in the sorted file list — deterministic, and unique by
+        # construction. It is announced, never silent.
+        self._section_id_by_rel: dict = {}
+        _dupe_ids = len(_derived_ids) != len(set(_derived_ids))
+        if _dupe_ids:
+            from collections import Counter as _C
+            _worst = _C(_derived_ids).most_common(3)
+            print(
+                f"\n*** adata_batch_id collisions: {len(_derived_ids)} sections "
+                f"map to only {len(set(_derived_ids))} distinct ids "
+                f"(worst: {_worst}).\n"
+                f"    uns['batch'] is a within-dataset counter, so it cannot key "
+                f"a multi-dataset corpus.\n"
+                f"    Reassigning ids by position in the sorted file list so "
+                f"every section is addressable.\n",
+                flush=True,
+            )
+            self._section_id_by_rel = {r: i for i, r in enumerate(_rels_pass1)}
+        else:
+            self._section_id_by_rel = dict(zip(_rels_pass1, _derived_ids))
+        if len(set(self._section_id_by_rel.values())) != len(_rels_pass1):
+            raise AssertionError(
+                "adata_batch_id is still not unique after reassignment; refusing "
+                "to build a blob whose cells cannot be traced to their section."
+            )
+
+        # Sidecars were written under positional names; re-key the INDEX by the
+        # resolved id, which is what predict looks a cell's obs up by.
+        obs_index = {
+            int(self._section_id_by_rel[r]): rel_path
+            for r, rel_path in obs_index.items()
+        }
+
         # ---- finalise the cross-panel vocabulary --------------------------
         if self.cross_panel:
             # NOTE: no local `import pandas as pd` here. A function-level import
@@ -800,25 +870,25 @@ class OnDiskDatasetBlob(OnDiskDataset):
             # asserts.
             if keep_names is None:
                 self._gene_ids_per_batch = {
-                    bid: np.fromiter((pos[g] for g in names), dtype=np.int64,
+                    rel: np.fromiter((pos[g] for g in names), dtype=np.int64,
                                      count=len(names))
-                    for bid, names in var_index_per_batch.items()
+                    for rel, names in var_index_per_batch.items()
                 }
                 self._gene_cols_per_batch = {}
             else:
                 self._gene_ids_per_batch = {}
                 self._gene_cols_per_batch = {}
-                for bid, names in var_index_per_batch.items():
+                for rel, names in var_index_per_batch.items():
                     cols = [i for i, g in enumerate(names) if g in keep_names]
                     if not cols:
                         raise ValueError(
-                            f"Section with adata_batch_id {bid} has no gene in "
+                            f"Section {rel!r} has no gene in "
                             f"the vocabulary, so it would be stored with zero "
                             f"columns. Lower min_panels_per_gene, or exclude "
                             f"the section explicitly."
                         )
-                    self._gene_cols_per_batch[bid] = np.asarray(cols, dtype=np.int64)
-                    self._gene_ids_per_batch[bid] = np.fromiter(
+                    self._gene_cols_per_batch[rel] = np.asarray(cols, dtype=np.int64)
+                    self._gene_ids_per_batch[rel] = np.fromiter(
                         (pos[names[i]] for i in cols), dtype=np.int64,
                         count=len(cols),
                     )
@@ -878,6 +948,18 @@ class OnDiskDatasetBlob(OnDiskDataset):
             data_batch = self.process_anndata_batch(adata_batch_file)
             rel = _rel_section_name(adata_batch_file, self.raw_dir)
             section_rels.append(rel)
+            # Apply the id resolved in pass 1. `process_anndata_batch` stamps
+            # the value parsed from `uns['batch']`, which is not unique across
+            # a multi-dataset corpus; pass 1 has already decided whether to
+            # keep it or renumber positionally.
+            _resolved = self._section_id_by_rel.get(rel)
+            if _resolved is None:
+                raise KeyError(
+                    f"No section id recorded for {rel!r}. Pass 1 and pass 2 "
+                    f"iterate the same file list, so this means they disagreed "
+                    f"about which sections exist."
+                )
+            data_batch.adata_batch_id = int(_resolved)
             if self.cross_panel:
                 # Slice BEFORE stamping: `gene_ids` must index the columns that
                 # actually get stored, and `_stamp_gene_ids` asserts exactly
@@ -885,7 +967,7 @@ class OnDiskDatasetBlob(OnDiskDataset):
                 drop = self._slice_to_vocab(data_batch, rel)
                 if drop is not None:
                     vocab_drops.append(drop)
-                self._stamp_gene_ids(data_batch)
+                self._stamp_gene_ids(data_batch, rel)
             # Append as a serialized row. schema=object => serialize() is a
             # passthrough and the DB pickles the Data (list attrs survive).
             self.append(self.serialize(data_batch))
@@ -988,7 +1070,7 @@ class OnDiskDatasetBlob(OnDiskDataset):
         section's total counts carried by the dropped columns — the number that
         makes the loss auditable rather than merely reported.
         """
-        cols = self._gene_cols_per_batch.get(int(data_batch.adata_batch_id))
+        cols = self._gene_cols_per_batch.get(rel)
         if cols is None:
             return None
         native = int(data_batch["x_cell_gene_counts"].shape[1])
@@ -1024,7 +1106,7 @@ class OnDiskDatasetBlob(OnDiskDataset):
             "dropped_frac_counts": round(frac, 6),
         }
 
-    def _stamp_gene_ids(self, data_batch) -> None:
+    def _stamp_gene_ids(self, data_batch, rel: str) -> None:
         """
         Attach this section's vocabulary ids, cross-panel builds only.
 
@@ -1044,18 +1126,17 @@ class OnDiskDatasetBlob(OnDiskDataset):
         CONTAINING "batch", which is what silently shifted `adata_batch_ids`
         0/1/2 into 0/2/5. "gene_ids" is inert under that rule.
         """
-        bid = int(data_batch.adata_batch_id)
-        ids = self._gene_ids_per_batch.get(bid)
+        ids = self._gene_ids_per_batch.get(rel)
         if ids is None:
             raise KeyError(
-                f"No gene ids recorded for adata_batch_id {bid}. Pass 1 builds "
-                f"the map from the same file list as pass 2, so this means the "
-                f"two passes disagreed about which sections exist."
+                f"No gene ids recorded for section {rel!r}. Pass 1 builds the "
+                f"map from the same file list as pass 2, so this means the two "
+                f"passes disagreed about which sections exist."
             )
         n_genes = int(data_batch["x_cell_gene_counts"].shape[1])
         if len(ids) != n_genes:
             raise ValueError(
-                f"Section {bid}: pass 1 recorded {len(ids)} genes but the "
+                f"Section {rel!r}: pass 1 recorded {len(ids)} genes but the "
                 f"processed counts have {n_genes} columns. `gene_ids` must "
                 f"index the columns of `x_cell_gene_counts` exactly, or the "
                 f"per-block union would scatter counts into the wrong genes."
