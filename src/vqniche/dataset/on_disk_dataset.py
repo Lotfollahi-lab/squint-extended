@@ -75,6 +75,7 @@ NeighborLoader; the stripped metadata is recoverable by section index.
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import math
 import pickle
@@ -2301,7 +2302,29 @@ class KSectionBlockLoader:
             for mini_batch in nl:
                 yield mini_batch
 
-            del block                                     # release the K sections
+            # Release the block BEFORE the next one is built.
+            #
+            # `del block` ALONE DID NOT. `nl` holds the block as its dataset and
+            # was only rebound on the next iteration, and PyG's
+            # NeighborLoader/NeighborSampler keep it in reference cycles that
+            # only the cyclic collector breaks -- so freeing was deferred to
+            # whenever CPython happened to run a generational collection.
+            #
+            # Measured by `BaseModel._tensor_census` on the corpus: at step 200
+            # 22.18 GiB in 260 live tensors, at step 1,200 35.54 GiB in 392,
+            # with four-plus DISTINCT blocks resident -- (514416, 5052),
+            # (616613, 1084), (299302, 173), (876342, 5225) -- in a run with
+            # num_workers=0 and prefetch off, where exactly one block should be
+            # alive. All `grad=False, graph=False`, so not a retained autograd
+            # graph: simply blocks that were never freed. That is the ~9 MB per
+            # step which survived excluding page cache, the inference cache, the
+            # worker machinery, pinned memory and allocator fragmentation.
+            #
+            # The collect is per BLOCK, not per step -- blocks are seconds apart
+            # and the heap holds only hundreds of objects, so it is cheap.
+            del nl
+            del block
+            gc.collect()
         self._epoch += 1
 
     def set_epoch(self, epoch: int) -> None:

@@ -1054,3 +1054,101 @@ def test_heartbeat_survives_an_unusable_loss(capsys):
     """Loss shape varies by variant; a heartbeat must never break a run."""
     out = _hb(10, 10, capsys, loss={"loss": object()}, t0_ago=None)
     assert "step 10" in out and "loss" not in out
+
+
+# --------------------------------------------------------------------------- #
+# blocks must be released as the loader advances
+# --------------------------------------------------------------------------- #
+
+def _write_biggish(root, name="big"):
+    """Sections large enough that a block's gene-width tensor is identifiable
+    among test noise. The original version of this test used 12-cell sections
+    and passed WITHOUT the fix, which made it worthless."""
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    silver = root / "silver" / name
+    silver.mkdir(parents=True, exist_ok=True)
+    for i in range(4):
+        n, g = 400, 60
+        a = ad.AnnData(rng.random((n, g)).astype("float32") + 1.0)
+        a.var.index = [f"g{j}" for j in range(g)]
+        a.obs["cell_id"] = [f"b{i}_c{j}" for j in range(n)]
+        a.obsm["spatial"] = rng.random((n, 2)) * 100
+        a.uns.update(batch=f"batch{i}", dataset_id=name, tissue="t", species="s")
+        a.write_h5ad(silver / f"section_{i}.h5ad")
+    return name
+
+
+def _live_blocks(min_elems=400 * 60 // 2):
+    """Live 2-D float tensors big enough to be a block's gene-width matrix."""
+    import gc as _gc
+    n = 0
+    for o in _gc.get_objects():
+        try:
+            if (isinstance(o, torch.Tensor) and o.dim() == 2
+                    and o.dtype == torch.float32 and o.nelement() >= min_elems):
+                n += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return n
+
+
+def _blob_biggish(tmp_path):
+    _write_biggish(tmp_path)
+    return OnDiskDatasetBlob(
+        name="big", feature_names=["cell_gene_counts"], label_names=[],
+        graph_kwargs=GRAPH_KWARGS, data_directory_path=tmp_path,
+        pre_filter=None, overwrite=True,
+        software_paths={"deepwalk": "", "gosh": ""}, cross_panel=True)
+
+
+def test_previous_block_is_freed_before_the_next_is_built(tmp_path):
+    """
+    The leak is only visible DURING iteration, not after: at loop exit the
+    generator frame dies and releases everything. While consuming block N,
+    `del block` alone left block N-1 alive because `nl` still referenced it and
+    was rebound only on the next pass.
+
+    Measured on the corpus: 4+ distinct blocks resident, 35.5 GiB at step 1,200
+    in a single-threaded run where one should be -- the ~9 MB/step that killed
+    two training runs.
+    """
+    blob = _blob_biggish(tmp_path)
+    ld = _loader(blob, K=1, transform=_transform(), num_neighbors=[-1],
+                 prefetch=False)
+    seen = []
+    for b in ld:
+        seen.append(_live_blocks())
+    # Sampled mid-stream, the live-block count must not grow with the number of
+    # blocks already visited.
+    assert max(seen) - min(seen) <= 1, f"live blocks grew during iteration: {seen}"
+
+
+def test_iteration_still_yields_every_section(tmp_path):
+    """The release must not cost us any data."""
+    blob = _blob_biggish(tmp_path)
+    ld = _loader(blob, K=1, transform=_transform(), num_neighbors=[-1],
+                 prefetch=False)
+    rows = {int(b.section_row.min()) for b in ld}
+    assert rows == {0, 1, 2, 3}
+
+
+def test_release_works_with_prefetch_too(tmp_path):
+    blob = _blob_biggish(tmp_path)
+    ld = _loader(blob, K=1, transform=_transform(), num_neighbors=[-1],
+                 prefetch=True)
+    seen = []
+    for b in ld:
+        seen.append(_live_blocks())
+    # Residency must be BOUNDED, not constant. With prefetch the design holds
+    # three blocks -- the consumer iterates N, the queue holds N+1 at
+    # maxsize=1, and the producer is already building N+2 -- plus a transient
+    # fourth while a block is being widened. What matters is that it does not
+    # TREND upward; the tail of the series drains to 1 as the loader runs out
+    # of blocks, so a max-minus-min bound would measure the drain, not a leak.
+    assert max(seen) <= 4, f"more than the designed residency: {seen}"
+    steady = [x for x in seen[:int(len(seen) * 0.6)]]
+    head = sum(steady[:len(steady) // 3]) / max(len(steady) // 3, 1)
+    tail = sum(steady[-(len(steady) // 3):]) / max(len(steady) // 3, 1)
+    assert tail <= head + 0.5, f"live blocks trending up: head {head} tail {tail}"
