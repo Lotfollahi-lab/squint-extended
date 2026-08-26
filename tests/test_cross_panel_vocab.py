@@ -211,13 +211,18 @@ def test_typo_in_exclude_sections_raises(tmp_path):
 # sidecars / manifest
 # --------------------------------------------------------------------------- #
 
-def test_manifest_v3_and_vocab_sidecar(tmp_path):
+def test_manifest_and_vocab_sidecar(tmp_path):
     name = _write(tmp_path, DISJOINT)
     blob = _build(tmp_path, name, cross_panel=True)
     m = json.load(open(f"{blob.processed_dir}/manifest.json"))
-    assert m["manifest_version"] == 3
+    # v4 added `section_rels`, the vocabulary policy and `batch_key`. The
+    # cross-panel fields it inherits from v3 must not have moved.
+    assert m["manifest_version"] == 4
     assert m["cross_panel"] is True
     assert m["gene_vocab_size"] == 7
+    assert m["min_panels_per_gene"] == 1 and m["vocab_drops"] == []
+    assert m["batch_key"] == "batch"
+    assert len(m["section_rels"]) == len(blob)
     with open(f"{blob.processed_dir}/gene_vocab.pkl", "rb") as f:
         assert list(pickle.load(f)) == list(blob.gene_vocab)
 

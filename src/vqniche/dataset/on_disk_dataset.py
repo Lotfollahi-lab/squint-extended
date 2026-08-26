@@ -142,6 +142,113 @@ def _section_batch_label(section: Data) -> str:
     return str(int(section.adata_batch_id))
 
 
+def _rel_section_name(path, raw_dir) -> str:
+    """
+    A section's corpus-unique name: its path relative to the silver root,
+    i.e. "subdir/file.h5ad". Falls back to "<parent>/<name>" when the path is
+    not under `raw_dir`, which keeps the name stable for the tmp-dir layouts
+    the tests build.
+    """
+    p = Path(path)
+    try:
+        return str(p.relative_to(Path(raw_dir)))
+    except ValueError:
+        return f"{p.parent.name}/{p.name}" if p.parent.name else p.name
+
+
+def _warn_on_batch_label_collisions(batch_labels, dataset_ids, batch_key) -> None:
+    """
+    Shout when one batch label spans several datasets.
+
+    A label that names 80 unrelated experiments silently destroys the decoder
+    covariate and the GRL adversary, and it is invisible in every metric — the
+    run completes and the numbers look plausible. This is the guard that stops
+    it recurring, and it fires regardless of `batch_key` so that even a
+    deliberate legacy build says so out loud.
+    """
+    if not batch_labels or not any(d is not None for d in dataset_ids):
+        return
+    spans: dict = {}
+    for lbl, dsid in zip(batch_labels, dataset_ids, strict=True):
+        if dsid is not None:
+            spans.setdefault(lbl, set()).add(dsid)
+    bad = {k: v for k, v in spans.items() if len(v) > 1}
+    if not bad:
+        return
+    n_sec = sum(1 for lbl in batch_labels if len(spans.get(lbl, ())) > 1)
+    worst = sorted(bad.items(), key=lambda kv: -len(kv[1]))[:5]
+    print(
+        f"\n*** WARNING: batch label collision across datasets ***\n"
+        f"  {len(bad)} of {len(spans)} batch labels are used by more than one "
+        f"dataset, covering {n_sec}/{len(batch_labels)} sections.\n"
+        + "".join(f"    {k!r} spans {len(v)} datasets\n" for k, v in worst)
+        + f"  batch_key={batch_key!r}. Every section sharing a label is treated "
+        f"as ONE batch by the\n"
+        f"  decoder covariate, FiLM conditioning and the adversarial head, and "
+        f"held-out sections\n"
+        f"  carrying a seen label will not register as unseen. Rebuild with "
+        f"batch_key='dataset_batch'\n"
+        f"  unless the collision is genuinely intended.\n",
+        flush=True,
+    )
+
+
+def _report_vocab_drops(drops, vocab_size) -> None:
+    """
+    Per-section accounting for the vocabulary cap.
+
+    Reported rather than silent BY DESIGN: dropping stored columns without
+    saying so is precisely what made a gene filter unacceptable, so a build
+    that discards data has to state how much and from where.
+    """
+    tot_cols = sum(d["dropped_cols"] for d in drops)
+    worst = sorted(drops, key=lambda d: -d["dropped_frac_counts"])[:10]
+    print(
+        f"\nVocabulary cap: {len(drops)} of the built sections lost columns "
+        f"(vocabulary {vocab_size} genes; {tot_cols} column-slots dropped in "
+        f"total).\n  Worst-hit by FRACTION OF COUNTS lost:", flush=True,
+    )
+    for d in worst:
+        print(
+            f"    {d['rel']:44} {d['dropped_cols']:>6}/{d['native_cols']:<6} "
+            f"cols  {d['dropped_frac_counts']:>7.2%} of counts", flush=True,
+        )
+
+
+def _section_dataset_id(section) -> Optional[str]:
+    """
+    The section's `uns['dataset_id']`, stamped by `process_anndata_batch`
+    (in_memory_dataset_blob.py:530, defaulting to the blob name when absent).
+    """
+    dsid = section.get("dataset_id", None) if hasattr(section, "get") else None
+    if dsid is None:
+        dsid = getattr(section, "dataset_id", None)
+    if dsid is None:
+        return None
+    # Stored as a plain string, but a list-valued uns round-trips as a list.
+    if isinstance(dsid, (list, tuple)):
+        dsid = dsid[0] if len(dsid) else None
+    return None if dsid is None else str(dsid)
+
+
+def _section_batch_identity(section, batch_key: str = "batch") -> str:
+    """
+    The label the decoder covariate, FiLM conditioning and GRL adversary treat
+    as "which batch is this cell from" — see `OnDiskDatasetBlob.__init__` for
+    why `batch_key` exists and why the composite is required at corpus scale.
+
+    Falls back to the bare batch label when `dataset_id` is absent, rather than
+    fabricating a key: a blob whose sections predate the `dataset_id` stamp
+    keeps its old identities instead of silently collapsing them all onto a
+    single "None_batchN".
+    """
+    label = _section_batch_label(section)
+    if batch_key != "dataset_batch":
+        return label
+    dsid = _section_dataset_id(section)
+    return label if dsid is None else f"{dsid}_{label}"
+
+
 class OnDiskDatasetBlob(OnDiskDataset):
     """
     Streaming counterpart of `InMemoryDatasetBlob`. One section per SQLite
@@ -208,6 +315,9 @@ class OnDiskDatasetBlob(OnDiskDataset):
         backend: str = "file",
         cross_panel: bool = False,
         exclude_sections: Optional[List[str]] = None,
+        min_panels_per_gene: int = 1,
+        gene_vocab: Optional[List[str]] = None,
+        batch_key: str = "batch",
     ) -> None:
         # Mirror InMemoryDatasetBlob.__init__ attribute setup WITHOUT calling
         # it (its super().__init__ is InMemoryDataset's, which eagerly loads a
@@ -248,6 +358,83 @@ class OnDiskDatasetBlob(OnDiskDataset):
         self.exclude_sections = set(exclude_sections or ())
         self.gene_vocab = None            # pd.Index of gene names, len V
         self._gene_ids_per_batch: dict = {}   # batch_id -> np.ndarray[G_sec]
+        # batch_id -> column positions KEPT from the section's native width.
+        # Empty (and unused) unless the vocabulary drops columns.
+        self._gene_cols_per_batch: dict = {}
+
+        # ---- vocabulary policy ----------------------------------------------
+        # `min_panels_per_gene` caps the vocabulary at genes corroborated by at
+        # least N distinct PANELS (a panel is a distinct gene SET -- 46 of them
+        # across the corpus -- not a section; a gene in 150 sections that all
+        # share one panel is still a one-panel gene).
+        #
+        # Measured by `_vocabpolicy.py` over all 636 sections: threshold 1 gives
+        # 18,937 genes, 2 gives 9,574, 3 gives 6,581. Threshold 2 is a
+        # `chp60-1b_1p` operation and essentially nothing else -- of the 9,363
+        # genes it drops, 9,353 are chp60's, and the other 10 come from four
+        # datasets losing 1-4 genes each. `chr78-11b_1p` (the unseen-assay rung,
+        # and the corpus's narrowest panel at 169 genes) retains 100%.
+        #
+        # Why a threshold rather than excluding the wide section outright: it
+        # keeps chp60's 48,934 cells and its ~9,540 corroborated genes, while
+        # avoiding a V that doubles -- and therefore a 4x block-memory spike and
+        # 49% of the model's gene rows trained on 0.04% of the corpus -- on the
+        # strength of one section.
+        #
+        # Dropping columns SILENTLY is what made a gene filter unacceptable
+        # before. `process()` therefore reports, per section, how many columns
+        # went and what fraction of that section's counts they carried, and the
+        # totals land in the manifest.
+        self.min_panels_per_gene = int(min_panels_per_gene)
+        if self.min_panels_per_gene < 1:
+            raise ValueError(
+                f"min_panels_per_gene must be >= 1, got "
+                f"{self.min_panels_per_gene}."
+            )
+        # An explicit vocabulary OVERRIDES the threshold. Both merely decide
+        # `self.gene_vocab`; filtering each section down to it is one shared
+        # code path either way. This is what lets two blobs built over
+        # DIFFERENT section sets share one vocabulary -- required, because
+        # `gene_ids` are baked into stored sections, so checkpoints trained on
+        # blobs with different vocabularies have non-comparable V-wide weights.
+        self.gene_vocab_override = (
+            None if gene_vocab is None else list(gene_vocab)
+        )
+        if self.gene_vocab_override is not None and not self.cross_panel:
+            raise ValueError(
+                "gene_vocab was supplied but cross_panel=False. A shared "
+                "vocabulary only has meaning on the cross-panel path, where "
+                "`gene_ids` index it."
+            )
+
+        # ---- which identity counts as "the batch" ---------------------------
+        # "batch"          -> uns['batch'], the legacy behaviour. Correct for
+        #                     the paper's setting (1-3 sections, one dataset).
+        # "dataset_batch"  -> f"{dataset_id}_{batch}", the composite key.
+        #
+        # At corpus scale the legacy key is WRONG, not merely coarse:
+        # `uns['batch']` is a within-dataset counter, so `batch0` is used by 80
+        # different datasets and 627 of 636 sections carry a label that collides
+        # across datasets. That hands one decoder-covariate embedding row to 80
+        # unrelated experiments and tells the GRL adversary they are the same
+        # batch. It also hides a holdout completely: keyed on `uns['batch']`,
+        # 219/219 of TERRA's held-out sections look already-seen; keyed on the
+        # composite, 0/219 do.
+        #
+        # TERRA resolved this identically on this same corpus --
+        # `batch_id_key = f"{uns['dataset_id']}_{uns['batch']}"`
+        # (terra/src/terra/tokenizers/cell_tokenizers.py:1097), which is also
+        # the key its split files use.
+        #
+        # Default stays "batch" so existing blobs, variants and the paper's
+        # reproduction are untouched; `process()` WARNS whenever labels actually
+        # collide, so the corpus case cannot pass silently again.
+        if batch_key not in ("batch", "dataset_batch"):
+            raise ValueError(
+                f"batch_key must be 'batch' or 'dataset_batch', got "
+                f"{batch_key!r}."
+            )
+        self.batch_key = batch_key
 
         # force_reload is consulted by OnDiskDataset._process via the base
         # Dataset; store it so `process()` gating matches PyG semantics.
@@ -362,10 +549,49 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # Drop excluded sections BEFORE the vocabulary is computed, so V is the
         # union over what is actually built (see `cross_panel` in __init__).
         if self.exclude_sections:
-            kept = [f for f in raw_files
-                    if Path(f).stem not in self.exclude_sections]
-            dropped = [Path(f).stem for f in raw_files if f not in kept]
-            missing = self.exclude_sections - {Path(f).stem for f in raw_files}
+            # Match on the REL PATH ("subdir/file.h5ad") first, falling back to
+            # the file stem only where that stem is unambiguous.
+            #
+            # Stems are NOT unique across a corpus: 40 of them cover 162 of
+            # hst_corpus_110m's 636 files, and `adata_batch0` alone appears in 8
+            # different datasets. Excluding one held-out section by stem would
+            # silently drop up to 8, which for a train/holdout split is a wrong
+            # answer rather than a crash -- so an ambiguous stem now raises and
+            # names the candidates instead of quietly matching all of them.
+            rel_of = {f: _rel_section_name(f, self.raw_dir) for f in raw_files}
+            stem_counts: dict = {}
+            for f in raw_files:
+                stem_counts[Path(f).stem] = stem_counts.get(Path(f).stem, 0) + 1
+
+            ambiguous = {
+                s for s in self.exclude_sections
+                if s not in set(rel_of.values()) and stem_counts.get(s, 0) > 1
+            }
+            if ambiguous:
+                detail = {
+                    s: sorted(rel_of[f] for f in raw_files if Path(f).stem == s)
+                    for s in sorted(ambiguous)
+                }
+                raise ValueError(
+                    f"exclude_sections names file stems that match more than "
+                    f"one section: {detail}. Stems are not unique across a "
+                    f"corpus. Use the relative path ('subdir/file.h5ad') so the "
+                    f"exclusion is exact."
+                )
+
+            def _excluded(f) -> bool:
+                return (rel_of[f] in self.exclude_sections
+                        or Path(f).stem in self.exclude_sections)
+
+            kept = [f for f in raw_files if not _excluded(f)]
+            dropped = [rel_of[f] for f in raw_files if _excluded(f)]
+            matched = set()
+            for f in raw_files:
+                if rel_of[f] in self.exclude_sections:
+                    matched.add(rel_of[f])
+                if Path(f).stem in self.exclude_sections:
+                    matched.add(Path(f).stem)
+            missing = self.exclude_sections - matched
             if missing:
                 raise ValueError(
                     f"exclude_sections names sections that are not in "
@@ -477,18 +703,87 @@ class OnDiskDatasetBlob(OnDiskDataset):
             # vocabulary that reshuffled between builds would silently
             # invalidate an existing blob (and any checkpoint trained on it,
             # whose V-wide weight rows are indexed by exactly these ids).
-            self.gene_vocab = pd.Index(sorted(vocab), name="gene")
+            # An explicit vocabulary wins; otherwise apply the panel threshold.
+            # Both paths only decide WHICH names are in `gene_vocab` -- the
+            # per-section filtering below is identical either way.
+            if self.gene_vocab_override is not None:
+                keep_names = set(self.gene_vocab_override)
+                absent = sorted(keep_names - vocab)
+                self.gene_vocab = pd.Index(
+                    sorted(self.gene_vocab_override), name="gene")
+                print(f"Cross-panel vocabulary: {len(self.gene_vocab)} genes "
+                      f"(supplied, not derived).")
+                if absent:
+                    # Not an error: a shared vocabulary is deliberately built
+                    # over a LARGER section set than this blob, so a holdout
+                    # blob is expected to be missing some genes. It is worth
+                    # stating, because those V rows can receive no gradient
+                    # from this blob.
+                    print(f"  {len(absent)} of them appear in NO built section "
+                          f"and so will train on nothing here "
+                          f"(e.g. {absent[:5]}).")
+            elif self.min_panels_per_gene > 1:
+                # A PANEL is a distinct gene set, not a section: a gene in 150
+                # sections that all share one panel is still a one-panel gene.
+                # Derived from `var_index_per_batch`, which pass 1 already
+                # holds, so this costs no extra read.
+                panels = {frozenset(names) for names in var_index_per_batch.values()}
+                panel_count: dict = {}
+                for pan in panels:
+                    for g in pan:
+                        panel_count[g] = panel_count.get(g, 0) + 1
+                keep_names = {g for g in vocab
+                              if panel_count.get(g, 0) >= self.min_panels_per_gene}
+                if not keep_names:
+                    raise ValueError(
+                        f"min_panels_per_gene={self.min_panels_per_gene} leaves "
+                        f"an EMPTY vocabulary over {len(panels)} distinct "
+                        f"panels. Lower the threshold."
+                    )
+                self.gene_vocab = pd.Index(sorted(keep_names), name="gene")
+                print(f"Cross-panel vocabulary: {len(self.gene_vocab)} of "
+                      f"{len(vocab)} union genes appear in >= "
+                      f"{self.min_panels_per_gene} of {len(panels)} distinct "
+                      f"panels.")
+            else:
+                keep_names = None          # keep everything; no filtering
+                self.gene_vocab = pd.Index(sorted(vocab), name="gene")
+
             pos = {g: i for i, g in enumerate(self.gene_vocab)}
-            self._gene_ids_per_batch = {
-                bid: np.fromiter((pos[g] for g in names), dtype=np.int64,
-                                 count=len(names))
-                for bid, names in var_index_per_batch.items()
-            }
+            # With a filter, a section keeps only its in-vocabulary columns.
+            # `_gene_cols_per_batch` records WHICH native columns survived so
+            # pass 2 can slice the stored tensors to match -- `gene_ids` must
+            # index the stored columns exactly, which `_stamp_gene_ids` then
+            # asserts.
+            if keep_names is None:
+                self._gene_ids_per_batch = {
+                    bid: np.fromiter((pos[g] for g in names), dtype=np.int64,
+                                     count=len(names))
+                    for bid, names in var_index_per_batch.items()
+                }
+                self._gene_cols_per_batch = {}
+            else:
+                self._gene_ids_per_batch = {}
+                self._gene_cols_per_batch = {}
+                for bid, names in var_index_per_batch.items():
+                    cols = [i for i, g in enumerate(names) if g in keep_names]
+                    if not cols:
+                        raise ValueError(
+                            f"Section with adata_batch_id {bid} has no gene in "
+                            f"the vocabulary, so it would be stored with zero "
+                            f"columns. Lower min_panels_per_gene, or exclude "
+                            f"the section explicitly."
+                        )
+                    self._gene_cols_per_batch[bid] = np.asarray(cols, dtype=np.int64)
+                    self._gene_ids_per_batch[bid] = np.fromiter(
+                        (pos[names[i]] for i in cols), dtype=np.int64,
+                        count=len(cols),
+                    )
+
             widths = sorted({len(v) for v in self._gene_ids_per_batch.values()})
-            print(f"Cross-panel vocabulary: {len(self.gene_vocab)} genes over "
-                  f"{len(self._gene_ids_per_batch)} sections; per-section "
-                  f"widths {widths[0]}..{widths[-1]} "
-                  f"({len(widths)} distinct).")
+            print(f"  stored per-section widths {widths[0]}..{widths[-1]} "
+                  f"({len(widths)} distinct) over "
+                  f"{len(self._gene_ids_per_batch)} sections.")
             with open(meta / "gene_vocab.pkl", "wb") as f:
                 pickle.dump(self.gene_vocab, f)
             # `gene_panel.pkl` is what predict() reads to recover gene names
@@ -508,6 +803,11 @@ class OnDiskDatasetBlob(OnDiskDataset):
         section_ids: List[int] = []
         node_counts: List[int] = []
         batch_labels: List[str] = []
+        section_dataset_ids: List[Optional[str]] = []
+        section_rels: List[str] = []
+        # Per-section accounting for the vocabulary cap; empty when nothing
+        # was dropped. Reported below and recorded in the manifest.
+        vocab_drops: List[dict] = []
         # In cross-panel mode `process_anndata_batch` must NOT reindex. Its
         # only use of `self.gene_panel` is to reindex each section onto a single
         # canonical panel (in_memory_dataset_blob.py:381-385) -- exactly what we
@@ -524,16 +824,25 @@ class OnDiskDatasetBlob(OnDiskDataset):
             # Inherited; pre_filter/pre_transform already applied inside it
             # (in_memory_dataset_blob.py:579-585).
             data_batch = self.process_anndata_batch(adata_batch_file)
+            rel = _rel_section_name(adata_batch_file, self.raw_dir)
+            section_rels.append(rel)
             if self.cross_panel:
+                # Slice BEFORE stamping: `gene_ids` must index the columns that
+                # actually get stored, and `_stamp_gene_ids` asserts exactly
+                # that, so it doubles as the guard that the two agree.
+                drop = self._slice_to_vocab(data_batch, rel)
+                if drop is not None:
+                    vocab_drops.append(drop)
                 self._stamp_gene_ids(data_batch)
             # Append as a serialized row. schema=object => serialize() is a
             # passthrough and the DB pickles the Data (list attrs survive).
             self.append(self.serialize(data_batch))
             section_ids.append(int(data_batch.adata_batch_id))
+            section_dataset_ids.append(_section_dataset_id(data_batch))
             # Cheap per-section facts recorded HERE so consumers never have
             # to deserialize a row just to learn them (see `manifest` below).
             node_counts.append(int(data_batch["x_cell_gene_counts"].shape[0]))
-            batch_labels.append(_section_batch_label(data_batch))
+            batch_labels.append(_section_batch_identity(data_batch, self.batch_key))
             del data_batch   # never hold two sections at once
 
         # Row order == append order == sorted(raw_files) order.
@@ -550,16 +859,36 @@ class OnDiskDatasetBlob(OnDiskDataset):
         if self.cross_panel:
             self.gene_panel = _panel_for_pass2
 
+        _warn_on_batch_label_collisions(
+            batch_labels, section_dataset_ids, self.batch_key,
+        )
+        if vocab_drops:
+            _report_vocab_drops(vocab_drops, len(self.gene_vocab))
+
         manifest = {
-            # 3 adds the cross-panel fields. `_load_sidecars` reads every field
-            # with .get(), so a v2 blob keeps loading unchanged.
-            "manifest_version": 3,
+            # 3 adds the cross-panel fields; 4 adds `section_rels` (the only
+            # corpus-unique section name), the vocabulary policy and its
+            # per-section cost, and `batch_key`. `_load_sidecars` reads every
+            # field with .get(), so v2/v3 blobs keep loading unchanged.
+            "manifest_version": 4,
             "name": self.name,
             "cross_panel": self.cross_panel,
             "gene_vocab_size": (
                 int(len(self.gene_vocab)) if self.gene_vocab is not None else None
             ),
+            "min_panels_per_gene": self.min_panels_per_gene,
+            "gene_vocab_overridden": self.gene_vocab_override is not None,
+            "vocab_drops": vocab_drops,
+            "batch_key": self.batch_key,
             "excluded_sections": sorted(self.exclude_sections),
+            # DB row idx -> "subdir/file.h5ad". The ONLY corpus-unique section
+            # name: file stems collide (40 stems over 162 of 636 corpus files,
+            # `adata_batch0` alone in 8 datasets) and `uns['batch']` collides
+            # harder still (75 values for 636 sections). Everything that has to
+            # name a specific row -- `exclude_sections`, and the section-
+            # restricted loaders that make whole-section validation affordable
+            # -- resolves through this.
+            "section_rels": section_rels,
             # Which container holds the rows. Recorded so a reopen knows what to
             # expect and so a blob built before this field defaults to sqlite.
             "container": self.backend,
@@ -572,6 +901,62 @@ class OnDiskDatasetBlob(OnDiskDataset):
         }
         with open(meta / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)
+
+    def _slice_to_vocab(self, data_batch, rel: str) -> Optional[dict]:
+        """
+        Drop a section's out-of-vocabulary gene columns, cross-panel only.
+
+        No-op (returns None) unless the vocabulary actually filters — with
+        `min_panels_per_gene=1` and no override, `_gene_cols_per_batch` is empty
+        and a build is bit-identical to before.
+
+        Every gene-width attribute must be sliced together, or `gene_ids` would
+        index one tensor correctly and another wrongly. Rather than trusting a
+        fixed key list, this finds gene-width tensors by SHAPE — any `x_*` whose
+        column count equals the section's native width — and raises on an `x_*`
+        that is 2-D with some other width. A silent skip there would store a
+        tensor whose columns no longer line up with the ids, which is a wrong
+        answer rather than a crash. `y_*` are label-width and untouched.
+
+        Returns the per-section drop accounting, including the fraction of the
+        section's total counts carried by the dropped columns — the number that
+        makes the loss auditable rather than merely reported.
+        """
+        cols = self._gene_cols_per_batch.get(int(data_batch.adata_batch_id))
+        if cols is None:
+            return None
+        native = int(data_batch["x_cell_gene_counts"].shape[1])
+        if len(cols) == native:
+            return None
+
+        keep = torch.as_tensor(cols, dtype=torch.long)
+        gene_keys = [k for k in list(data_batch.keys()) if k.startswith("x_")]
+        total = None
+        dropped_mass = None
+        for k in gene_keys:
+            t = data_batch[k]
+            if not torch.is_tensor(t) or t.dim() != 2:
+                continue
+            if t.shape[1] != native:
+                raise ValueError(
+                    f"{rel}: gene-width attribute {k!r} has {t.shape[1]} "
+                    f"columns but the section's native width is {native}. "
+                    f"Every gene-width tensor must share one column order for "
+                    f"`gene_ids` to index them all."
+                )
+            if k == "x_cell_gene_counts":
+                total = float(t.sum())
+                dropped_mass = total - float(t.index_select(1, keep).sum())
+            data_batch[k] = t.index_select(1, keep)
+
+        frac = 0.0 if not total else dropped_mass / total
+        return {
+            "rel": rel,
+            "native_cols": native,
+            "kept_cols": int(len(cols)),
+            "dropped_cols": int(native - len(cols)),
+            "dropped_frac_counts": round(frac, 6),
+        }
 
     def _stamp_gene_ids(self, data_batch) -> None:
         """
@@ -631,6 +1016,12 @@ class OnDiskDatasetBlob(OnDiskDataset):
             self.section_ids = _manifest.get("section_ids", [])
             self.node_counts = _manifest.get("node_counts", None)
             self.batch_labels = _manifest.get("batch_labels", None)
+            # manifest_version >= 4. `section_rels` is the corpus-unique row
+            # name that `section_rows_for()` resolves against; None on older
+            # blobs, which then cannot address rows by name.
+            self.section_rels = _manifest.get("section_rels", None)
+            self.batch_key = _manifest.get("batch_key", "batch")
+            self.min_panels_per_gene = _manifest.get("min_panels_per_gene", 1)
             # Blobs built before the file container existed have no `container`
             # field and are sqlite by construction.
             self.container = _manifest.get("container", "sqlite")
@@ -709,17 +1100,83 @@ class OnDiskDatasetBlob(OnDiskDataset):
             ]
         return self.batch_labels
 
-    def batch_label_to_dense(self) -> dict:
+    def batch_label_to_dense(self, rows: Optional[List[int]] = None) -> dict:
         """
-        Corpus-wide {batch label -> dense id}, ids assigned over the SORTED
-        unique labels.
+        {batch label -> dense id} over `rows`, or over every section when
+        `rows` is None. Ids are assigned over the SORTED unique labels.
 
         Sorted-unique matches `build_batch_one_hot_from_obs`
         (initializers/initialize.py), so a section gets the same dense id
         whether it is loaded through the streaming or the in-memory path.
+
+        `rows` exists for the zero-shot setting, and it is the difference
+        between a correct evaluation and a silently wrong one. Restricted to
+        the TRAIN sections, the map has one row per batch the model actually
+        sees, so every embedding row receives gradient and the mean-embedding
+        fallback for novel batches is uncontaminated. A held-out section's label
+        is then absent, `_stamp_batch_ids` marks it unseen, and the model
+        substitutes that mean instead of an arbitrary reference batch — which is
+        what "this section was never in training" is supposed to mean.
+
+        Derived over the whole blob instead, a held-out label would resolve as
+        KNOWN and index a row that never trained; and because ids come from
+        sorted-unique, adding held-out labels also RENUMBERS the shared ones, so
+        every cell's covariate silently moves. That exact failure has already
+        occurred here once (fixed in 13f437b).
         """
-        labels = sorted(set(self.get_batch_labels()))
+        labels_all = self.get_batch_labels()
+        if rows is None:
+            labels = sorted(set(labels_all))
+        else:
+            labels = sorted({str(labels_all[int(r)]) for r in rows})
         return {lbl: i for i, lbl in enumerate(labels)}
+
+    def section_rows_for(self, names) -> List[int]:
+        """
+        DB row indices for the named sections.
+
+        `names` are rel paths ("subdir/file.h5ad"), or bare file stems where
+        those are unambiguous. Raises on a name that matches nothing or matches
+        several rows — this is what a train/val/test split is built from, so a
+        silent partial match would mis-scope an entire evaluation.
+
+        Requires manifest_version >= 4 (`section_rels`); older blobs have no
+        corpus-unique row name to resolve against.
+        """
+        rels = getattr(self, "section_rels", None)
+        if not rels:
+            raise RuntimeError(
+                "This blob's manifest has no 'section_rels' (built before "
+                "manifest_version 4), so its rows cannot be addressed by name. "
+                "Rebuild the blob to use section-restricted loaders."
+            )
+        by_rel = {r: i for i, r in enumerate(rels)}
+        by_stem: dict = {}
+        for i, r in enumerate(rels):
+            by_stem.setdefault(Path(r).stem, []).append(i)
+
+        rows, missing, ambiguous = [], [], {}
+        for n in names:
+            if n in by_rel:
+                rows.append(by_rel[n])
+                continue
+            hits = by_stem.get(n, [])
+            if len(hits) == 1:
+                rows.append(hits[0])
+            elif len(hits) > 1:
+                ambiguous[n] = [rels[i] for i in hits]
+            else:
+                missing.append(n)
+        if missing:
+            raise KeyError(
+                f"{len(missing)} section name(s) not in this blob, e.g. "
+                f"{sorted(missing)[:5]}."
+            )
+        if ambiguous:
+            raise ValueError(
+                f"Ambiguous section stems (use the rel path): {ambiguous}."
+            )
+        return sorted(set(rows))
 
     def iter_sections(self) -> Iterator[Tuple[int, Data]]:
         """Yield (row_idx, section Data) one at a time — never more than one
@@ -937,6 +1394,7 @@ class KSectionBlockLoader:
         shuffle: bool = True,
         seed: int = 0,
         input_mask_attr: Optional[str] = None,
+        section_rows: Optional[List[int]] = None,
         section_transform: Optional[Callable] = None,
         batch_label_to_dense: Optional[dict] = None,
         unknown_batch_label_dense_id: int = 0,
@@ -1011,6 +1469,29 @@ class KSectionBlockLoader:
         self.shuffle = shuffle
         self.seed = seed
         self.input_mask_attr = input_mask_attr
+        # Restrict the epoch to these DB rows. None => the whole blob.
+        #
+        # Without this a val pass builds EVERY block in the corpus to reach the
+        # val cells -- ~51 min at 636 sections, which is what forced validation
+        # off entirely. With whole-section splits (TERRA's design, and the
+        # SQUINT paper's for query-to-reference) the val loader visits only the
+        # val sections, so a val epoch costs seconds and honest validation
+        # curves become affordable at corpus scale.
+        if section_rows is not None:
+            n = len(dataset)
+            bad = [r for r in section_rows if not (0 <= int(r) < n)]
+            if bad:
+                raise IndexError(
+                    f"section_rows out of range for a {n}-section blob: "
+                    f"{bad[:5]}."
+                )
+            section_rows = sorted({int(r) for r in section_rows})
+            if not section_rows:
+                raise ValueError(
+                    "section_rows is empty — a loader over no sections would "
+                    "yield an empty epoch silently."
+                )
+        self.section_rows = section_rows
         # Fail fast on transforms that cannot be applied per section.
         _reject_global_scope_transforms(section_transform, where="section_transform")
         self.section_transform = section_transform
@@ -1033,7 +1514,8 @@ class KSectionBlockLoader:
 
     # -- block assignment -------------------------------------------------- #
     def _block_row_lists(self) -> List[List[int]]:
-        order = list(range(len(self.dataset)))
+        order = (list(range(len(self.dataset))) if self.section_rows is None
+                 else list(self.section_rows))
         if self.shuffle:
             random.Random(self.seed + self._epoch).shuffle(order)
         K = self.sections_per_block
@@ -1517,21 +1999,28 @@ class KSectionBlockLoader:
         if cached is not None:
             return cached
 
+        # Only the rows this loader will actually visit. Everything else keeps a
+        # 0 that is never read: `__len__` and `__iter__` both index `counts`
+        # through `_block_row_lists()`, which yields only these rows. Streaming
+        # the untouched rows too would reintroduce exactly the corpus-wide pass
+        # `section_rows` exists to avoid.
+        rows = (list(range(len(self.dataset))) if self.section_rows is None
+                else list(self.section_rows))
         print(
             f"KSectionBlockLoader: counting '{self.input_mask_attr}' seeds by "
-            f"streaming {len(self.dataset)} sections once (split masks are "
-            f"produced at load time, so they are not in the manifest). "
-            f"Cached for the rest of this loader's life."
+            f"streaming {len(rows)} of {len(self.dataset)} sections once (split "
+            f"masks are produced at load time, so they are not in the "
+            f"manifest). Cached for the rest of this loader's life."
         )
-        counts: List[int] = []
-        for row in range(len(self.dataset)):
+        counts: List[int] = [0] * len(self.dataset)
+        for row in rows:
             view = self._block_view(self._fetch_section(row), row)
             if self.input_mask_attr in view:
-                counts.append(int(view[self.input_mask_attr].sum()))
+                counts[row] = int(view[self.input_mask_attr].sum())
             else:
                 # Transform produced no such mask -> treat every cell as a
                 # seed, matching NeighborLoader's behaviour for input_nodes=None.
-                counts.append(int(view.num_nodes))
+                counts[row] = int(view.num_nodes)
         self._seed_count_cache[self.input_mask_attr] = counts
         return counts
 
@@ -1605,9 +2094,14 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
         batch_label_to_dense: Optional[dict] = None,
         unknown_batch_label_dense_id: int = 0,
         prefetch: bool = True,
+        split_sections: Optional[dict] = None,
     ) -> None:
         super().__init__()
         self.dataset = dataset
+        # {split -> [section name, ...]} for whole-section splits; see
+        # `_resolve_section_rows`. None keeps the in-section cell-mask splits.
+        self.split_sections = dict(split_sections or {}) or None
+        self._section_rows_cache: dict = {}
         self.edge_index_name = edge_index_name
         self.sections_per_block = int(sections_per_block)
         self.batch_size = int(batch_size)
@@ -1621,10 +2115,23 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
         # supplied one (predict time must reuse the TRAIN-time map, otherwise
         # dense ids shift and the decoder covariate embedding is indexed out of
         # range). Same reason `initialize_databatch` takes it as an argument.
-        self.batch_label_to_dense = (
-            batch_label_to_dense if batch_label_to_dense is not None
-            else dataset.batch_label_to_dense()
-        )
+        # With whole-section splits the map is derived from the TRAIN sections
+        # ONLY, and that is deliberate rather than an optimisation. Deriving it
+        # over the whole blob would size the decoder-covariate embedding to
+        # every section, leaving one untrained row per held-out section (219 of
+        # 635 on TERRA's split — 34% of the embedding, all of it random init).
+        # Those rows would then pollute the mean-embedding fallback AND make
+        # held-out labels resolve as "seen", so a zero-shot evaluation would
+        # quietly condition on noise. Restricted to train, every row trains and
+        # held-out sections take the unseen path by construction.
+        if batch_label_to_dense is not None:
+            self.batch_label_to_dense = batch_label_to_dense
+        elif self.split_sections:
+            self.batch_label_to_dense = dataset.batch_label_to_dense(
+                rows=self._resolve_section_rows("train"),
+            )
+        else:
+            self.batch_label_to_dense = dataset.batch_label_to_dense()
         self.unknown_batch_label_dense_id = int(unknown_batch_label_dense_id)
         self.prefetch = bool(prefetch)
 
@@ -1636,7 +2143,15 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
             "test": "test_mask",
             "predict": None,      # predict over all cells
         }[split]
+        rows = self._resolve_section_rows(split)
+        if rows is not None and mask_attr is not None:
+            # Whole-section splits and in-section cell masks are two different
+            # answers to "which cells are val". Applying both would intersect
+            # them and silently validate on a fraction of the named sections,
+            # so a named section set takes over the split entirely.
+            mask_attr = None
         return KSectionBlockLoader(
+            section_rows=rows,
             dataset=self.dataset,
             edge_index_name=self.edge_index_name,
             sections_per_block=self.sections_per_block,
@@ -1651,6 +2166,41 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
             prefetch=self.prefetch,
             loader_kwargs={"num_workers": self.num_workers},
         )
+
+    def _resolve_section_rows(self, split: str) -> Optional[List[int]]:
+        """
+        DB rows for a split's sections, or None for "the whole blob".
+
+        `split_sections` maps split name -> section names (rel paths, or
+        unambiguous stems), resolved once against the manifest. Train defaults
+        to "everything not named by another split" so a caller only has to list
+        the held-out sections — listing train's 417 by hand invites a typo that
+        would silently shrink the training set.
+        """
+        spec = self.split_sections
+        if not spec:
+            return None
+        cache = self._section_rows_cache
+        if split in cache:
+            return cache[split]
+
+        named = {s: self.dataset.section_rows_for(v)
+                 for s, v in spec.items() if v}
+        if split == "train" and "train" not in named:
+            claimed = {r for s, rows in named.items() if s != "train"
+                       for r in rows}
+            rows = [r for r in range(len(self.dataset)) if r not in claimed]
+            if not rows:
+                raise ValueError(
+                    "split_sections leaves no sections for training."
+                )
+        else:
+            rows = named.get(split)
+        cache[split] = rows
+        if rows is not None:
+            print(f"OnDiskStreamingDataModule: split {split!r} -> "
+                  f"{len(rows)} of {len(self.dataset)} sections.")
+        return rows
 
     def train_dataloader(self):
         return self._make_loader(split="train")

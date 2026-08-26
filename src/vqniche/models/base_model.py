@@ -638,6 +638,9 @@ class BaseModel(pl.LightningModule):
         # initialize total_loss = 0.0 with requires_grad=True so that the loss can be backpropagated
         # total_loss will be computed as the sum of all the loss terms from self.loss_names
         total_loss = torch.tensor(0.0, requires_grad=True, dtype=torch.float32).to(self.device)
+        # Accumulators for the reconstruction-vs-graph balance diagnostic.
+        _nb_sum = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        _adj_sum = torch.tensor(0.0, dtype=torch.float32, device=self.device)
 
         # during model initialization, self.loss_fn_tuples is set to a list of tuples
         # one tuple per loss name in self.loss_names
@@ -662,10 +665,68 @@ class BaseModel(pl.LightningModule):
                     sync_dist=True,
                     )
 
+            # Realised contribution of the reconstruction vs the graph term,
+            # accumulated for the balance diagnostic below. `loss_fn_value` is
+            # ALREADY weighted -- `wt_adj_reconstr` is a loss_fn_param applied
+            # inside the adjacency loss -- so these are what the optimizer
+            # actually sees, not the raw terms.
+            if "nb_attribute_reconstruction" in loss_fn_name:
+                _nb_sum = _nb_sum + loss_fn_value.detach()
+            elif "adjacency_reconstruction" in loss_fn_name:
+                _adj_sum = _adj_sum + loss_fn_value.detach()
+
             # free up memory by deleting the intermediate loss function data
             del _loss_fn_data
 
+        self._log_recon_graph_balance(
+            _nb_sum, _adj_sum, loss_data, mode, curr_batch_size,
+        )
         return total_loss
+
+    def _log_recon_graph_balance(self, nb_sum, adj_sum, loss_data, mode,
+                                 curr_batch_size) -> None:
+        """
+        Log the realised NB:adjacency balance and the panel width it occurred at.
+
+        WHY. The NB term is `mean over cells of SUM over genes`
+        (nb_attribute_reconstruction.py:128), so it grows with the number of
+        MEASURED genes. The adjacency BCE is over edge pairs and does not. Across
+        a corpus spanning 169 to 5,049 genes that is a ~30x swing in the balance
+        between reconstructing expression and reconstructing structure — from a
+        single `wt_adj_reconstr`. That constant was tuned on the MERFISH/STARmap
+        MB panel (~950 genes; run_squint.py:2117-2127, "~150 nats" of NB against
+        an adjacency BCE bounded by log(2)), so the corpus sits mostly ABOVE its
+        tuning width: ~5.3x the NB magnitude at 5,049 genes, ~5.6x below it at
+        169.
+
+        Whether that is a bug is genuinely open. A narrow panel carries less
+        expression information while its spatial graph is just as informative, so
+        relatively up-weighting the graph term for it may well be CORRECT. That
+        is an empirical question, and answering it needs the realised ratio
+        alongside the width it was measured at — which is what this logs, rather
+        than pre-emptively inventing a width-dependent weight.
+
+        `panel_width_mean` is per-cell measured genes from `gene_mask` under
+        cross-panel, where a block mixes panels and a single width would be
+        meaningless; it falls back to the input width otherwise.
+        """
+        if adj_sum is None or not torch.is_tensor(adj_sum) or float(adj_sum) == 0.0:
+            return
+        log = lambda n, v: self.log(  # noqa: E731 - local, one shape
+            name=n, value=v, prog_bar=False, on_step=False, on_epoch=True,
+            batch_size=curr_batch_size, sync_dist=True,
+        )
+        log(f"{mode}_recon_over_graph", nb_sum / adj_sum)
+
+        gene_mask = loss_data.get("gene_mask", None)
+        if gene_mask is not None and torch.is_tensor(gene_mask):
+            width = gene_mask.sum(dim=-1).to(torch.float32).mean()
+        else:
+            x = loss_data.get("x", None)
+            if x is None or not torch.is_tensor(x) or x.dim() != 2:
+                return
+            width = torch.tensor(float(x.shape[1]), device=nb_sum.device)
+        log(f"{mode}_panel_width_mean", width)
 
 
     def _init_attribute_decoder(

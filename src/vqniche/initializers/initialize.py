@@ -659,6 +659,7 @@ def initialize_databatch(
 def initialize_streaming_probe(
         config: Dict,
         dataset_blob,
+        batch_label_to_dense: Optional[Dict[str, int]] = None,
     ) -> Data:
     """
     Derive the shapes/dims the model constructor needs, from ONE section.
@@ -690,14 +691,23 @@ def initialize_streaming_probe(
         probe = section_transform(probe)
 
     # Span the corpus, not this section: a single section has one batch label.
-    n_batches = len(dataset_blob.batch_label_to_dense())
+    #
+    # `batch_label_to_dense` MUST be the same map the loader stamps ids with.
+    # It is passed in whenever the datamodule restricts the map to the TRAIN
+    # sections (whole-section splits), because sizing the decoder-covariate
+    # embedding from the whole blob while the loader emits ids from a smaller,
+    # differently-numbered map indexes the wrong embedding row for every cell —
+    # silently, since both are valid indices. Falls back to the blob-wide map,
+    # which is correct when training does span the blob.
+    label_map = batch_label_to_dense or dataset_blob.batch_label_to_dense()
+    n_batches = len(label_map)
     probe.n_distinct_batches = n_batches
 
     # `_n_distinct_batches` in the driver falls back to
     # `adata_batch_ids.max() + 1`; give it a consistent per-cell vector too so
     # either path agrees.
     label = dataset_blob.get_batch_labels()[0]
-    dense = dataset_blob.batch_label_to_dense()[label]
+    dense = label_map.get(label, 0)
     n_cells = probe.x.shape[0] if getattr(probe, 'x', None) is not None else probe.num_nodes
     probe.adata_batch_ids = torch.full((n_cells,), int(dense), dtype=torch.long)
 
@@ -773,6 +783,19 @@ def initialize_datamodule(
                     section_transform=getattr(data, 'section_transform', None),
                     num_workers=loader_params.get('num_workers', 0),
                     prefetch=dm_cfg.get('prefetch', True),
+                    # Whole-section splits: {split -> [section rel path, ...]}.
+                    # Absent, the loaders span the blob and splits come from
+                    # in-section cell masks (the paper's behaviour).
+                    split_sections=dm_cfg.get('split_sections', None),
+                    # MUST be the same map the model was sized from. The caller
+                    # passes it explicitly so the two cannot drift; when it is
+                    # None the DataModule derives it from the train sections,
+                    # which is the correct default but only agrees with the
+                    # model if the model was sized the same way. See
+                    # `OnDiskStreamingDataModule.__init__`.
+                    batch_label_to_dense=dm_cfg.get('batch_label_to_dense', None),
+                    seed=dm_cfg.get('seed', 0),
+                    val_num_neighbors=dm_cfg.get('val_num_neighbors', None),
                 )
 
     datamodule_batch = InMemoryDataModule(

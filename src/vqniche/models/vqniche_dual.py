@@ -531,6 +531,24 @@ class VQNiche_Dual(BaseModel):
                     "the step methods."
                 )
             ids_long = adata_batch_ids.long()
+            # A dense id past the embedding means the loader's label->dense map
+            # and the map the model was SIZED from disagree. Both are then
+            # plausible integers, so out of range is the lucky case: a shifted
+            # but in-range map silently reads the wrong covariate row for every
+            # cell and nothing anywhere raises (this happened once, 13f437b).
+            # Check explicitly rather than leaving it to a CUDA device assert.
+            if ids_long.numel():
+                _hi = int(ids_long.max())
+                if _hi >= self.decoder_covariate_dim or int(ids_long.min()) < 0:
+                    raise IndexError(
+                        f"adata_batch_ids range [{int(ids_long.min())}, {_hi}] "
+                        f"does not fit decoder_covariate_dim="
+                        f"{self.decoder_covariate_dim}. The batch label->dense "
+                        f"map used by the dataloader differs from the one the "
+                        f"model was built with — pass the SAME map to both "
+                        f"(for whole-section splits it must be derived from the "
+                        f"train sections only)."
+                    )
             unseen = (
                 adata_batch_ids_unseen_mask is not None
                 and adata_batch_ids_unseen_mask.any()

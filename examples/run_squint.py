@@ -126,6 +126,7 @@ Each .h5ad must contain:
 If any of these are missing, run `--patch-uns` once.
 """
 import argparse
+import json
 import os
 import sys
 import warnings
@@ -4596,6 +4597,63 @@ def _patch_dual_chl59_2b_1p(
     )
 
     cfg["trainer"]["monitor"] = "val_loss"
+    return cfg
+
+
+def _resolve_train_rows(dataset_blob, split_sections: dict) -> List[int]:
+    """
+    DB rows of the TRAIN sections, given a whole-section split spec.
+
+    Train is whatever no other split claims — the caller lists only the
+    held-out sections. Listing 416 train sections by hand invites a typo that
+    would silently shrink the training set, and a shrunk train set is invisible
+    in every metric.
+
+    Mirrors `OnDiskStreamingDataModule._resolve_section_rows`, and must keep
+    mirroring it: the map derived here sizes the model, the one derived there
+    stamps the loader's ids, and the two have to agree exactly.
+    """
+    claimed = set()
+    for split, names in split_sections.items():
+        if split == "train" or not names:
+            continue
+        claimed.update(dataset_blob.section_rows_for(names))
+    if "train" in split_sections and split_sections["train"]:
+        return dataset_blob.section_rows_for(split_sections["train"])
+    rows = [r for r in range(len(dataset_blob)) if r not in claimed]
+    if not rows:
+        raise ValueError("split_sections leaves no sections for training.")
+    return rows
+
+
+def _patch_corpus_split(cfg: dict, split_json: str | Path,
+                        val_key: str = "val", test_key: str = "held_out") -> dict:
+    """
+    Apply TERRA's whole-section split, read from `_splitspec.json`.
+
+    Whole-section, not an in-section cell split, because that is what the
+    zero-shot claim requires: a held-out SECTION is one the model has never
+    seen in any form, which is what TERRA's generalisation ladder measures and
+    what makes our numbers comparable to a published model on identical data.
+
+    Sections are named by REL PATH ("subdir/file.h5ad"). File stems collide for
+    162 of the corpus's 636 files (`adata_batch0` appears in 8 datasets), so a
+    stem-keyed split would silently mis-scope. `section_rows_for` raises on an
+    ambiguous name rather than guessing.
+
+    Train is implicit — everything not named here. See `_resolve_train_rows`.
+    """
+    spec = json.loads(Path(split_json).read_text())
+    split_sections = {}
+    if val_key and spec.get(val_key):
+        split_sections["val"] = list(spec[val_key])
+    if test_key and spec.get(test_key):
+        # The held-out set doubles as `test`: it is not touched during
+        # training, and Part F evaluates against it rung by rung.
+        split_sections["test"] = list(spec[test_key])
+    cfg.setdefault("datamodule", {})["split_sections"] = split_sections
+    n = {k: len(v) for k, v in split_sections.items()}
+    print(f"Corpus split from {split_json}: {n} (train = the remainder).")
     return cfg
 
 
@@ -37858,7 +37916,8 @@ def harmonize_anndata_var():
 
 def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
                container: str = "file", cross_panel: bool = False,
-               exclude_sections: Optional[List[str]] = None):
+               exclude_sections: Optional[List[str]] = None,
+               min_panels_per_gene: int = 1, batch_key: str = "batch"):
     """
     Build the in-memory PyG DatasetBlob in-process.
 
@@ -37976,6 +38035,12 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
             backend=container,
             cross_panel=cross_panel,
             exclude_sections=exclude_sections,
+            # Corpus builds pass `--min-panels-per-gene 2` (V 18,937 -> 9,574;
+            # 9,353 of the 9,363 dropped genes are chp60's, and chr78 keeps
+            # 100%) and `--batch-key dataset_batch` (uns['batch'] is a
+            # within-dataset counter: `batch0` names 80 unrelated experiments).
+            min_panels_per_gene=min_panels_per_gene,
+            batch_key=batch_key,
         )
         print(f"Built {len(dataset_blob)} sections; "
               f"section ids: {getattr(dataset_blob, 'section_ids', None)}")
@@ -38090,6 +38155,7 @@ def train(
         train_strategy:      Optional[str] = None,
         compile_model:       Optional[bool] = None,
         train_deterministic: Optional[bool] = None,
+        split_sections_json: Optional[str] = None,
     ):
     """
     Train SQUINT.
@@ -38162,6 +38228,14 @@ def train(
         )
     cfg = VARIANTS[variant]["build"]()
     summary = _ablation_summary(variant)
+
+    # Whole-section splits from a split spec, overriding whatever in-section
+    # cell split the variant configured. A CLI flag rather than a variant
+    # patch because the SAME variant is trained against different splits
+    # (SQUINT-holdout vs SQUINT-full differ ONLY in whether this is applied),
+    # and because the spec is a generated artifact, not source.
+    if split_sections_json:
+        _patch_corpus_split(cfg, split_sections_json)
 
     # Apply CLI-level precision override (if any). Keeps the base
     # config's bf16-mixed default in place when `train_precision is
@@ -38406,7 +38480,33 @@ def train(
     # the datamodule (which dispatches on its type).
     _streaming = cfg["dataset"].get("backend", "in-memory") == "on-disk"
     if _streaming:
-        data_batch = initialize_streaming_probe(cfg, dataset_blob)
+        # ---- ONE batch label->dense map, shared by the model and the loader --
+        # The model's decoder-covariate embedding is sized from this map
+        # (`initialize_streaming_probe` -> n_distinct_batches) and the loader
+        # stamps `adata_batch_ids` from it. If the two are derived separately
+        # they disagree the moment splits restrict one of them: sorted-unique
+        # ids RENUMBER on any change of membership, so every cell would read a
+        # valid-but-wrong embedding row. Compute it once, here, and hand the
+        # same object to both.
+        #
+        # Restricted to the TRAIN sections when whole-section splits are in
+        # use, which is what makes zero-shot evaluation correct: every
+        # embedding row then receives gradient, and a held-out section's label
+        # is absent, so it takes the unseen path (mean of the trained rows)
+        # rather than conditioning on an untrained one.
+        _split_sections = cfg["datamodule"].get("split_sections", None)
+        _label_map = None
+        if _split_sections:
+            _train_rows = _resolve_train_rows(dataset_blob, _split_sections)
+            _label_map = dataset_blob.batch_label_to_dense(rows=_train_rows)
+            print(f"Streaming: batch map restricted to {len(_train_rows)} train "
+                  f"sections -> {len(_label_map)} batches "
+                  f"(blob-wide would be "
+                  f"{len(dataset_blob.batch_label_to_dense())}).")
+            cfg["datamodule"]["batch_label_to_dense"] = _label_map
+        data_batch = initialize_streaming_probe(
+            cfg, dataset_blob, batch_label_to_dense=_label_map,
+        )
         _datamodule_input = dataset_blob
     else:
         data_batch = initialize_databatch(config=cfg, dataset_blob=dataset_blob)
@@ -40463,6 +40563,48 @@ def main():
                        "is computed, so a built section can never carry a gene "
                        "outside it."
                    ))
+    p.add_argument("--split-sections-json", type=str, default=None,
+                   help=(
+                       "Path to a split spec (`_splitspec.json`) applying "
+                       "WHOLE-SECTION train/val/test splits, overriding the "
+                       "variant's in-section cell split. Sections are named by "
+                       "rel path ('subdir/file.h5ad'); stems are not unique "
+                       "across a corpus. Train is implicit -- everything not "
+                       "named. This is the ONLY difference between the "
+                       "held-out model (which can make zero-shot claims) and "
+                       "the full model (which cannot, having seen every "
+                       "section). Streaming backend only."
+                   ))
+    p.add_argument("--min-panels-per-gene", type=int, default=1,
+                   help=(
+                       "Keep only genes measured by at least N DISTINCT PANELS "
+                       "(a panel is a distinct gene set -- 46 across the corpus "
+                       "-- not a section). Cross-panel builds only. 1 (default) "
+                       "keeps the full union and is bit-identical to before. "
+                       "Measured over all 636 corpus sections by "
+                       "`_vocabpolicy.py`: 1 -> 18,937 genes, 2 -> 9,574, "
+                       "3 -> 6,581. At 2 the cap is a chp60-1b_1p operation and "
+                       "almost nothing else -- 9,353 of the 9,363 dropped genes "
+                       "are its -- while chr78-11b_1p (the narrowest panel at "
+                       "169 genes) keeps 100%%. Each section's out-of-vocabulary "
+                       "columns are sliced from storage and the loss is "
+                       "reported per section, never applied silently."
+                   ))
+    p.add_argument("--batch-key", type=str, default="batch",
+                   choices=["batch", "dataset_batch"],
+                   help=(
+                       "What counts as 'the batch' for the decoder covariate, "
+                       "FiLM conditioning and the GRL adversary. 'batch' "
+                       "(default) is uns['batch'], correct for the paper's "
+                       "1-3 section setting. Use 'dataset_batch' "
+                       "(f'{dataset_id}_{batch}') for a corpus: uns['batch'] is "
+                       "a WITHIN-DATASET counter, so `batch0` is used by 80 "
+                       "different datasets and 627 of 636 sections carry a "
+                       "colliding label -- which both merges unrelated "
+                       "experiments into one batch and makes held-out sections "
+                       "look already-seen. TERRA uses the same composite key on "
+                       "this corpus (cell_tokenizers.py:1097)."
+                   ))
     p.add_argument("--container", type=str,
                    default="file",
                    choices=["file", "sqlite"],
@@ -40770,6 +40912,8 @@ def main():
                    backend=args.build_blob_backend,
                    cross_panel=args.cross_panel,
                    exclude_sections=args.exclude_sections,
+                   min_panels_per_gene=args.min_panels_per_gene,
+                   batch_key=args.batch_key,
                    container=args.container)
     # Resolve --compile / --no-compile into a tri-state override:
     #   `--no-compile`               → False (always wins)
@@ -40791,6 +40935,7 @@ def main():
             train_strategy=args.strategy,
             compile_model=_compile_override,
             train_deterministic=_deterministic_override,
+            split_sections_json=args.split_sections_json,
         )
     if args.predict:
         run_dir = args.run_dir or args.wandb_run_dir
