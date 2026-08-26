@@ -15,6 +15,8 @@ The load-bearing assertion throughout is that `gene_ids` keeps indexing the
 STORED columns exactly. If a filter and a slice ever disagree, counts land under
 the wrong gene names and nothing raises.
 """
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -634,3 +636,40 @@ def test_label_on_every_section_still_works(tmp_path):
     blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
     assert len(blob) == 3
     assert "y_cell_types" in blob.get(0).keys()
+
+
+# --------------------------------------------------------------------------- #
+# the edgelist export — 43 GB of text nothing reads, at corpus scale
+# --------------------------------------------------------------------------- #
+
+def test_no_edgelists_when_no_embedder_is_configured(tmp_path):
+    """
+    The text edgelist is only ever read by the deepwalk/gosh steps. With
+    `k: {}` neither runs, so writing it costs 384 bytes/cell (~43 GB over the
+    corpus) and ~3.4 billion python-level f.write() calls for nothing.
+    """
+    blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
+    assert not list(Path(blob.processed_dir).rglob("*.edgelist"))
+
+
+def test_edgelists_still_written_when_deepwalk_is_configured(tmp_path):
+    """
+    The gate is on the CONFIG, not a blanket removal — a dataset that asks for
+    deepwalk still needs the file.
+
+    The build then fails, and is expected to: `/bin/true` stands in for the
+    deepwalk binary and produces no `.emb` for the reader. What matters is that
+    the edgelist was written BEFORE that point, which is what the gate controls.
+    """
+    gk = dict(GRAPH_KWARGS, k={"deepwalk": 8})
+    _write(tmp_path, PANELS)
+    gold = tmp_path / "gold" / "on-disk-PyG-dataset-blob" / "xp"
+    with pytest.raises((FileNotFoundError, OSError, ValueError, RuntimeError)):
+        OnDiskDatasetBlob(
+            name="xp", feature_names=["cell_gene_counts"],
+            label_names=["cell_types=cell_type"], graph_kwargs=gk,
+            data_directory_path=tmp_path, pre_filter=None, overwrite=True,
+            software_paths={"deepwalk": "/bin/true", "gosh": ""},
+            cross_panel=True,
+        )
+    assert list(gold.rglob("*.edgelist")), "gate suppressed a needed edgelist"

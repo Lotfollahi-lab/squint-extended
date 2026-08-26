@@ -481,13 +481,28 @@ class InMemoryDatasetBlob(InMemoryDataset):
             if not is_undirected(batch_dict[f"edge_index_{edge_index_name}"]):
                 raise ValueError(f"Edge index {edge_index_name} is not undirected")
 
-            # save graph to disk in edgelist format
-            print(f"Saving {edge_index_name} to disk in edgelist format...")
-            self.save_adjacency_matrix_to_edgelist(
-                batch_id=adata_batch.uns['batch'],
-                A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
-                edge_index_name=edge_index_name
-            )
+            # Save the graph as a text edgelist ONLY if something will read it.
+            # The sole consumers are the deepwalk and gosh embedding steps
+            # below, both gated on their key being present in
+            # `graph_kwargs['k']`; the edge index itself is already stored on
+            # the Data object as `edge_index_<name>`, so nothing else needs the
+            # text form.
+            #
+            # This write used to be unconditional, and at corpus scale that is
+            # expensive rather than merely untidy: measured on xhc38 it is 384
+            # bytes per cell, i.e. ~43 GB over hst_corpus_110m's 112,578,039
+            # cells, emitted as ~3.4 BILLION individual `f.write()` calls in a
+            # Python loop (30.4 edges per cell across the k=8 and k=16 graphs).
+            # That is tens of minutes of a serial build and 43 GB of disk, all
+            # of it written, never read, for a config (`k: {}`) that runs
+            # neither embedder.
+            if 'deepwalk' in self.graph_kwargs['k'] or 'gosh' in self.graph_kwargs['k']:
+                print(f"Saving {edge_index_name} to disk in edgelist format...")
+                self.save_adjacency_matrix_to_edgelist(
+                    batch_id=adata_batch.uns['batch'],
+                    A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
+                    edge_index_name=edge_index_name
+                )
 
             # ----------------- Build Unsupervised Node Embeddings -----------------
             # if dimensions for lm_eigvecs are specified, build spectral embeddings
