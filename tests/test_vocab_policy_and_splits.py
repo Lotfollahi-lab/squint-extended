@@ -1118,7 +1118,7 @@ def test_previous_block_is_freed_before_the_next_is_built(tmp_path):
     ld = _loader(blob, K=1, transform=_transform(), num_neighbors=[-1],
                  prefetch=False)
     seen = []
-    for b in ld:
+    for _ in ld:
         seen.append(_live_blocks())
     # Sampled mid-stream, the live-block count must not grow with the number of
     # blocks already visited.
@@ -1139,7 +1139,7 @@ def test_release_works_with_prefetch_too(tmp_path):
     ld = _loader(blob, K=1, transform=_transform(), num_neighbors=[-1],
                  prefetch=True)
     seen = []
-    for b in ld:
+    for _ in ld:
         seen.append(_live_blocks())
     # Residency must be BOUNDED, not constant. With prefetch the design holds
     # three blocks -- the consumer iterates N, the queue holds N+1 at
@@ -1148,7 +1148,7 @@ def test_release_works_with_prefetch_too(tmp_path):
     # TREND upward; the tail of the series drains to 1 as the loader runs out
     # of blocks, so a max-minus-min bound would measure the drain, not a leak.
     assert max(seen) <= 4, f"more than the designed residency: {seen}"
-    steady = [x for x in seen[:int(len(seen) * 0.6)]]
+    steady = list(seen[:int(len(seen) * 0.6)])
     head = sum(steady[:len(steady) // 3]) / max(len(steady) // 3, 1)
     tail = sum(steady[-(len(steady) // 3):]) / max(len(steady) // 3, 1)
     assert tail <= head + 0.5, f"live blocks trending up: head {head} tail {tail}"
