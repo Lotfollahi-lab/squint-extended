@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 from typing import List, Tuple, Callable, Optional, Literal
@@ -1142,6 +1143,49 @@ class BaseModel(pl.LightningModule):
         return super().on_train_batch_end(outputs, batch, batch_idx)
 
 
+    @staticmethod
+    def _tensor_census(top: int = 12) -> str:
+        """
+        What torch tensors are alive, grouped by shape, biggest first.
+
+        Diagnostic only, behind `SQUINT_TENSOR_CENSUS=1`, because it walks the
+        whole GC heap. It exists because the corpus run leaks ~9 MB per step
+        that survived every elimination -- not the per-block NeighborLoader and
+        its workers, not the prefetch thread, not page cache, not the inference
+        cache (skipped when `train_metrics_list` is empty), not allocator
+        fragmentation (tuning glibc removed only 30%). `tracemalloc` cannot see
+        it either: tensor storage is allocated in C++, so Python-level tracing
+        reports nothing. Walking the GC heap and summing `element_size() *
+        nelement()` per shape does show it, and names the shape -- which is
+        usually enough to identify the holder.
+        """
+        import gc
+
+        import torch as _t
+        by_shape: dict = {}
+        total = 0
+        for o in gc.get_objects():
+            try:
+                if not isinstance(o, _t.Tensor):
+                    continue
+                nbytes = o.element_size() * o.nelement()
+                key = (tuple(o.shape), str(o.device), str(o.dtype),
+                       o.requires_grad, o.grad_fn is not None)
+            except Exception:  # noqa: BLE001 - dead/exotic tensors
+                continue
+            e = by_shape.setdefault(key, [0, 0])
+            e[0] += 1
+            e[1] += nbytes
+            total += nbytes
+        rows = sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:top]
+        out = [f"    tensor census: {total / 2**30:.2f} GiB live in "
+               f"{sum(v[0] for v in by_shape.values()):,} tensors"]
+        for (shape, dev, dtype, rg, has_graph), (n, b) in rows:
+            out.append(f"      {b / 2**30:7.3f} GiB  x{n:<6} {str(shape):26} "
+                       f"{dev:6} {dtype:14} grad={rg} graph={has_graph}")
+        return "\n".join(out)
+
+
     def _maybe_log_heartbeat(self, outputs) -> None:
         """
         Periodic step heartbeat: step, rate and ETA to the step budget.
@@ -1181,6 +1225,8 @@ class BaseModel(pl.LightningModule):
         except Exception:  # noqa: BLE001 - loss shape varies by variant
             pass
         print(msg, flush=True)
+        if os.environ.get("SQUINT_TENSOR_CENSUS") == "1":
+            print(self._tensor_census(), flush=True)
 
 
     def training_step(

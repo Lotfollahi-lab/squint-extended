@@ -38419,6 +38419,10 @@ def train(
     # decide whether the run is worth hours (decoder_covariate_dim, which
     # sections each split visits, no batch-label collision) are checked against
     # the real thing rather than assumed.
+    if max_steps is not None and max_steps <= 5_000:
+        # A short diagnostic run needs frequent heartbeats to be useful; the
+        # 2,000-step production interval would fire at most twice.
+        cfg["trainer"]["heartbeat_every_n_steps"] = max(1, int(max_steps) // 6)
     if max_steps is not None:
         prev = cfg["trainer"].get("max_steps")
         cfg["trainer"]["max_steps"] = int(max_steps)
