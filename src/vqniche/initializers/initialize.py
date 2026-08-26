@@ -783,6 +783,7 @@ def initialize_datamodule(
                     section_transform=getattr(data, 'section_transform', None),
                     num_workers=loader_params.get('num_workers', 0),
                     prefetch=dm_cfg.get('prefetch', True),
+                    max_cells_per_block=dm_cfg.get('max_cells_per_block', None),
                     # Whole-section splits: {split -> [section rel path, ...]}.
                     # Absent, the loaders span the blob and splits come from
                     # in-section cell masks (the paper's behaviour).

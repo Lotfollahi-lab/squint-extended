@@ -1718,6 +1718,7 @@ class KSectionBlockLoader:
         seed: int = 0,
         input_mask_attr: Optional[str] = None,
         section_rows: Optional[List[int]] = None,
+        max_cells_per_block: Optional[int] = None,
         section_transform: Optional[Callable] = None,
         batch_label_to_dense: Optional[dict] = None,
         unknown_batch_label_dense_id: int = 0,
@@ -1787,6 +1788,25 @@ class KSectionBlockLoader:
         self.dataset = dataset
         self.edge_index_name = edge_index_name
         self.sections_per_block = int(sections_per_block)
+        # Cap a block by CELLS as well as by section count, because section
+        # count does not bound memory on a real corpus.
+        #
+        # A block widens every section to the UNION of its panels, so its
+        # gene-width tensor is (sum of cells) x (union width) x 4 bytes. Across
+        # hst_corpus_110m sections span 1,049 to 1,617,614 cells and stored
+        # widths 169 to 9,540, so a fixed K has a ~20x spread between a typical
+        # block and the worst one: measured over random shuffles, K=8 gives a
+        # median block of 26.7 GB and a worst case of 144 GB. A 96 GB run died
+        # at 102 GB (TERM_MEMLIMIT) for exactly this reason.
+        #
+        # Budgeting cells bounds it: union width can never exceed the
+        # vocabulary, so cells x V x 4 is a hard ceiling per block, and the
+        # budget can be set from available memory. It also MIXES BETTER than a
+        # small K -- the median section is 89,752 cells, so a budget sized for
+        # one large section admits several typical ones, and section mixing is
+        # what supplies the batch-integration signal.
+        self.max_cells_per_block = (int(max_cells_per_block)
+                                    if max_cells_per_block else None)
         self.batch_size = int(batch_size)
         self.num_neighbors = list(num_neighbors)
         self.shuffle = shuffle
@@ -1842,7 +1862,28 @@ class KSectionBlockLoader:
         if self.shuffle:
             random.Random(self.seed + self._epoch).shuffle(order)
         K = self.sections_per_block
-        return [order[i:i + K] for i in range(0, len(order), K)]
+        if not self.max_cells_per_block:
+            return [order[i:i + K] for i in range(0, len(order), K)]
+
+        # Both limits apply: at most K sections, and at most
+        # `max_cells_per_block` cells. Cell counts come from the manifest, so
+        # this costs no I/O. A single section over budget still forms its own
+        # block — a section is the indivisible unit here.
+        counts = self.dataset.get_node_counts()
+        blocks: List[List[int]] = []
+        cur: List[int] = []
+        cur_cells = 0
+        for r in order:
+            n = int(counts[r])
+            if cur and (cur_cells + n > self.max_cells_per_block
+                        or len(cur) >= K):
+                blocks.append(cur)
+                cur, cur_cells = [], 0
+            cur.append(r)
+            cur_cells += n
+        if cur:
+            blocks.append(cur)
+        return blocks
 
     @staticmethod
     def _view_num_nodes(view: Data) -> int:
@@ -2417,6 +2458,7 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
         batch_label_to_dense: Optional[dict] = None,
         unknown_batch_label_dense_id: int = 0,
         prefetch: bool = True,
+        max_cells_per_block: Optional[int] = None,
         split_sections: Optional[dict] = None,
     ) -> None:
         super().__init__()
@@ -2427,6 +2469,7 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
         self._section_rows_cache: dict = {}
         self.edge_index_name = edge_index_name
         self.sections_per_block = int(sections_per_block)
+        self.max_cells_per_block = max_cells_per_block
         self.batch_size = int(batch_size)
         self.num_neighbors = list(num_neighbors)
         # val/test/predict: full neighborhood unless caller overrides.
@@ -2492,6 +2535,7 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
             dataset=self.dataset,
             edge_index_name=self.edge_index_name,
             sections_per_block=self.sections_per_block,
+            max_cells_per_block=self.max_cells_per_block,
             batch_size=self.batch_size,
             num_neighbors=self.num_neighbors if is_train else self.val_num_neighbors,
             shuffle=is_train,

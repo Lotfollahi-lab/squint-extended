@@ -4701,6 +4701,7 @@ def _patch_streaming(
         sections_per_block: int = 4,
         prefetch: bool = True,
         num_workers: int = 2,
+        max_cells_per_block: Optional[int] = None,
     ) -> dict:
     """
     Switch the dataset backend from the collated in-memory blob to on-disk
@@ -4749,6 +4750,19 @@ def _patch_streaming(
     """
     cfg["dataset"]["backend"] = "on-disk"
     cfg["datamodule"]["sections_per_block"] = int(sections_per_block)
+    # Cap a block by CELLS too. `sections_per_block` alone does not bound
+    # memory on a corpus: a block widens every section to the union of its
+    # panels, and hst_corpus_110m's sections span 1,049 to 1,617,614 cells with
+    # stored widths from 169 to 9,540. Measured over random shuffles, K=8 gives
+    # a median block of 26.7 GB and a worst case of 144 GB -- a 96 GB run died
+    # at 102 GB. Since the union can never exceed the vocabulary V, cells x V x
+    # 4 bytes is a hard per-block ceiling, so a cell budget bounds memory by
+    # construction. It also mixes BETTER than shrinking K: the median section is
+    # 89,752 cells, so a budget sized for one large section admits several
+    # typical ones, and section mixing is what supplies the batch-integration
+    # signal. None keeps the pure section-count behaviour.
+    cfg["datamodule"]["max_cells_per_block"] = (
+        int(max_cells_per_block) if max_cells_per_block else None)
     cfg["datamodule"]["prefetch"] = bool(prefetch)
     cfg["datamodule"]["loader_params"]["num_workers"] = int(num_workers)
     return cfg
@@ -6027,7 +6041,8 @@ VARIANTS: dict = {
             "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
             "diversity-w10, contrastWB-w10-k5)",
             "+hst_corpus_110m (636 sections, 112.6M cells, V=9,574)",
-            "+streaming(sections_per_block=8, num_workers=2)",
+            "+streaming(sections_per_block=8, max_cells_per_block=900k, "
+            "num_workers=2)",
             "+step-budget(max_steps=200000, val every 20000 steps)",
             "+whole-section splits via --split-sections-json",
         ],
@@ -6041,8 +6056,29 @@ VARIANTS: dict = {
                 # 2, not the default fan-out: R0 measured 96.5 GB of RSS at 22
                 # workers against 26 GB at 2, and a NeighborLoader is built per
                 # BLOCK so workers are spawned and torn down for every one of
-                # them (80 per epoch here at K=8 over 636 sections).
+                # them.
                 num_workers=2,
+                # Measured over random shuffles of the 417 train sections
+                # (cells and widths from `_vocabpolicy.json`), blocks come out
+                # at a median of 12.1 GB and a worst case of 21.6 GB, so 43.2 GB
+                # counting the prefetched block. The first attempt used K=8 with
+                # no cell budget and died at 102 GB (TERM_MEMLIMIT) against a
+                # 96 GB request; unbudgeted K=8 has a 144 GB worst case.
+                #
+                # 900k rather than less because the worst case is set by the
+                # largest SINGLE section (1,617,614 cells, which forms its own
+                # block whatever the budget) and is therefore flat below ~600k:
+                # 400k and 600k both peak at 19.2 GB while holding a median of
+                # only 1-2 sections. 900k lifts the median to 3 sections per
+                # block for +2.4 GB of peak. Section mixing is what supplies the
+                # batch-integration signal, so that is worth having.
+                #
+                # NOTE the corpus's sections are simply large: even at 900k a
+                # block holds ~3 of them, against K=8 on the 39-section R0. Each
+                # step's adversary therefore sees ~3 batches out of 416. Watch
+                # the adversarial term in the preflight -- a 416-way head fed 3
+                # classes per step may need its weight revisited.
+                max_cells_per_block=900_000,
             ),
             max_steps=200_000,
             # 10 validation passes over the run. Affordable only because Part D

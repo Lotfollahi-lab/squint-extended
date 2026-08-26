@@ -928,3 +928,82 @@ def test_progress_file_is_removed_on_completion(tmp_path):
     """Leaving it would invite 'resuming' a finished build."""
     blob = _build(_write(tmp_path, MANY) and tmp_path, "xp", cross_panel=True)
     assert not (Path(blob.processed_dir) / "_build_progress.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# cell-budgeted blocks — section count alone does not bound memory
+# --------------------------------------------------------------------------- #
+
+def _write_uneven(root, name="uneven"):
+    """Sections of wildly different size, as the corpus has (1,049 to
+    1,617,614 cells)."""
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    silver = root / "silver" / name
+    silver.mkdir(parents=True, exist_ok=True)
+    for i, n in enumerate([10, 10, 60, 10, 10]):
+        a = ad.AnnData(np.tile(np.arange(1, 4, dtype="float32"), (n, 1)))
+        a.var.index = ["a", "b", "c"]
+        a.obs["cell_id"] = [f"b{i}_c{j}" for j in range(n)]
+        a.obsm["spatial"] = rng.random((n, 2)) * 100
+        a.uns.update(batch=f"batch{i}", dataset_id=name, tissue="t", species="s")
+        a.write_h5ad(silver / f"section_{i}.h5ad")
+    return name
+
+
+def _blk(blob, **kw):
+    return KSectionBlockLoader(
+        dataset=blob, edge_index_name=EDGE, batch_size=4, num_neighbors=[-1],
+        shuffle=False, batch_label_to_dense=blob.batch_label_to_dense(), **kw,
+    )._block_row_lists()
+
+
+def test_cell_budget_splits_a_block_that_would_be_too_large(tmp_path):
+    name = _write_uneven(tmp_path)
+    blob = OnDiskDatasetBlob(
+        name=name, feature_names=["cell_gene_counts"], label_names=[],
+        graph_kwargs=GRAPH_KWARGS, data_directory_path=tmp_path,
+        pre_filter=None, overwrite=True,
+        software_paths={"deepwalk": "", "gosh": ""}, cross_panel=True)
+    counts = blob.get_node_counts()
+    # unbudgeted: one block of 5, i.e. every cell resident at once
+    assert _blk(blob, sections_per_block=8) == [[0, 1, 2, 3, 4]]
+    # budgeted: no block exceeds the cell budget unless one section alone does
+    for b in _blk(blob, sections_per_block=8, max_cells_per_block=40):
+        tot = sum(counts[r] for r in b)
+        assert tot <= 40 or len(b) == 1, f"block {b} holds {tot} cells"
+
+
+def test_an_oversized_section_still_forms_its_own_block(tmp_path):
+    """A section is indivisible — the corpus's 1.6M-cell section exceeds any
+    sane budget and must still be visited exactly once."""
+    name = _write_uneven(tmp_path)
+    blob = OnDiskDatasetBlob(
+        name=name, feature_names=["cell_gene_counts"], label_names=[],
+        graph_kwargs=GRAPH_KWARGS, data_directory_path=tmp_path,
+        pre_filter=None, overwrite=True,
+        software_paths={"deepwalk": "", "gosh": ""}, cross_panel=True)
+    blocks = _blk(blob, sections_per_block=8, max_cells_per_block=20)
+    counts = blob.get_node_counts()
+    big = counts.index(max(counts))
+    assert [big] in blocks                       # alone in its own block
+    flat = [r for b in blocks for r in b]
+    assert sorted(flat) == list(range(len(blob)))  # every section exactly once
+
+
+def test_section_cap_still_applies_alongside_the_budget(tmp_path):
+    name = _write_uneven(tmp_path)
+    blob = OnDiskDatasetBlob(
+        name=name, feature_names=["cell_gene_counts"], label_names=[],
+        graph_kwargs=GRAPH_KWARGS, data_directory_path=tmp_path,
+        pre_filter=None, overwrite=True,
+        software_paths={"deepwalk": "", "gosh": ""}, cross_panel=True)
+    for b in _blk(blob, sections_per_block=2, max_cells_per_block=10_000):
+        assert len(b) <= 2
+
+
+def test_no_budget_is_the_old_behaviour(tmp_path):
+    blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
+    assert _blk(blob, sections_per_block=2) == [[0, 1], [2]]
+    assert _blk(blob, sections_per_block=2, max_cells_per_block=None) == [[0, 1], [2]]
