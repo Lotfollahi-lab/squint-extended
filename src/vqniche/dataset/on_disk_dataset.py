@@ -318,6 +318,7 @@ class OnDiskDatasetBlob(OnDiskDataset):
         exclude_sections: Optional[List[str]] = None,
         include_sections: Optional[List[str]] = None,
         output_suffix: str = "",
+        resume: bool = False,
         min_panels_per_gene: int = 1,
         gene_vocab: Optional[List[str]] = None,
         batch_key: str = "batch",
@@ -480,7 +481,10 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # too, not just the manifest, or `process()` would re-run and APPEND to
         # the existing rows. `self.backend` is normally set by the base init, so
         # set it here for `processed_file_names`, which is backend-dependent.
-        if overwrite:
+        # `resume` overrides `overwrite`: the whole point is to keep the rows
+        # already written. Pass 2 skips the completed prefix; see `process()`.
+        self.resume = bool(resume)
+        if overwrite and not self.resume:
             self.backend = backend
             for _path in self.processed_paths:
                 _p = Path(_path)
@@ -488,6 +492,12 @@ class OnDiskDatasetBlob(OnDiskDataset):
                     shutil.rmtree(_p)
                 elif _p.exists():
                     _p.unlink()
+
+        if overwrite and self.resume:
+            self.backend = backend
+            print("OnDiskDatasetBlob: resume=True, so overwrite=True is NOT "
+                  "clearing the store — completed sections will be kept and "
+                  "the build will continue after them.")
 
         # Drive PyG's OnDiskDataset (SQLite), NOT InMemoryDataset. Its
         # __init__ opens/creates the DB and calls _process() -> process()
@@ -923,7 +933,31 @@ class OnDiskDatasetBlob(OnDiskDataset):
         _t_build0 = time.time()
         _cells_done = 0
 
+        # ---- resume: skip the completed prefix ----------------------------
+        # Section i always lands at row i (raw_files is sorted and pass 2 walks
+        # it in order), so "already done" is a prefix and the accumulators can
+        # be restored wholesale from the progress file rather than recomputed
+        # by deserializing rows.
+        _fingerprint = self._build_fingerprint(
+            [_rel_section_name(f, self.raw_dir) for f in raw_files])
+        _n_done, _state = self._load_resume_state(_fingerprint)
+        if _n_done:
+            section_ids = list(_state["section_ids"])[:_n_done]
+            node_counts = list(_state["node_counts"])[:_n_done]
+            batch_labels = list(_state["batch_labels"])[:_n_done]
+            section_rels = list(_state["section_rels"])[:_n_done]
+            section_dataset_ids = list(_state["section_dataset_ids"])[:_n_done]
+            vocab_drops = [d for d in _state["vocab_drops"]
+                           if d["rel"] in set(section_rels)]
+            _cells_done = sum(node_counts)
+            print(f"RESUMING: {_n_done} of {len(raw_files)} sections already "
+                  f"built ({_cells_done:,} cells); continuing from "
+                  f"{_rel_section_name(raw_files[_n_done], self.raw_dir)!r}.",
+                  flush=True)
+
         for _i_sec, adata_batch_file in enumerate(raw_files):
+            if _i_sec < _n_done:
+                continue
             print(f"Processing {adata_batch_file}...")
             _t_sec = time.time()
             # Inherited; pre_filter/pre_transform already applied inside it
@@ -967,13 +1001,21 @@ class OnDiskDatasetBlob(OnDiskDataset):
             _dt = time.time() - _t_sec
             _elapsed = time.time() - _t_build0
             _left = len(raw_files) - (_i_sec + 1)
-            _eta = (_elapsed / (_i_sec + 1)) * _left
+            # Rate over sections done THIS run, not since row 0 — a resumed run
+            # has done fewer than `_i_sec + 1`.
+            _this_run = (_i_sec + 1) - _n_done
+            _eta = (_elapsed / max(_this_run, 1)) * _left
             print(
                 f"  [{_i_sec + 1}/{len(raw_files)}] {rel} — {_n:,} cells in "
                 f"{_dt:.1f}s ({_n / max(_dt, 1e-9):,.0f} cells/s); "
                 f"elapsed {_elapsed / 60:.1f} min, "
                 f"{_cells_done:,} cells done, ETA {_eta / 60:.1f} min",
                 flush=True,
+            )
+            self._save_resume_state(
+                _fingerprint, _i_sec + 1, section_ids, node_counts,
+                batch_labels, section_rels, section_dataset_ids, vocab_drops,
+                obs_index,
             )
 
         # Row order == append order == sorted(raw_files) order.
@@ -1032,6 +1074,108 @@ class OnDiskDatasetBlob(OnDiskDataset):
         }
         with open(meta / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)
+
+        # The manifest is the completion marker; the progress file has no
+        # further use and leaving it would invite a "resume" of a finished
+        # build.
+        _pf = Path(self.processed_dir) / self._PROGRESS_FILE
+        if _pf.exists():
+            _pf.unlink()
+
+    # ------------------------------------------------------------------ #
+    # Resume
+    # ------------------------------------------------------------------ #
+    _PROGRESS_FILE = "_build_progress.json"
+
+    def _build_fingerprint(self, rels: List[str]) -> dict:
+        """
+        Everything that must be identical for a resumed build to be coherent.
+
+        `gene_ids` are baked into each stored section, so resuming a build whose
+        vocabulary differs from the completed rows' would leave earlier sections
+        indexing one gene set and later ones another — silently, with no shape
+        error anywhere. The vocabulary is therefore hashed, not just counted,
+        and the ordered file list is included because pass 2 relies on section i
+        always landing at row i.
+        """
+        import hashlib
+        vocab = list(self.gene_vocab) if self.gene_vocab is not None else []
+        h = hashlib.sha256("\n".join(vocab).encode()).hexdigest()[:16]
+        return {
+            "cross_panel": bool(self.cross_panel),
+            "min_panels_per_gene": int(self.min_panels_per_gene),
+            "batch_key": self.batch_key,
+            "gene_vocab_size": len(vocab),
+            "gene_vocab_sha": h,
+            "feature_names": list(self.feature_names),
+            "label_names": list(self.label_names),
+            "section_rels": list(rels),
+        }
+
+    def _load_resume_state(self, fingerprint: dict):
+        """
+        How many sections are already written, and their accumulated metadata.
+
+        Returns `(n_done, state)` — `(0, None)` when there is nothing usable.
+        A fingerprint mismatch is a hard error rather than a silent restart:
+        the caller asked to resume, and quietly rebuilding 636 sections while
+        reporting success is the kind of surprise this whole exercise has been
+        about.
+        """
+        pf = Path(self.processed_dir) / self._PROGRESS_FILE
+        if not self.resume or not pf.exists():
+            return 0, None
+        with open(pf) as fh:
+            state = json.load(fh)
+        old = state.get("fingerprint", {})
+        drift = {k: (old.get(k), fingerprint[k]) for k in fingerprint
+                 if k != "section_rels" and old.get(k) != fingerprint[k]}
+        if old.get("section_rels") != fingerprint["section_rels"]:
+            drift["section_rels"] = (
+                f"{len(old.get('section_rels') or [])} sections",
+                f"{len(fingerprint['section_rels'])} sections",
+            )
+        if drift:
+            raise ValueError(
+                f"Cannot resume: the build parameters changed since the "
+                f"progress file was written. Differences (was -> now): {drift}. "
+                f"Resuming would leave earlier sections indexing a different "
+                f"gene vocabulary than later ones, with nothing to raise. "
+                f"Delete {pf} and rebuild from scratch."
+            )
+        n_done = int(state.get("n_done", 0))
+        # Trust the store, not the bookkeeping: only count sections the DB
+        # actually holds.
+        try:
+            n_rows = len(self)
+        except Exception:  # noqa: BLE001 - store not readable yet
+            n_rows = n_done
+        if n_rows < n_done:
+            print(f"OnDiskDatasetBlob: progress file claims {n_done} sections "
+                  f"but the store holds {n_rows}; continuing from {n_rows}.")
+            n_done = n_rows
+        return n_done, state
+
+    def _save_resume_state(self, fingerprint, n_done, section_ids, node_counts,
+                           batch_labels, section_rels, section_dataset_ids,
+                           vocab_drops, obs_index) -> None:
+        """Written after EVERY section, atomically, so a kill at any point
+        leaves a usable record."""
+        pf = Path(self.processed_dir) / self._PROGRESS_FILE
+        tmp = pf.with_suffix(".json.tmp")
+        with open(tmp, "w") as fh:
+            json.dump({
+                "fingerprint": fingerprint,
+                "n_done": n_done,
+                "section_ids": section_ids,
+                "node_counts": node_counts,
+                "batch_labels": batch_labels,
+                "section_rels": section_rels,
+                "section_dataset_ids": section_dataset_ids,
+                "vocab_drops": vocab_drops,
+                "obs_index": {str(k): v for k, v in obs_index.items()},
+            }, fh)
+        tmp.replace(pf)          # atomic on POSIX
 
     def _resolve_section_selection(self, raw_files, names, what):
         """

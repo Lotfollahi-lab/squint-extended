@@ -37958,7 +37958,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
                exclude_sections: Optional[List[str]] = None,
                include_sections: Optional[List[str]] = None,
                min_panels_per_gene: int = 1, batch_key: str = "batch",
-               name_suffix: str = ""):
+               name_suffix: str = "", resume: bool = False):
     """
     Build the in-memory PyG DatasetBlob in-process.
 
@@ -38078,6 +38078,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
             exclude_sections=exclude_sections,
             include_sections=include_sections,
             output_suffix=name_suffix,
+            resume=resume,
             # Corpus builds pass `--min-panels-per-gene 2` (V 18,937 -> 9,574;
             # 9,353 of the 9,363 dropped genes are chp60's, and chr78 keeps
             # 100%) and `--batch-key dataset_batch` (uns['batch'] is a
@@ -40618,6 +40619,18 @@ def main():
                        "the full model (which cannot, having seen every "
                        "section). Streaming backend only."
                    ))
+    p.add_argument("--resume-build", action="store_true",
+                   help=(
+                       "Continue an interrupted on-disk build instead of "
+                       "starting over: sections already written are kept and "
+                       "the build continues after them. Overrides the config's "
+                       "`overwrite`, which would otherwise clear the store. "
+                       "Refuses to resume if the build parameters changed "
+                       "(vocabulary, panel threshold, batch key, file list), "
+                       "because mixing sections built under different "
+                       "vocabularies would corrupt `gene_ids` with nothing to "
+                       "raise."
+                   ))
     p.add_argument("--build-blob-name-suffix", type=str, default="",
                    help=(
                        "Append this to the blob's output name, e.g. "
@@ -40976,6 +40989,7 @@ def main():
                    exclude_sections=args.exclude_sections,
                    include_sections=args.include_sections,
                    name_suffix=args.build_blob_name_suffix,
+                   resume=args.resume_build,
                    min_panels_per_gene=args.min_panels_per_gene,
                    batch_key=args.batch_key,
                    container=args.container)

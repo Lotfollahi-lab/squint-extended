@@ -830,3 +830,101 @@ def test_output_suffix_moves_only_the_output(tmp_path):
     assert Path(sub.processed_dir).name == "xp_subset"
     assert Path(full.raw_dir) == Path(sub.raw_dir)
     assert len(full) == 3 and len(sub) == 1
+
+
+# --------------------------------------------------------------------------- #
+# resume — the corpus build is serial; a failure must cost one section
+# --------------------------------------------------------------------------- #
+
+MANY = {i: ["a", "b", "c"] + ([f"x{i}"] if i % 2 else []) for i in range(5)}
+
+
+class _StopAfter(RuntimeError):
+    """Stands in for a wall-clock kill or a node failure."""
+
+
+def _build_interrupted(tmp_path, after, **kw):
+    """Build, but raise partway through pass 2 to leave a partial store."""
+    import vqniche.dataset.on_disk_dataset as mod
+    real = mod.OnDiskDatasetBlob._save_resume_state
+    calls = {"n": 0}
+
+    def stopping(self, *a, **k):
+        real(self, *a, **k)
+        calls["n"] += 1
+        if calls["n"] >= after:
+            raise _StopAfter(f"killed after {after} sections")
+
+    mod.OnDiskDatasetBlob._save_resume_state = stopping
+    try:
+        with pytest.raises(_StopAfter):
+            _build(tmp_path, "xp", cross_panel=True, **kw)
+    finally:
+        mod.OnDiskDatasetBlob._save_resume_state = real
+
+
+def test_resume_continues_from_where_it_stopped(tmp_path, capsys):
+    _write(tmp_path, MANY)
+    _build_interrupted(tmp_path, after=2)
+    capsys.readouterr()
+    blob = _build(tmp_path, "xp", cross_panel=True, resume=True)
+    out = capsys.readouterr().out
+    assert "RESUMING: 2 of 5 sections already built" in out
+    assert len(blob) == 5
+
+
+def test_resumed_blob_is_identical_to_an_uninterrupted_one(tmp_path):
+    """The whole point: resuming must not change the result."""
+    _write(tmp_path / "a", MANY)
+    _write(tmp_path / "b", MANY)
+    whole = _build(tmp_path / "a", "xp", cross_panel=True)
+    _build_interrupted(tmp_path / "b", after=3)
+    resumed = _build(tmp_path / "b", "xp", cross_panel=True, resume=True)
+
+    assert len(whole) == len(resumed)
+    assert list(whole.gene_vocab) == list(resumed.gene_vocab)
+    assert whole.section_rels == resumed.section_rels
+    assert whole.get_node_counts() == resumed.get_node_counts()
+    assert whole.get_batch_labels() == resumed.get_batch_labels()
+    for r in range(len(whole)):
+        a, b = whole.get(r), resumed.get(r)
+        assert torch.equal(a.gene_ids, b.gene_ids)
+        assert torch.equal(a["x_cell_gene_counts"], b["x_cell_gene_counts"])
+        assert int(a.adata_batch_id) == int(b.adata_batch_id)
+
+
+def test_resume_refuses_when_the_vocabulary_would_differ(tmp_path):
+    """
+    Sections carry baked-in `gene_ids`. Resuming under a different vocabulary
+    would leave earlier rows indexing one gene set and later rows another, with
+    no shape error anywhere — so it must raise, not restart quietly.
+    """
+    _write(tmp_path, MANY)
+    _build_interrupted(tmp_path, after=2)
+    with pytest.raises(ValueError, match="build parameters changed"):
+        _build(tmp_path, "xp", cross_panel=True, resume=True,
+               min_panels_per_gene=2)
+
+
+def test_resume_refuses_when_the_file_list_changed(tmp_path):
+    _write(tmp_path, MANY)
+    _build_interrupted(tmp_path, after=2)
+    _write(tmp_path, {9: ["a", "b"]})          # a new section appears
+    with pytest.raises(ValueError, match="build parameters changed"):
+        _build(tmp_path, "xp", cross_panel=True, resume=True)
+
+
+def test_without_resume_a_partial_build_starts_over(tmp_path, capsys):
+    """`overwrite=True` must still mean a clean rebuild by default."""
+    _write(tmp_path, MANY)
+    _build_interrupted(tmp_path, after=2)
+    capsys.readouterr()
+    blob = _build(tmp_path, "xp", cross_panel=True)      # resume defaults False
+    assert "RESUMING" not in capsys.readouterr().out
+    assert len(blob) == 5
+
+
+def test_progress_file_is_removed_on_completion(tmp_path):
+    """Leaving it would invite 'resuming' a finished build."""
+    blob = _build(_write(tmp_path, MANY) and tmp_path, "xp", cross_panel=True)
+    assert not (Path(blob.processed_dir) / "_build_progress.json").exists()
