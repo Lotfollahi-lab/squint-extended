@@ -4627,7 +4627,8 @@ def _resolve_train_rows(dataset_blob, split_sections: dict) -> List[int]:
 
 
 def _patch_corpus_split(cfg: dict, split_json: str | Path,
-                        val_key: str = "val", test_key: str = "held_out") -> dict:
+                        val_key: str = "validation",
+                        test_key: str = "test") -> dict:
     """
     Apply TERRA's whole-section split, read from `_splitspec.json`.
 
@@ -4643,17 +4644,43 @@ def _patch_corpus_split(cfg: dict, split_json: str | Path,
 
     Train is implicit — everything not named here. See `_resolve_train_rows`.
     """
-    spec = json.loads(Path(split_json).read_text())
+    doc = json.loads(Path(split_json).read_text())
+    # `_splitspec.json` nests the section lists under "splits"; a hand-written
+    # spec may put them at the top level. Accept both.
+    spec = doc.get("splits", doc)
+
+    # A MISSING KEY RAISES. It used to be skipped with `.get()`, and that
+    # silently produced a leak: with no `val` entry the val loader fell back to
+    # an in-section cell mask spanning EVERY section, so validation cells were
+    # drawn from the training sections. The run looked healthy -- `val_*`
+    # metrics appeared and val_loss improved -- which is precisely why this
+    # cannot be quiet.
     split_sections = {}
-    if val_key and spec.get(val_key):
-        split_sections["val"] = list(spec[val_key])
-    if test_key and spec.get(test_key):
-        # The held-out set doubles as `test`: it is not touched during
-        # training, and Part F evaluates against it rung by rung.
-        split_sections["test"] = list(spec[test_key])
+    for want, key in (("val", val_key), ("test", test_key)):
+        if not key:
+            continue
+        if key not in spec or not spec[key]:
+            raise KeyError(
+                f"{split_json} has no non-empty {key!r} for the {want!r} "
+                f"split. Available keys: {sorted(spec)}. Refusing to continue, "
+                f"because falling back to an in-section cell mask would draw "
+                f"{want} cells from the TRAINING sections."
+            )
+        split_sections[want] = list(spec[key])
+
+    overlap = (set(split_sections.get("val", ())) &
+               set(split_sections.get("test", ())))
+    if overlap:
+        raise ValueError(
+            f"val and test share {len(overlap)} section(s), e.g. "
+            f"{sorted(overlap)[:3]}. Note `_splitspec.json`'s 'held_out' is "
+            f"validation + test combined, so pass test_key='test', not "
+            f"'held_out', when a separate val split is also in use."
+        )
+
     cfg.setdefault("datamodule", {})["split_sections"] = split_sections
     n = {k: len(v) for k, v in split_sections.items()}
-    print(f"Corpus split from {split_json}: {n} (train = the remainder).")
+    print(f"Split from {split_json}: {n} (train = every other section).")
     return cfg
 
 

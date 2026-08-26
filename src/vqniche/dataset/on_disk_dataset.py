@@ -2144,6 +2144,20 @@ class OnDiskStreamingDataModule(_LightningDataModuleBase):
             "predict": None,      # predict over all cells
         }[split]
         rows = self._resolve_section_rows(split)
+        if self.split_sections and rows is None and mask_attr is not None:
+            # Whole-section splits are configured but this split is not among
+            # them, so it would silently fall back to an in-section cell mask
+            # spanning EVERY section -- drawing this split's cells from the
+            # TRAINING sections. The run then looks healthy (the metrics appear
+            # and improve) while the number it reports is leaked. Refuse.
+            raise ValueError(
+                f"split_sections is configured ({sorted(self.split_sections)}) "
+                f"but names no sections for {split!r}, which would fall back to "
+                f"an in-section '{mask_attr}' over all {len(self.dataset)} "
+                f"sections and draw {split} cells from the training sections. "
+                f"Name {split!r}'s sections explicitly, or drop split_sections "
+                f"entirely to use cell-mask splits throughout."
+            )
         if rows is not None and mask_attr is not None:
             # Whole-section splits and in-section cell masks are two different
             # answers to "which cells are val". Applying both would intersect

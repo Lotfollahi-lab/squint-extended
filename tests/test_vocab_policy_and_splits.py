@@ -538,3 +538,31 @@ def test_the_swing_the_diagnostic_exists_to_measure():
     wide = _balance(5049.0, 100.0, {"x": torch.zeros(4, 5049)})
     ratio = wide["train_recon_over_graph"] / narrow["train_recon_over_graph"]
     assert ratio == pytest.approx(5049 / 169, rel=1e-3)
+
+
+# --------------------------------------------------------------------------- #
+# the silent-fallback leak the dry run caught
+# --------------------------------------------------------------------------- #
+
+def test_unnamed_split_raises_instead_of_leaking(tmp_path):
+    """
+    With whole-section splits configured but a split unnamed, the loader used
+    to fall back to an in-section cell mask over EVERY section -- drawing that
+    split's cells from the training sections. The run looked healthy (`val_*`
+    appeared and improved), so this must raise rather than warn.
+    """
+    blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
+    dm = _dm(blob, split_sections={"test": ["section_2.h5ad"]})
+    with pytest.raises(ValueError, match="names no sections for 'val'"):
+        dm.val_dataloader()
+    # test IS named, so it resolves; train takes the remainder.
+    assert dm.test_dataloader().section_rows == [2]
+    assert dm.train_dataloader().section_rows == [0, 1]
+
+
+def test_predict_still_spans_everything(tmp_path):
+    """predict has no mask, so it is not a leak risk and must not raise."""
+    blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
+    dm = _dm(blob, split_sections={"test": ["section_2.h5ad"]})
+    ld = dm.predict_dataloader()
+    assert ld.input_mask_attr is None and ld.section_rows is None
