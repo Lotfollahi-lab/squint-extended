@@ -38334,6 +38334,8 @@ def train(
         train_deterministic: Optional[bool] = None,
         split_sections_json: Optional[str] = None,
         max_steps: Optional[int] = None,
+        num_workers: Optional[int] = None,
+        no_prefetch: bool = False,
     ):
     """
     Train SQUINT.
@@ -38430,6 +38432,18 @@ def train(
                   f"--max-steps override")
         print(f"Trainer: max_steps override from CLI = {max_steps} "
               f"(variant had {prev!r})")
+
+    # Loader overrides, for isolating where memory goes. A NeighborLoader is
+    # built per BLOCK, so workers are spawned and torn down for every one of
+    # them; turning both off reduces the streaming path to a single thread with
+    # no worker processes, which separates "the loader machinery accumulates"
+    # from "the model/Lightning accumulates" without editing tested code.
+    if num_workers is not None:
+        cfg["datamodule"]["loader_params"]["num_workers"] = int(num_workers)
+        print(f"Datamodule: num_workers override from CLI = {num_workers}")
+    if no_prefetch:
+        cfg["datamodule"]["prefetch"] = False
+        print("Datamodule: prefetch DISABLED from CLI")
 
     if split_sections_json:
         _patch_corpus_split(cfg, split_sections_json)
@@ -40770,6 +40784,13 @@ def main():
                        "is computed, so a built section can never carry a gene "
                        "outside it."
                    ))
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="Override the dataloader worker count (0 = in-process). "
+                        "Diagnostic knob for memory isolation.")
+    p.add_argument("--no-prefetch", action="store_true",
+                   help="Disable the streaming block prefetch thread. With "
+                        "--num-workers 0 this reduces the loader to a single "
+                        "thread and no worker processes.")
     p.add_argument("--max-steps", type=int, default=None,
                    help=(
                        "Override the variant's step budget. Intended for "
@@ -41187,6 +41208,8 @@ def main():
             train_deterministic=_deterministic_override,
             split_sections_json=args.split_sections_json,
             max_steps=args.max_steps,
+            num_workers=args.num_workers,
+            no_prefetch=args.no_prefetch,
         )
     if args.predict:
         run_dir = args.run_dir or args.wandb_run_dir
