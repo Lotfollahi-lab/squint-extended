@@ -5271,6 +5271,49 @@ def _patch_dual_xhb42_3b(
     )
 
 
+def _patch_dual_hst_corpus(
+        cfg: dict,
+        batch_size: int = 512,
+        edge_sampling_ratio: float = 1.0,
+    ) -> dict:
+    """
+    Dataset switch to the full corpus: hst_corpus_110m, 636 sections,
+    112,578,039 cells, cross-panel vocabulary V = 9,574.
+
+    Deliberately takes NO `train_batch_idx` / `test_batch_idx`, unlike every
+    other `_patch_dual_*`. Those select sections by `adata_batch_id`, which is
+    parsed from `uns['batch']` -- a within-dataset counter that names up to 80
+    unrelated corpus sections at once. Splits here come from
+    `--split-sections-json`, which names sections by REL PATH (the only
+    corpus-unique identifier) and applies them as whole-section train/val/test
+    via `split_sections`. Passing batch indices as well would silently
+    intersect the two.
+
+    `train_transform_params` is therefore left empty: no `SpatialBatchSplit`,
+    no in-section cell masks. `OnDiskStreamingDataModule._make_loader` drops
+    the mask attribute entirely for any split named by `split_sections`, and
+    refuses to fall back to a cell mask for one that is not.
+    """
+    cfg["dataset"]["dataset_name"]    = DATASET_NAME
+    cfg["dataset"]["dataset_tag"]     = DATASET_NAME
+    cfg["dataset"]["root_data_dir"]   = str(DATA_ROOT)
+    # Declared, and enforced in `train()`. Forgetting the split spec would
+    # train on all 636 sections while every log line still looked healthy, and
+    # the resulting model could support no zero-shot claim -- a full overnight
+    # run silently spent on the wrong thing. Refuse instead.
+    cfg["dataset"]["requires_split_sections"] = True
+    cfg["dataset"]["adata_batch_idx"] = []
+    cfg["dataset"]["train_transform_params"] = {}
+    # The blob was built with batch_key='dataset_batch'; the loader reads the
+    # labels from the manifest, so this only records the intent.
+    cfg["dataset"]["graph_params"]["batch_key"] = "batch"
+    cfg["datamodule"]["loader_params"]["batch_size"] = int(batch_size)
+    cfg["model"]["loss_params"]["loss_kwargs"]["edge_sampling_ratio"] = float(
+        edge_sampling_ratio)
+    cfg["trainer"]["monitor"] = "val_loss"
+    return cfg
+
+
 def _patch_dual_xhs1000_39b(
         cfg: dict,
         train_batch_idx: Optional[List[int]] = None,
@@ -5967,6 +6010,48 @@ VARIANTS: dict = {
         ),
     },
 
+    "corpus-holdout": {
+        "description": (
+            "SQUINT-holdout: the paper run. Trains on TERRA's 416 train "
+            "sections of hst_corpus_110m (417 files -- 47_batch0 is two) and "
+            "never sees the 219 held-out ones, so every benchmark number it "
+            "produces is genuinely zero-shot and directly comparable to "
+            "TERRA-96M on identical data. 200,000 steps at batch 512 is ~1.15 "
+            "passes over the 96M training cells. Cross-panel throughout: the "
+            "model is built at the 9,574-gene vocabulary and gathers per block, "
+            "with masked softmax and masked-sum NB. REQUIRES "
+            "--split-sections-json _splitspec.json; without it this trains on "
+            "all 636 sections and can support no zero-shot claim at all."
+        ),
+        "patches": [
+            "+reference recipe (rvq-both, decoder-cov, knn16, within-sec, "
+            "diversity-w10, contrastWB-w10-k5)",
+            "+hst_corpus_110m (636 sections, 112.6M cells, V=9,574)",
+            "+streaming(sections_per_block=8, num_workers=2)",
+            "+step-budget(max_steps=200000, val every 20000 steps)",
+            "+whole-section splits via --split-sections-json",
+        ],
+        "build": lambda: _patch_step_budget(
+            _patch_streaming(
+                _patch_dual_hst_corpus(
+                    _r0_reference_stack(),
+                    batch_size=512,
+                ),
+                sections_per_block=8,
+                # 2, not the default fan-out: R0 measured 96.5 GB of RSS at 22
+                # workers against 26 GB at 2, and a NeighborLoader is built per
+                # BLOCK so workers are spawned and torn down for every one of
+                # them (80 per epoch here at K=8 over 636 sections).
+                num_workers=2,
+            ),
+            max_steps=200_000,
+            # 10 validation passes over the run. Affordable only because Part D
+            # restricts the val loader to the 32 val SECTIONS -- unrestricted it
+            # would rebuild every block in the corpus to reach them, ~51 min a
+            # pass, which is what forced validation off entirely before.
+            val_checks=10,
+        ),
+    },
     "smoke-steps+stream+xhs1000-39b_1p": {
         "description": (
             "Short proof of the STEP-BUDGET machinery on the streaming backend "
@@ -38200,6 +38285,7 @@ def train(
         compile_model:       Optional[bool] = None,
         train_deterministic: Optional[bool] = None,
         split_sections_json: Optional[str] = None,
+        max_steps: Optional[int] = None,
     ):
     """
     Train SQUINT.
@@ -38278,8 +38364,37 @@ def train(
     # patch because the SAME variant is trained against different splits
     # (SQUINT-holdout vs SQUINT-full differ ONLY in whether this is applied),
     # and because the spec is a generated artifact, not source.
+    # A step-budget override, for preflighting a long run: the same variant and
+    # the same split, stopped after a handful of steps, so the invariants that
+    # decide whether the run is worth hours (decoder_covariate_dim, which
+    # sections each split visits, no batch-label collision) are checked against
+    # the real thing rather than assumed.
+    if max_steps is not None:
+        prev = cfg["trainer"].get("max_steps")
+        cfg["trainer"]["max_steps"] = int(max_steps)
+        # val_check_interval must not exceed the budget, or Lightning never
+        # validates and `monitor=val_loss` has nothing to rank checkpoints by.
+        vci = cfg["trainer"].get("val_check_interval")
+        if vci and vci > int(max_steps):
+            cfg["trainer"]["val_check_interval"] = max(1, int(max_steps) // 2)
+            print(f"Trainer: val_check_interval {vci} -> "
+                  f"{cfg['trainer']['val_check_interval']} to fit the "
+                  f"--max-steps override")
+        print(f"Trainer: max_steps override from CLI = {max_steps} "
+              f"(variant had {prev!r})")
+
     if split_sections_json:
         _patch_corpus_split(cfg, split_sections_json)
+    elif cfg["dataset"].get("requires_split_sections"):
+        raise SystemExit(
+            f"Variant {variant!r} covers a multi-dataset corpus and requires "
+            f"--split-sections-json (e.g. _splitspec.json).\n"
+            f"Without it every section is used for training, so the model sees "
+            f"all 219 held-out sections and can support no zero-shot claim -- "
+            f"and nothing in the logs would say so.\n"
+            f"Pass --split-sections-json, or use a variant that does not "
+            f"declare `requires_split_sections`."
+        )
 
     # Apply CLI-level precision override (if any). Keeps the base
     # config's bf16-mixed default in place when `train_precision is
@@ -40607,6 +40722,15 @@ def main():
                        "is computed, so a built section can never carry a gene "
                        "outside it."
                    ))
+    p.add_argument("--max-steps", type=int, default=None,
+                   help=(
+                       "Override the variant's step budget. Intended for "
+                       "preflighting a long run: same variant, same split, "
+                       "stopped after a few steps, so the invariants worth "
+                       "checking before an overnight job are verified against "
+                       "the real config. `val_check_interval` is reduced to fit "
+                       "if it would exceed the budget."
+                   ))
     p.add_argument("--split-sections-json", type=str, default=None,
                    help=(
                        "Path to a split spec (`_splitspec.json`) applying "
@@ -41014,6 +41138,7 @@ def main():
             compile_model=_compile_override,
             train_deterministic=_deterministic_override,
             split_sections_json=args.split_sections_json,
+            max_steps=args.max_steps,
         )
     if args.predict:
         run_dir = args.run_dir or args.wandb_run_dir
