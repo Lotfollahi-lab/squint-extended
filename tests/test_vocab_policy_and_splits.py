@@ -775,3 +775,58 @@ def test_unique_ids_are_left_alone(tmp_path, capsys):
     assert "adata_batch_id collisions" not in capsys.readouterr().out
     assert sorted(int(blob.get(r).adata_batch_id)
                   for r in range(len(blob))) == [0, 1, 2]
+
+
+# --------------------------------------------------------------------------- #
+# include_sections / output_suffix — validating on a subset
+# --------------------------------------------------------------------------- #
+
+def test_include_sections_builds_only_those(tmp_path):
+    _write(tmp_path, PANELS)
+    blob = _build(tmp_path, "xp", cross_panel=True,
+                  include_sections=["section_0.h5ad", "section_2.h5ad"])
+    assert len(blob) == 2
+    assert sorted(blob.section_rels) == ["section_0.h5ad", "section_2.h5ad"]
+    # the vocabulary is the union over just those two: 'c' is section 1's only
+    assert list(blob.gene_vocab) == ["a", "b", "c", "x", "y"]
+
+
+def test_include_and_exclude_together_raises(tmp_path):
+    _write(tmp_path, PANELS)
+    with pytest.raises(ValueError, match="not both"):
+        _build(tmp_path, "xp", cross_panel=True,
+               include_sections=["section_0.h5ad"],
+               exclude_sections=["section_1.h5ad"])
+
+
+def test_include_of_an_unknown_section_raises(tmp_path):
+    _write(tmp_path, PANELS)
+    with pytest.raises(ValueError, match="include_sections names sections"):
+        _build(tmp_path, "xp", cross_panel=True,
+               include_sections=["nope.h5ad"])
+
+
+def test_include_of_an_ambiguous_stem_raises(tmp_path):
+    _write(tmp_path, {0: ["a", "b"]}, name="ds1")
+    _write(tmp_path, {0: ["a", "b"]}, name="ds2")
+    with pytest.raises(ValueError, match="more than one section"):
+        OnDiskDatasetBlob(
+            name="", feature_names=["cell_gene_counts"], label_names=[],
+            graph_kwargs=GRAPH_KWARGS, data_directory_path=tmp_path,
+            pre_filter=None, overwrite=True,
+            software_paths={"deepwalk": "", "gosh": ""},
+            cross_panel=True, include_sections=["section_0"],
+        )
+
+
+def test_output_suffix_moves_only_the_output(tmp_path):
+    """A subset build must not write into the real blob's directory, and must
+    still read the SAME silver source (raw_dir is silver/<name>)."""
+    _write(tmp_path, PANELS)
+    full = _build(tmp_path, "xp", cross_panel=True)
+    sub = _build(tmp_path, "xp", cross_panel=True, output_suffix="_subset",
+                 include_sections=["section_0.h5ad"])
+    assert Path(full.processed_dir).name == "xp"
+    assert Path(sub.processed_dir).name == "xp_subset"
+    assert Path(full.raw_dir) == Path(sub.raw_dir)
+    assert len(full) == 3 and len(sub) == 1

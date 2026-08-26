@@ -316,6 +316,8 @@ class OnDiskDatasetBlob(OnDiskDataset):
         backend: str = "file",
         cross_panel: bool = False,
         exclude_sections: Optional[List[str]] = None,
+        include_sections: Optional[List[str]] = None,
+        output_suffix: str = "",
         min_panels_per_gene: int = 1,
         gene_vocab: Optional[List[str]] = None,
         batch_key: str = "batch",
@@ -357,6 +359,23 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # 9,571 to 18,937 with no code change.
         self.cross_panel = bool(cross_panel)
         self.exclude_sections = set(exclude_sections or ())
+        # Restrict the build to these sections, applied BEFORE the vocabulary
+        # like `exclude_sections` and matched the same way (rel path, or an
+        # unambiguous stem). Exists so a representative SUBSET of a corpus can
+        # be built in minutes to validate a pipeline change before committing
+        # hours to the full thing -- three build-stopping bugs in a row were
+        # each cheaper to find on 21 sections than on 636.
+        # Suffixes the OUTPUT directory only, never `self.name` -- `raw_dir`
+        # is `silver / self.name`, so renaming the blob would look for silver
+        # data that does not exist. Lets a subset build occupy its own gold
+        # directory while reading the same silver source.
+        self.output_suffix = str(output_suffix or "")
+        self.include_sections = set(include_sections or ())
+        if self.include_sections and self.exclude_sections:
+            raise ValueError(
+                "Pass include_sections or exclude_sections, not both: the "
+                "intersection is silent and easy to get wrong."
+            )
         self.gene_vocab = None            # pd.Index of gene names, len V
         self._gene_ids_per_batch: dict = {}   # batch_id -> np.ndarray[G_sec]
         # batch_id -> column positions KEPT from the section's native width.
@@ -493,7 +512,8 @@ class OnDiskDatasetBlob(OnDiskDataset):
     @property
     def processed_dir(self) -> str:
         gold = self.data_directory_path / "gold"
-        return str(gold / "on-disk-PyG-dataset-blob" / self.name)
+        name = f"{self.name}{getattr(self, 'output_suffix', '')}"
+        return str(gold / "on-disk-PyG-dataset-blob" / name)
 
     @property
     def processed_file_names(self) -> List[str]:
@@ -549,60 +569,23 @@ class OnDiskDatasetBlob(OnDiskDataset):
 
         # Drop excluded sections BEFORE the vocabulary is computed, so V is the
         # union over what is actually built (see `cross_panel` in __init__).
-        if self.exclude_sections:
-            # Match on the REL PATH ("subdir/file.h5ad") first, falling back to
-            # the file stem only where that stem is unambiguous.
-            #
-            # Stems are NOT unique across a corpus: 40 of them cover 162 of
-            # hst_corpus_110m's 636 files, and `adata_batch0` alone appears in 8
-            # different datasets. Excluding one held-out section by stem would
-            # silently drop up to 8, which for a train/holdout split is a wrong
-            # answer rather than a crash -- so an ambiguous stem now raises and
-            # names the candidates instead of quietly matching all of them.
-            rel_of = {f: _rel_section_name(f, self.raw_dir) for f in raw_files}
-            stem_counts: dict = {}
-            for f in raw_files:
-                stem_counts[Path(f).stem] = stem_counts.get(Path(f).stem, 0) + 1
-
-            ambiguous = {
-                s for s in self.exclude_sections
-                if s not in set(rel_of.values()) and stem_counts.get(s, 0) > 1
-            }
-            if ambiguous:
-                detail = {
-                    s: sorted(rel_of[f] for f in raw_files if Path(f).stem == s)
-                    for s in sorted(ambiguous)
-                }
+        if self.exclude_sections or self.include_sections:
+            names = self.exclude_sections or self.include_sections
+            what = ("exclude_sections" if self.exclude_sections
+                    else "include_sections")
+            selected = self._resolve_section_selection(raw_files, names, what)
+            if self.exclude_sections:
+                kept = [f for f in raw_files if f not in selected]
+            else:
+                kept = [f for f in raw_files if f in selected]
+            dropped = [_rel_section_name(f, self.raw_dir)
+                       for f in raw_files if f not in kept]
+            if not kept:
                 raise ValueError(
-                    f"exclude_sections names file stems that match more than "
-                    f"one section: {detail}. Stems are not unique across a "
-                    f"corpus. Use the relative path ('subdir/file.h5ad') so the "
-                    f"exclusion is exact."
-                )
-
-            def _excluded(f) -> bool:
-                return (rel_of[f] in self.exclude_sections
-                        or Path(f).stem in self.exclude_sections)
-
-            kept = [f for f in raw_files if not _excluded(f)]
-            dropped = [rel_of[f] for f in raw_files if _excluded(f)]
-            matched = set()
-            for f in raw_files:
-                if rel_of[f] in self.exclude_sections:
-                    matched.add(rel_of[f])
-                if Path(f).stem in self.exclude_sections:
-                    matched.add(Path(f).stem)
-            missing = self.exclude_sections - matched
-            if missing:
-                raise ValueError(
-                    f"exclude_sections names sections that are not in "
-                    f"{self.raw_dir}: {sorted(missing)}. Refusing to build, "
-                    f"because a typo here would silently include a section the "
-                    f"caller meant to leave out (and, with cross_panel, widen "
-                    f"the vocabulary accordingly)."
-                )
-            print(f"Excluding {len(dropped)} section(s) from the build: "
-                  f"{sorted(dropped)}")
+                    f"{what} leaves no sections to build.")
+            print(f"{what}: building {len(kept)} of {len(kept) + len(dropped)} "
+                  f"section(s); leaving out {len(dropped)}"
+                  + (f": {sorted(dropped)}" if len(dropped) <= 12 else ""))
             raw_files = kept
 
         # ---------------- Pass 1: gene panel + label vocab (streamed) ------
@@ -1049,6 +1032,55 @@ class OnDiskDatasetBlob(OnDiskDataset):
         }
         with open(meta / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)
+
+    def _resolve_section_selection(self, raw_files, names, what):
+        """
+        Which of `raw_files` a list of section names refers to.
+
+        Names are REL PATHS ("subdir/file.h5ad"), or bare stems where those are
+        unambiguous. Shared by `exclude_sections` and `include_sections` so the
+        two cannot drift apart in what they accept.
+
+        Two hard failures, both because a quiet near-miss here mis-scopes an
+        entire build: a stem matching several files raises rather than matching
+        all of them (40 stems cover 162 of the corpus's 636 files --
+        `adata_batch0` appears in 8 datasets), and a name matching nothing
+        raises rather than being ignored.
+        """
+        rel_of = {f: _rel_section_name(f, self.raw_dir) for f in raw_files}
+        by_stem: dict = {}
+        for f in raw_files:
+            by_stem.setdefault(Path(f).stem, []).append(f)
+
+        selected, missing, ambiguous = set(), [], {}
+        rels = set(rel_of.values())
+        for n in names:
+            hit = [f for f in raw_files if rel_of[f] == n]
+            if hit:
+                selected.update(hit)
+                continue
+            stem_hits = by_stem.get(n, [])
+            if len(stem_hits) == 1:
+                selected.update(stem_hits)
+            elif len(stem_hits) > 1:
+                ambiguous[n] = sorted(rel_of[f] for f in stem_hits)
+            else:
+                missing.append(n)
+        if ambiguous:
+            raise ValueError(
+                f"{what} names file stems that match more than one section: "
+                f"{ambiguous}. Stems are not unique across a corpus. Use the "
+                f"relative path ('subdir/file.h5ad') so the selection is exact."
+            )
+        if missing:
+            raise ValueError(
+                f"{what} names sections that are not in {self.raw_dir}: "
+                f"{sorted(missing)[:10]}. Refusing to build, because a typo "
+                f"here would silently change which sections are built (and, "
+                f"with cross_panel, the vocabulary derived from them). "
+                f"{len(rels)} sections are available."
+            )
+        return selected
 
     def _slice_to_vocab(self, data_batch, rel: str) -> Optional[dict]:
         """

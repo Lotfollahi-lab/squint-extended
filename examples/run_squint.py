@@ -37956,7 +37956,9 @@ def harmonize_anndata_var():
 def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
                container: str = "file", cross_panel: bool = False,
                exclude_sections: Optional[List[str]] = None,
-               min_panels_per_gene: int = 1, batch_key: str = "batch"):
+               include_sections: Optional[List[str]] = None,
+               min_panels_per_gene: int = 1, batch_key: str = "batch",
+               name_suffix: str = ""):
     """
     Build the in-memory PyG DatasetBlob in-process.
 
@@ -38074,6 +38076,8 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p", backend: str = "in-memory",
             backend=container,
             cross_panel=cross_panel,
             exclude_sections=exclude_sections,
+            include_sections=include_sections,
+            output_suffix=name_suffix,
             # Corpus builds pass `--min-panels-per-gene 2` (V 18,937 -> 9,574;
             # 9,353 of the 9,363 dropped genes are chp60's, and chr78 keeps
             # 100%) and `--batch-key dataset_batch` (uns['batch'] is a
@@ -40614,6 +40618,25 @@ def main():
                        "the full model (which cannot, having seen every "
                        "section). Streaming backend only."
                    ))
+    p.add_argument("--build-blob-name-suffix", type=str, default="",
+                   help=(
+                       "Append this to the blob's output name, e.g. "
+                       "'_subset21', so a partial/subset build gets its own "
+                       "gold directory and cannot touch the real one. Silver "
+                       "input is unaffected."
+                   ))
+    p.add_argument("--include-sections", type=str, nargs="*", default=None,
+                   help=(
+                       "Build ONLY these sections, named by relative path "
+                       "('subdir/file.h5ad') or an unambiguous file stem. "
+                       "Mutually exclusive with --exclude-sections. Applied "
+                       "before the vocabulary is computed, so V is the union "
+                       "over just these sections. Use it to validate a "
+                       "pipeline change on a representative subset -- a few "
+                       "datasets spanning several panels -- in minutes, rather "
+                       "than discovering a build-stopping bug hours into the "
+                       "full corpus."
+                   ))
     p.add_argument("--min-panels-per-gene", type=int, default=1,
                    help=(
                        "Keep only genes measured by at least N DISTINCT PANELS "
@@ -40951,6 +40974,8 @@ def main():
                    backend=args.build_blob_backend,
                    cross_panel=args.cross_panel,
                    exclude_sections=args.exclude_sections,
+                   include_sections=args.include_sections,
+                   name_suffix=args.build_blob_name_suffix,
                    min_panels_per_gene=args.min_panels_per_gene,
                    batch_key=args.batch_key,
                    container=args.container)
