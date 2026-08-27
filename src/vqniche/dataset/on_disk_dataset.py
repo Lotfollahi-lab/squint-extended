@@ -2280,7 +2280,24 @@ class KSectionBlockLoader:
                 # Surface producer failures on the consumer's stack rather
                 # than losing them in a dead thread.
                 raise item
-            yield item
+            try:
+                yield item
+            finally:
+                # RELEASE BEFORE THE NEXT `q.get()`.
+                #
+                # `item` is a local of this generator's frame and survives the
+                # yield, so it kept the block alive even after `__iter__` had
+                # done `del nl; del block; gc.collect()` -- the collect could
+                # not free a block this frame still referenced. That is one
+                # resident block MORE than the design's three (consumer, queue,
+                # producer-building), and 4 x ~19 GB matches the 75.4 GB peak
+                # measured with prefetch on against 34.8 GB without it.
+                #
+                # `finally` rather than a plain assignment so it also runs when
+                # the consumer ABANDONS this generator, which Lightning does on
+                # every `max_steps` stop: without it the in-flight block leaked
+                # for the lifetime of the iterator.
+                item = None
 
     def __iter__(self):
         from torch_geometric.loader import NeighborLoader
@@ -2299,32 +2316,34 @@ class KSectionBlockLoader:
                 shuffle=self.shuffle,
                 **self.loader_kwargs,
             )
-            for mini_batch in nl:
-                yield mini_batch
-
-            # Release the block BEFORE the next one is built.
-            #
-            # `del block` ALONE DID NOT. `nl` holds the block as its dataset and
-            # was only rebound on the next iteration, and PyG's
-            # NeighborLoader/NeighborSampler keep it in reference cycles that
-            # only the cyclic collector breaks -- so freeing was deferred to
-            # whenever CPython happened to run a generational collection.
-            #
-            # Measured by `BaseModel._tensor_census` on the corpus: at step 200
-            # 22.18 GiB in 260 live tensors, at step 1,200 35.54 GiB in 392,
-            # with four-plus DISTINCT blocks resident -- (514416, 5052),
-            # (616613, 1084), (299302, 173), (876342, 5225) -- in a run with
-            # num_workers=0 and prefetch off, where exactly one block should be
-            # alive. All `grad=False, graph=False`, so not a retained autograd
-            # graph: simply blocks that were never freed. That is the ~9 MB per
-            # step which survived excluding page cache, the inference cache, the
-            # worker machinery, pinned memory and allocator fragmentation.
-            #
-            # The collect is per BLOCK, not per step -- blocks are seconds apart
-            # and the heap holds only hundreds of objects, so it is cheap.
-            del nl
-            del block
-            gc.collect()
+            try:
+                for mini_batch in nl:
+                    yield mini_batch
+            finally:
+                # Release the block BEFORE the next one is built, and do it in
+                # a `finally` so it also runs when the consumer ABANDONS this
+                # generator -- which Lightning does at every `max_steps` stop.
+                #
+                # `del block` alone did not release anything. `nl` holds the
+                # block as its dataset and was only rebound on the next
+                # iteration, and PyG's NeighborLoader/NeighborSampler keep it in
+                # reference cycles that only the cyclic collector breaks, so
+                # freeing was deferred to whenever CPython happened to run a
+                # generational collection.
+                #
+                # Measured by `BaseModel._tensor_census` on the corpus: 22.18
+                # GiB in 260 live tensors at step 200, 35.54 GiB in 392 at step
+                # 1,200, with four-plus DISTINCT blocks resident in a run where
+                # exactly one should be. All grad=False, graph=False -- not a
+                # retained autograd graph, just blocks never freed. Fixing it
+                # took the single-threaded arm from 13.1 MB/step to -1.3, i.e.
+                # flat, and its peak from 63.3 GB to 34.8.
+                #
+                # The collect is per BLOCK, not per step: blocks are seconds
+                # apart and the heap holds hundreds of objects, so it is cheap.
+                del nl
+                del block
+                gc.collect()
         self._epoch += 1
 
     def set_epoch(self, epoch: int) -> None:

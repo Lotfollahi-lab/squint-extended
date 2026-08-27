@@ -1152,3 +1152,63 @@ def test_release_works_with_prefetch_too(tmp_path):
     head = sum(steady[:len(steady) // 3]) / max(len(steady) // 3, 1)
     tail = sum(steady[-(len(steady) // 3):]) / max(len(steady) // 3, 1)
     assert tail <= head + 0.5, f"live blocks trending up: head {head} tail {tail}"
+
+
+# --------------------------------------------------------------------------- #
+# early abandonment — Lightning stops mid-epoch at every max_steps
+# --------------------------------------------------------------------------- #
+
+def test_abandoning_the_loader_releases_the_block(tmp_path):
+    """
+    Lightning stops the iterator mid-epoch whenever `max_steps` is reached, so
+    the release must happen in a `finally`, not after the inner loop. Without
+    it the in-flight block and its NeighborLoader survived for the lifetime of
+    the iterator -- and with prefetch, `_blocks()`'s own `item` local held a
+    further one across its yield, which is the fourth resident block behind the
+    75.4 GB peak measured with prefetch on against 34.8 GB without.
+    """
+    import gc as _gc
+
+    blob = _blob_biggish(tmp_path)
+    # K=2 and a threshold above one section, for the same reason as the
+    # residency test: at K=1 a block is exactly one section's width, so section
+    # tensors are indistinguishable from block tensors.
+    big = int(400 * 60 * 1.5)
+    for prefetch in (False, True):
+        # Collect BEFORE the baseline as well as after. `_live_blocks` reads the
+        # global heap, so without this the baseline picks up whatever the
+        # previous test (or the previous loop iteration) has not yet released,
+        # and the test passes alone but fails in a full run.
+        _gc.collect()
+        baseline = _live_blocks(min_elems=big)
+        ld = _loader(blob, K=2, transform=_transform(), num_neighbors=[-1],
+                     prefetch=prefetch)
+        it = iter(ld)
+        next(it)                      # consume one mini-batch, then walk away
+        it.close()                    # what CPython does when Lightning drops it
+        del it, ld
+        _gc.collect()
+        assert _live_blocks(min_elems=big) <= baseline, (
+            f"block survived abandonment (prefetch={prefetch})")
+
+
+def test_prefetch_does_not_hold_an_extra_block_after_each_yield(tmp_path):
+    """
+    `_blocks()` kept `item` bound across its yield, so the consumer's release
+    could not free the block that frame still referenced.
+
+    Uses K=2 and counts only tensors LARGER than a single section. With K=1 a
+    block is exactly one section's width, so `_live_blocks()` counted section
+    tensors too and could not tell three blocks from three sections -- the
+    metric, not the code, was what failed first.
+    """
+    blob = _blob_biggish(tmp_path)
+    ld = _loader(blob, K=2, transform=_transform(), num_neighbors=[-1],
+                 prefetch=True)
+    section_elems = 400 * 60
+    seen = []
+    for _ in ld:
+        seen.append(_live_blocks(min_elems=int(section_elems * 1.5)))
+    # Designed residency with prefetch is three: consumer, queue, and the
+    # producer building ahead. A fourth would mean `item` is still holding one.
+    assert max(seen) <= 3, f"more than the designed residency: {seen}"
