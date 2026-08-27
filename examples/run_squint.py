@@ -39084,6 +39084,19 @@ def train(
             )
             if monitor not in _filename_by_monitor:
                 monitor = "val_loss"
+            # Record the STEP as well as the epoch. With `save_top_k=-1` a
+            # corpus run leaves ten checkpoints, and `{epoch}-{metric}` alone
+            # cannot order them or name one: every save on a 200,000-step budget
+            # lands in epoch 0 or 1, so the files differ only by a metric value
+            # whose ranking is exactly what we do not want to rely on. `step` is
+            # the identity that lets `--ckpt-select step:N` address one and lets
+            # a human read the sequence.
+            #
+            # `find_best_checkpoint` is unaffected: it splits on
+            # f"{metric_name}=" and takes what follows, so an extra leading
+            # field parses identically.
+            if "{step}" not in filename:
+                filename = filename.replace("{epoch}", "{epoch}-{step}", 1)
 
         checkpoint_params = cfg["trainer"]["checkpoint_params"]
         callbacks.append(
@@ -39618,10 +39631,89 @@ def _build_clean_adata_from_inference(
     return adata
 
 
+def _resolve_checkpoint(run_dir, select: str) -> Optional[str]:
+    """
+    Turn a checkpoint SELECTION POLICY into a path.
+
+    WHY THIS IS A CONFIGURATION AND NOT A DEFAULT. `save_top_k=-1` leaves one
+    checkpoint per validation pass -- ten on the corpus budget -- and which one
+    a benchmark should use is a decision, not a lookup. The retained "best" is
+    best by `val_loss`, a weighted sum whose weights were tuned for
+    optimisation dynamics, 55% of which is a stochastic adjacency term, and
+    whose components move in opposite directions. On the first corpus run it
+    selected step 40,000 of 200,000 while reconstruction was still improving,
+    so `best` and "best for reconstruction" were different checkpoints.
+
+    The five benchmark regimes rest on different loss terms -- identification on
+    the codes, integration on the batch covariate, reconstruction and imputation
+    on the NB terms -- so different regimes may legitimately prefer different
+    checkpoints. Naming the policy per invocation makes that explicit and
+    reportable instead of implicit.
+
+    Policies
+    --------
+    best      the highest-ranked checkpoint by the monitored metric, parsed from
+              the filename (the historical behaviour; returns None so the
+              existing `find_best_checkpoint` path runs).
+    last      `last.ckpt` -- the end of the budget, regardless of any metric.
+    step:N    the checkpoint saved at global step N. Requires `{step}` in the
+              filename, which training now always includes.
+    <path>    an explicit .ckpt path, passed through untouched.
+    """
+    if not select or select == "best":
+        return None
+
+    ckpt_dir = Path(run_dir) / "checkpoints"
+    if not ckpt_dir.is_dir():
+        raise FileNotFoundError(f"No checkpoints/ under {run_dir}")
+    available = sorted(f.name for f in ckpt_dir.glob("*.ckpt"))
+
+    if select == "last":
+        p = ckpt_dir / "last.ckpt"
+        if not p.exists():
+            raise FileNotFoundError(
+                f"--ckpt-select last, but no last.ckpt in {ckpt_dir}. "
+                f"`save_last` must have been off for that run. "
+                f"Available: {available}"
+            )
+        return str(p)
+
+    if select.startswith("step:"):
+        want = select.split(":", 1)[1].strip()
+        hits = [f for f in available if f"step={want}-" in f or f"step={want}." in f]
+        if len(hits) == 1:
+            return str(ckpt_dir / hits[0])
+        if not hits:
+            steps = sorted(
+                {f.split("step=")[1].split("-")[0].split(".ckpt")[0]
+                 for f in available if "step=" in f},
+                key=lambda x: int(x) if x.isdigit() else -1,
+            )
+            hint = steps if steps else (
+                "<none: these checkpoints predate step-stamped filenames>")
+            raise FileNotFoundError(
+                f"No checkpoint at step {want} in {ckpt_dir}. "
+                f"Steps present: {hint}"
+            )
+        raise ValueError(
+            f"step {want} matches several checkpoints: {hits}. "
+            f"Pass an explicit path instead."
+        )
+
+    p = Path(select)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"--ckpt-select {select!r} is neither a policy "
+            f"(best | last | step:N) nor an existing path."
+        )
+    return str(p)
+
+
 def predict(
     run_dir: str,
     silver_dir: str | None = None,
     model_ckpt_fname: str | None = None,
+    ckpt_select: str | None = None,
     output_dir: str | None = None,
     precision: Optional[str] = None,
     strategy: Optional[str] = None,
@@ -39720,11 +39812,19 @@ def predict(
     # datasets.
     # NOTE: collect_test_configs takes a parameter named `wandb_run_dir` for
     # historical reasons; it now supports both the flat and legacy layouts.
+    # Resolve the selection POLICY into a concrete path before the config is
+    # assembled. An explicit --model-ckpt-fname still wins: policy is for when
+    # you want "step 40,000" or "the end of the budget" without looking up a
+    # filename.
+    if model_ckpt_fname is None and ckpt_select:
+        model_ckpt_fname = _resolve_checkpoint(run_dir, ckpt_select)
+
     config = collect_test_configs(
         wandb_run_dir=run_dir,
         model_ckpt_fname=model_ckpt_fname,
     )
     print(f"Using checkpoint: {config['model']['model_ckpt_fname']}")
+    print(f"  selection policy: {ckpt_select or 'best (by monitored metric)'}")
 
     # ---- predict_batch_size override -----------------------------------------
     # Needed because the inference cache aggregates 1-hop neighbours with
@@ -41044,8 +41144,21 @@ def main():
                    help="Folder of .h5ad files for inference (default: same silver "
                         "folder used for training).")
     p.add_argument("--model-ckpt-fname", type=str, default=None,
-                   help="Optional path to a specific .ckpt; otherwise the best "
-                        "checkpoint is auto-selected.")
+                   help="Explicit path to a .ckpt. Wins over --ckpt-select.")
+    p.add_argument("--ckpt-select", type=str, default=None,
+                   help=(
+                       "Which checkpoint to predict with, as a POLICY rather "
+                       "than a path: 'best' (highest-ranked by the monitored "
+                       "metric, the historical default), 'last' (the end of the "
+                       "step budget), or 'step:N'. With save_top_k=-1 a corpus "
+                       "run leaves one checkpoint per validation pass, and "
+                       "which one a benchmark should use is a decision: 'best' "
+                       "means best by val_loss, a weighted sum 55%% of which is "
+                       "a stochastic adjacency term and whose components move "
+                       "in opposite directions. On the first corpus run it "
+                       "picked step 40,000 of 200,000 while reconstruction was "
+                       "still improving."
+                   ))
     p.add_argument("--output-dir", type=str, default=None,
                    help="Where to write predicted_adata.h5ad and downstream "
                         "plot/metrics output. Defaults to the run_dir itself "
@@ -41320,6 +41433,7 @@ def main():
             run_dir=run_dir,
             silver_dir=args.silver_dir,
             model_ckpt_fname=args.model_ckpt_fname,
+            ckpt_select=args.ckpt_select,
             output_dir=args.output_dir,
             predict_batch_size=args.predict_batch_size,
         )
