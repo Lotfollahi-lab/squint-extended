@@ -1133,6 +1133,14 @@ class BaseModel(pl.LightningModule):
         """        
         print(f"--------------------------------Start of Epoch {self.current_epoch}--------------------------------------")
         self._epoch_t0 = time.time()
+        # Anchor the step counter to this epoch as well as the clock. Setting
+        # only `_epoch_t0` meant that after the first epoch boundary the elapsed
+        # time restarted while `global_step` did not, so the heartbeat divided a
+        # cumulative step count by a fresh elapsed and reported nonsense -- the
+        # corpus run printed "208 steps/s, elapsed 0.26 h" at step 196,000
+        # against a true ~8 steps/s. Cosmetic, but a progress line that lies is
+        # worse than none.
+        self._epoch_step0 = int(self.global_step)
 
         # call the parent class method to complete default behavior
         return super().on_train_epoch_start()
