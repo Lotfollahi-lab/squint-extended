@@ -441,6 +441,49 @@ class VQNiche_Dual(BaseModel):
         niche_keys = ['H_latent_niche', 'H_quantized_niche', 'Indices_niche', 'X_hat_nbr']
         self.cache_keys = data_keys + cell_keys + niche_keys
 
+        # ---- output scoping -------------------------------------------------
+        # Four of these keys are GENE-WIDTH -- X, X_nbr, X_hat, X_hat_nbr -- and
+        # at corpus scale that is not a detail. 112,578,039 cells x 9,574 genes
+        # x float32 is 4.31 TB EACH, so an unscoped predict over the corpus
+        # would try to accumulate ~17 TB in RAM and then write it.
+        #
+        # The regimes need different things, so the mode is a configuration:
+        #   codes          Indices_* plus coordinates and the per-cell keys
+        #                  needed to join back to .obs. ~4 GB over the corpus.
+        #                  Enough for identification (NMI/ARI), integration and
+        #                  query-to-reference, which read codes and labels only.
+        #   codes+latents  adds H_latent_* / H_quantized_*: FOUR matrices at
+        #                  256 dims, so 461 GB over the corpus, not the ~115 GB
+        #                  a single-matrix estimate suggests. Needed when a
+        #                  metric works on the embedding rather than the code.
+        #   full           adds the gene-width matrices. Reconstruction and
+        #                  imputation need these, and therefore must be run on a
+        #                  SUBSET of sections per rung, never the whole corpus.
+        #
+        # Default `full`, so nothing that worked before changes silently; the
+        # corpus paths opt down.
+        mode = str(getattr(self, 'inference_cache_mode', 'full') or 'full')
+        _GENE_WIDTH = ('X', 'X_nbr', 'X_hat', 'X_hat_nbr')
+        _LATENTS = ('H_latent_cell', 'H_quantized_cell',
+                    'H_latent_niche', 'H_quantized_niche')
+        if mode == 'codes':
+            drop = set(_GENE_WIDTH) | set(_LATENTS)
+        elif mode in ('codes+latents', 'codes_latents'):
+            drop = set(_GENE_WIDTH)
+        elif mode == 'full':
+            drop = set()
+        else:
+            raise ValueError(
+                f"inference_cache_mode must be 'codes', 'codes+latents' or "
+                f"'full', got {mode!r}."
+            )
+        if drop:
+            kept = [k for k in self.cache_keys if k not in drop]
+            print(f"Inference cache mode {mode!r}: keeping {len(kept)} of "
+                  f"{len(self.cache_keys)} keys, dropping {sorted(drop)}.")
+            self.cache_keys = kept
+        self.inference_cache_mode = mode
+
         for split in ['train_inference_data_cache',
                       'val_inference_data_cache',
                       'test_inference_data_cache']:

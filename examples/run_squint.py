@@ -39714,6 +39714,7 @@ def predict(
     silver_dir: str | None = None,
     model_ckpt_fname: str | None = None,
     ckpt_select: str | None = None,
+    inference_cache_mode: str | None = None,
     output_dir: str | None = None,
     precision: Optional[str] = None,
     strategy: Optional[str] = None,
@@ -39825,6 +39826,12 @@ def predict(
     )
     print(f"Using checkpoint: {config['model']['model_ckpt_fname']}")
     print(f"  selection policy: {ckpt_select or 'best (by monitored metric)'}")
+    # Output scoping, read by `initialize_model` and applied inside
+    # `VQNiche_Dual._init_inference_data_caches`. Left absent unless asked for,
+    # so predict keeps writing everything by default.
+    if inference_cache_mode:
+        config['model']['inference_cache_mode'] = inference_cache_mode
+        print(f"  inference cache mode: {inference_cache_mode}")
 
     # ---- predict_batch_size override -----------------------------------------
     # Needed because the inference cache aggregates 1-hop neighbours with
@@ -41145,6 +41152,21 @@ def main():
                         "folder used for training).")
     p.add_argument("--model-ckpt-fname", type=str, default=None,
                    help="Explicit path to a .ckpt. Wins over --ckpt-select.")
+    p.add_argument("--inference-cache-mode", type=str, default=None,
+                   choices=["codes", "codes+latents", "full"],
+                   help=(
+                       "How much predict should accumulate and write. Four "
+                       "cached keys are GENE-WIDTH (X, X_nbr, X_hat, "
+                       "X_hat_nbr), and over the corpus each is 4.31 TB "
+                       "(112,578,039 cells x 9,574 genes x f32) -- ~17 TB "
+                       "unscoped. 'codes' (~4 GB) suffices for identification, "
+                       "integration and query-to-reference; 'codes+latents' "
+                       "(461 GB -- four 256-dim matrices, not one) adds the "
+                       "embeddings; 'full' adds the "
+                       "gene-width matrices and must be run on a SUBSET of "
+                       "sections per rung. Default 'full', so existing "
+                       "behaviour is unchanged."
+                   ))
     p.add_argument("--ckpt-select", type=str, default=None,
                    help=(
                        "Which checkpoint to predict with, as a POLICY rather "
@@ -41434,6 +41456,7 @@ def main():
             silver_dir=args.silver_dir,
             model_ckpt_fname=args.model_ckpt_fname,
             ckpt_select=args.ckpt_select,
+            inference_cache_mode=args.inference_cache_mode,
             output_dir=args.output_dir,
             predict_batch_size=args.predict_batch_size,
         )

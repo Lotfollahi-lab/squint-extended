@@ -939,6 +939,18 @@ def initialize_model(
     # the model definition).
     model.heartbeat_every_n_steps = int(
         config.get('trainer', {}).get('heartbeat_every_n_steps', 0) or 0)
+    # Predict-time output scoping. Set as an attribute BEFORE the caches are
+    # built if the model builds them in __init__; VQNiche_Dual reads it inside
+    # `_init_inference_data_caches`, which predict re-invokes, so setting it
+    # here is enough. See that method for why this matters: four cached keys are
+    # gene-width, and at 112,578,039 cells x 9,574 genes that is 4.31 TB each.
+    mode = config.get('model', {}).get('inference_cache_mode', None)
+    if mode:
+        model.inference_cache_mode = str(mode)
+        # Rebuild the caches so the mode takes effect for a model whose
+        # __init__ already created them.
+        if hasattr(model, '_init_inference_data_caches'):
+            model._init_inference_data_caches()
     return model
 
 
