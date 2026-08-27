@@ -1212,3 +1212,20 @@ def test_prefetch_does_not_hold_an_extra_block_after_each_yield(tmp_path):
     # Designed residency with prefetch is three: consumer, queue, and the
     # producer building ahead. A fourth would mean `item` is still holding one.
     assert max(seen) <= 3, f"more than the designed residency: {seen}"
+
+
+def test_predict_split_can_be_scoped_to_named_sections(tmp_path):
+    """
+    Predict covers every section in the blob unless scoped, which on the corpus
+    is 636 sections / 112,578,039 cells (~17 TB at `full` cache mode).
+    `--predict-sections` sets a `predict` entry in `split_sections`, which the
+    loader already honours -- assert that path works and that predict is exempt
+    from the cell-mask refusal, since it carries no mask.
+    """
+    blob = _build(_write(tmp_path, PANELS) and tmp_path, "xp", cross_panel=True)
+    dm = _dm(blob, split_sections={"predict": ["section_1.h5ad"]})
+    ld = dm.predict_dataloader()
+    assert ld.section_rows == [1]
+    assert ld.input_mask_attr is None
+    rows = {int(b.section_row.min()) for b in ld}
+    assert rows == {1}, f"predict visited {rows}, expected only section 1"

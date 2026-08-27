@@ -39715,6 +39715,7 @@ def predict(
     model_ckpt_fname: str | None = None,
     ckpt_select: str | None = None,
     inference_cache_mode: str | None = None,
+    predict_sections: Optional[List[str]] = None,
     output_dir: str | None = None,
     precision: Optional[str] = None,
     strategy: Optional[str] = None,
@@ -39922,6 +39923,36 @@ def predict(
     # train+val already covers the whole blob.
     _orig_idx = list(config["dataset"].get("adata_batch_idx", []))
     config["dataset"]["adata_batch_idx"] = list(range(len(dataset_blob)))
+
+    # ---- restrict predict to NAMED SECTIONS ---------------------------------
+    # Without this, predict runs over EVERY section in the blob -- 636 sections
+    # and 112,578,039 cells on the corpus, which at `full` cache mode is ~17 TB.
+    # `--silver-dir` cannot scope it: that argument only supplies `source_paths`
+    # for labelling, while the dataset itself comes from
+    # `initialize_dataset_blob(config)` and therefore carries the whole blob.
+    #
+    # Sections are named by REL PATH, the only corpus-unique identifier, and
+    # resolved through the same `section_rows_for` the loaders use -- so an
+    # ambiguous stem or an unknown name raises rather than silently changing
+    # which cells are scored. The streaming loader already honours a `predict`
+    # entry in `split_sections` (`_make_loader` -> `_resolve_section_rows`), so
+    # this needs no new machinery in the datamodule.
+    #
+    # Evaluation runs on a RUNG, not the corpus: reconstruction and imputation
+    # need `full` output, and `full` is only affordable on a subset.
+    if predict_sections:
+        if not hasattr(dataset_blob, "section_rows_for"):
+            raise ValueError(
+                "--predict-sections needs a streaming blob with manifest v4 "
+                "(`section_rels`); this run's blob cannot address rows by name."
+            )
+        rows = dataset_blob.section_rows_for(list(predict_sections))
+        config.setdefault("datamodule", {})["split_sections"] = {
+            "predict": list(predict_sections)
+        }
+        config["dataset"]["adata_batch_idx"] = rows
+        print(f"Predict restricted to {len(rows)} of {len(dataset_blob)} "
+              f"sections.")
     if config["dataset"]["adata_batch_idx"] != _orig_idx:
         print(
             f"Predict: expanding adata_batch_idx {_orig_idx} -> "
@@ -41152,6 +41183,16 @@ def main():
                         "folder used for training).")
     p.add_argument("--model-ckpt-fname", type=str, default=None,
                    help="Explicit path to a .ckpt. Wins over --ckpt-select.")
+    p.add_argument("--predict-sections", type=str, nargs="*", default=None,
+                   help=(
+                       "Restrict predict to these sections, by relative path "
+                       "('subdir/file.h5ad') or an unambiguous stem. Without "
+                       "it predict covers EVERY section in the blob -- 636 and "
+                       "112,578,039 cells on the corpus, ~17 TB at "
+                       "--inference-cache-mode full. --silver-dir does NOT "
+                       "scope this: it only supplies the source list used for "
+                       "labelling. Evaluation runs on a rung, not the corpus."
+                   ))
     p.add_argument("--inference-cache-mode", type=str, default=None,
                    choices=["codes", "codes+latents", "full"],
                    help=(
@@ -41461,6 +41502,7 @@ def main():
             model_ckpt_fname=args.model_ckpt_fname,
             ckpt_select=args.ckpt_select,
             inference_cache_mode=args.inference_cache_mode,
+            predict_sections=args.predict_sections,
             output_dir=args.output_dir,
             predict_batch_size=args.predict_batch_size,
         )
