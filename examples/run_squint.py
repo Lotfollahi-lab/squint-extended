@@ -4899,6 +4899,8 @@ def _patch_step_budget(
         val_checks: int = 10,
         max_epochs: int = 1000,
         heartbeat_every_n_steps: int = 0,
+        save_top_k: Optional[int] = None,
+        early_stopping: Optional[bool] = None,
     ) -> dict:
     """
     Train to a STEP budget rather than an epoch count.
@@ -4990,6 +4992,18 @@ def _patch_step_budget(
     # budget finishes inside epoch 0 and nothing else prints between the
     # epoch banners -- a healthy run looks identical to a hung one.
     cfg["trainer"]["heartbeat_every_n_steps"] = int(heartbeat_every_n_steps)
+    # Belongs with `val_checks`: it decides how many of those checks leave a
+    # file behind. -1 keeps them all, which is what a run whose checkpoint will
+    # be chosen against a downstream benchmark wants -- see `corpus-holdout`.
+    if save_top_k is not None:
+        cfg["trainer"]["checkpoint_params"]["save_top_k"] = int(save_top_k)
+    # `patience` is counted in VALIDATION CHECKS, so a patience >= `val_checks`
+    # can never fire. The default (enabled, patience=10) was inert on a run with
+    # exactly 10 checks while appearing to guard the budget, so make the intent
+    # explicit rather than leave a callback that cannot act.
+    if early_stopping is not None:
+        cfg["trainer"].setdefault("early_stopping_params", {})
+        cfg["trainer"]["early_stopping_params"]["enabled"] = bool(early_stopping)
     cfg["trainer"]["max_epochs"] = int(max_epochs)
     # MUST be None, not 1. With an int here Lightning treats
     # `val_check_interval` as an offset WITHIN one epoch and hard-raises if it
@@ -6119,6 +6133,42 @@ VARIANTS: dict = {
             # because a corpus epoch is 187,562 steps and the whole budget
             # finishes inside epoch 0.
             heartbeat_every_n_steps=2_000,
+            # KEEP EVERY VALIDATION CHECKPOINT, rather than only the best by
+            # `val_loss`. 10 x 108 MB = 1.1 GB, which is nothing, and it removes
+            # the need to decide in advance which loss term should rank models.
+            #
+            # `val_loss` is a poor ranking key here, and not because the wrong
+            # term was chosen -- because it is a WEIGHTED SUM whose weights
+            # (`wt_adj_reconstr=1000`) were tuned for optimisation dynamics, not
+            # for model selection. 55% of it is `bce_cosine_adjacency`, which
+            # resamples negatives every batch at `edge_sampling_ratio=2`, so the
+            # ranking is partly luck; and its terms move in OPPOSITE directions,
+            # so the sum can worsen while components improve. Measured on the
+            # first corpus run between the two epoch ends: NB -44.6, adjacency
+            # +130, total +84 -- and the retained "best" landed at step 40,000
+            # of 200,000 while reconstruction was still improving at the end.
+            #
+            # No single term is the right key either. The five benchmark regimes
+            # depend on different ones: identification (NMI/ARI) on the codes and
+            # so on the adjacency term, integration on the batch covariate,
+            # reconstruction and imputation on the NB terms. With a FIXED step
+            # budget the monitor only decides which file survives, so retain all
+            # and select afterwards against whichever benchmark carries the
+            # claim. Different regimes may prefer different checkpoints; that is
+            # a result, not a problem.
+            save_top_k=-1,
+            # EarlyStopping is DISABLED here, and saying so beats leaving a
+            # callback that cannot act. The default is enabled with
+            # `patience=10` counted in VALIDATION CHECKS -- and this run has
+            # exactly 10 checks, so it could never fire. It was inert on the
+            # first corpus run while appearing to guard the budget.
+            #
+            # A fixed step budget is the endpoint here by design (200,000 steps
+            # ~ 1.15 corpus passes), and `val_loss` is the wrong quantity to
+            # stop on for the reasons above -- it worsened while reconstruction
+            # improved, so a live EarlyStopping on it would have cut the run
+            # short for the wrong reason.
+            early_stopping=False,
             # 10 validation passes over the run. Affordable only because Part D
             # restricts the val loader to the 32 val SECTIONS -- unrestricted it
             # would rebuild every block in the corpus to reach them, ~51 min a
