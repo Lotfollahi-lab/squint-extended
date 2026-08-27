@@ -38361,7 +38361,7 @@ def train(
         split_sections_json: Optional[str] = None,
         max_steps: Optional[int] = None,
         num_workers: Optional[int] = None,
-        no_prefetch: bool = False,
+        prefetch: Optional[bool] = None,
     ):
     """
     Train SQUINT.
@@ -38471,9 +38471,11 @@ def train(
     if num_workers is not None:
         cfg["datamodule"]["loader_params"]["num_workers"] = int(num_workers)
         print(f"Datamodule: num_workers override from CLI = {num_workers}")
-    if no_prefetch:
-        cfg["datamodule"]["prefetch"] = False
-        print("Datamodule: prefetch DISABLED from CLI")
+    if prefetch is not None:
+        prev = cfg["datamodule"].get("prefetch")
+        cfg["datamodule"]["prefetch"] = bool(prefetch)
+        print(f"Datamodule: prefetch override from CLI = {prefetch} "
+              f"(variant had {prev!r})")
 
     if split_sections_json:
         _patch_corpus_split(cfg, split_sections_json)
@@ -40817,10 +40819,19 @@ def main():
     p.add_argument("--num-workers", type=int, default=None,
                    help="Override the dataloader worker count (0 = in-process). "
                         "Diagnostic knob for memory isolation.")
+    # Tri-state, like --compile/--no-compile: neither flag leaves the variant's
+    # value alone, so the memory/throughput trade-off can be chosen per run
+    # without editing the variant.
+    p.add_argument("--prefetch", action="store_true",
+                   help="Force the streaming block prefetch thread ON. Faster "
+                        "(~1.8x) but holds three blocks instead of one: measured "
+                        "41.9 GB peak over 10 corpus blocks with a residual "
+                        "+26.5 GB/h, against a flat ~35 GB with it off. Size the "
+                        "memory request accordingly.")
     p.add_argument("--no-prefetch", action="store_true",
-                   help="Disable the streaming block prefetch thread. With "
-                        "--num-workers 0 this reduces the loader to a single "
-                        "thread and no worker processes.")
+                   help="Force the prefetch thread OFF. Measured flat "
+                        "(-1.3 MB/step, ~35 GB peak) and the safe default for a "
+                        "long run; costs roughly 1.8x wall-clock.")
     p.add_argument("--max-steps", type=int, default=None,
                    help=(
                        "Override the variant's step budget. Intended for "
@@ -41220,6 +41231,14 @@ def main():
     #   `--no-compile`               → False (always wins)
     #   `--compile` (alone)          → True
     #   neither flag                 → None (use cfg value, currently False)
+    # Tri-state prefetch: --no-prefetch wins if both are given.
+    if args.no_prefetch:
+        _prefetch_override = False
+    elif args.prefetch:
+        _prefetch_override = True
+    else:
+        _prefetch_override = None
+
     if args.no_compile:
         _compile_override = False
     elif args.compile:
@@ -41239,7 +41258,7 @@ def main():
             split_sections_json=args.split_sections_json,
             max_steps=args.max_steps,
             num_workers=args.num_workers,
-            no_prefetch=args.no_prefetch,
+            prefetch=_prefetch_override,
         )
     if args.predict:
         run_dir = args.run_dir or args.wandb_run_dir
