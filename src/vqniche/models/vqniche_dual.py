@@ -449,9 +449,14 @@ class VQNiche_Dual(BaseModel):
         #
         # The regimes need different things, so the mode is a configuration:
         #   codes          Indices_* plus coordinates and the per-cell keys
-        #                  needed to join back to .obs. ~4 GB over the corpus.
-        #                  Enough for identification (NMI/ARI), integration and
-        #                  query-to-reference, which read codes and labels only.
+        #                  needed to join back to .obs. 3.6 GB over the corpus.
+        #                  Enough for identification (NMI/ARI, scored on code
+        #                  indices) and query-to-reference (code distributions).
+        #                  NOT enough for batch integration: iLISI/ASW/MMD read
+        #                  `obsm['cell_emb']` / `obsm['neighborhood_emb']`,
+        #                  which are H_quantized_cell / H_quantized_niche
+        #                  (run_squint.py:39567-39569) -- dropped in this mode,
+        #                  so those metrics would find nothing.
         #   codes+latents  adds H_latent_* / H_quantized_*: FOUR matrices at
         #                  256 dims, so 461 GB over the corpus, not the ~115 GB
         #                  a single-matrix estimate suggests. Needed when a

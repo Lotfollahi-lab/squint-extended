@@ -112,3 +112,26 @@ def test_the_arithmetic_this_exists_for(mode, expected_tb):
     keys, _ = _keys(mode)
     tb = len(GENE_WIDTH & keys) * cells * genes * 4 / 1e12
     assert round(tb, 1) == expected_tb
+
+
+def test_codes_mode_loses_the_integration_embeddings():
+    """
+    A documented consequence, asserted so the mode->regime mapping cannot drift.
+    `obsm['cell_emb']` / `obsm['neighborhood_emb']` are H_quantized_cell /
+    H_quantized_niche (run_squint.py:39567-39569), and iLISI/ASW/MMD read those
+    obsm keys -- so `codes` covers identification and query-to-reference but NOT
+    batch integration.
+    """
+    codes, _ = _keys("codes")
+    assert "H_quantized_cell" not in codes
+    assert "H_quantized_niche" not in codes
+    # the next mode up is what integration needs
+    cl, _ = _keys("codes+latents")
+    assert {"H_quantized_cell", "H_quantized_niche"} <= cl
+
+
+def test_codes_mode_keeps_what_identification_needs():
+    """NMI/ARI score code INDICES against obs labels, and the obs join needs
+    the per-cell batch id; both survive `codes`."""
+    codes, _ = _keys("codes")
+    assert {"Indices_cell", "Indices_niche", "adata_batch_ids"} <= codes
