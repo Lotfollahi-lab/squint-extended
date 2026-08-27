@@ -6047,7 +6047,7 @@ VARIANTS: dict = {
             "diversity-w10, contrastWB-w10-k5)",
             "+hst_corpus_110m (636 sections, 112.6M cells, V=9,574)",
             "+streaming(sections_per_block=8, max_cells_per_block=900k, "
-            "num_workers=2)",
+            "num_workers=0, prefetch=off)",
             "+step-budget(max_steps=200000, val every 20000 steps)",
             "+whole-section splits via --split-sections-json",
         ],
@@ -6058,11 +6058,37 @@ VARIANTS: dict = {
                     batch_size=512,
                 ),
                 sections_per_block=8,
-                # 2, not the default fan-out: R0 measured 96.5 GB of RSS at 22
-                # workers against 26 GB at 2, and a NeighborLoader is built per
-                # BLOCK so workers are spawned and torn down for every one of
-                # them.
-                num_workers=2,
+                # num_workers=0 and prefetch OFF, and both are MEASURED choices
+                # rather than caution. Per-step host memory growth over 3,000
+                # corpus steps, after the block-release fix:
+                #
+                #     workers=2, prefetch on   +10.0 MB/step   peak 75.4 GB
+                #     workers=0, prefetch ON   +12.0 MB/step   peak 55.2 GB
+                #     workers=2, prefetch OFF   +2.3 MB/step   peak 39.2 GB
+                #     workers=0, prefetch off   -1.3 MB/step   peak 34.8 GB  FLAT
+                #
+                # Only the last is safe: +2.3 MB/step is still ~460 GB over a
+                # 200,000-step budget. The prefetch THREAD carries most of it
+                # (~13 MB/step); workers add ~3.6. Two runs died on memory
+                # before this was measured, at 102 GB and 253 GB.
+                #
+                # The throughput cost is real -- roughly 2x, so ~15 h rather
+                # than 7.7 for the full budget, which fits the 48 h wall-clock.
+                # Dropping workers may cost nothing at all: a NeighborLoader is
+                # constructed per BLOCK, so workers are spawned and torn down
+                # for every one of them and `persistent_workers` cannot help.
+                #
+                # The prefetch retention was subsequently FIXED (`_blocks()`
+                # held a fourth block across its yield; the per-block release
+                # was not in a `finally` so it was skipped on Lightning's
+                # mid-epoch max_steps stop). Re-measured over 17,580 steps
+                # = 10 blocks, peak fell 75.4 -> 41.9 GB. But the second-half
+                # slope is still +26.5 GB/h, i.e. ~200 GB over a 7.7 h run
+                # against a 250 GB limit, so prefetch stays OFF. Over only 10
+                # blocks that residual cannot be separated from block-size
+                # variance, and the flat configuration is available now.
+                num_workers=0,
+                prefetch=False,
                 # Measured over random shuffles of the 417 train sections
                 # (cells and widths from `_vocabpolicy.json`), blocks come out
                 # at a median of 12.1 GB and a worst case of 21.6 GB, so 43.2 GB
