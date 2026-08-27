@@ -112,3 +112,54 @@ def test_step_filename_is_parseable_by_find_best_checkpoint(rs, tmp_path):
     got = find_best_checkpoint(str(run), mode="min", metric_name="val_loss")
     # returns a Path, not a str
     assert "step=200000" in str(got)
+
+
+# --------------------------------------------------------------------------- #
+# predict_batch_size: width-aware, because "remember the flag" failed twice
+# --------------------------------------------------------------------------- #
+
+def _derived(genes, current=65536):
+    """The rule applied in predict() when --predict-batch-size is not given."""
+    safe = max(512, min(65536, int(5.0e7 // genes)))
+    return safe if safe < current else current
+
+
+@pytest.mark.parametrize("genes,expect_lower", [
+    (169, False),     # narrow panel: default already safe, leave it
+    (946, True),
+    (4948, True),     # R0: the default asked for 47.51 GiB here
+    (9574, True),     # corpus vocabulary: the default asked for 89.23 GiB
+])
+def test_the_default_is_lowered_only_where_it_needs_to_be(genes, expect_lower):
+    got = _derived(genes)
+    assert (got < 65536) is expect_lower, f"{genes} genes -> {got}"
+
+
+@pytest.mark.parametrize("genes", [169, 946, 4948, 9574, 18893])
+def test_the_gather_stays_within_budget(genes):
+    """
+    The failure is `X[row]` in aggregate_1hop_neighbor_features materialising
+    [n_edges, n_genes]. At ~40 edges per seed the derived batch must keep that
+    under ~8 GiB at every panel width in the corpus (169 to 18,893).
+    """
+    seeds = _derived(genes)
+    gib = seeds * 40 * genes * 4 / 2**30
+    assert gib <= 8.0, f"{genes} genes -> {seeds} seeds -> {gib:.1f} GiB"
+
+
+def test_it_never_raises_the_default():
+    """Only ever lowers: a bigger batch could OOM a config that worked."""
+    for genes in (1, 10, 169, 946, 4948, 9574, 18893, 50000):
+        assert _derived(genes) <= 65536
+
+
+def test_it_never_goes_below_a_usable_floor():
+    assert _derived(10_000_000) >= 512
+
+
+def test_the_observed_failures_would_now_be_avoided():
+    """The two real OOMs, at the defaults that produced them."""
+    for genes, observed_gib in ((4948, 47.51), (9574, 89.23)):
+        at_default = 65536 * 40 * genes * 4 / 2**30
+        assert at_default > observed_gib * 0.8    # the arithmetic matches
+        assert _derived(genes) * 40 * genes * 4 / 2**30 <= 8.0

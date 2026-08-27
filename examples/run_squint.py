@@ -39852,6 +39852,35 @@ def predict(
             f"Predict: predict_batch_size {_old_pbs} -> {int(predict_batch_size)} "
             f"(override; the 1-hop neighbour gather is O(batch x degree x genes))."
         )
+    else:
+        # WIDTH-AWARE DEFAULT, because "remember the flag" has failed twice: the
+        # base 65,536 OOM'd at 47.51 GiB on R0's 4,948-gene panel, and again at
+        # 89.23 GiB on the 9,574-gene corpus vocabulary. The gather is
+        # O(batch x degree x genes), so a seed count that is safe on a narrow
+        # panel is not safe on a wide one, and only the genes term is knowable
+        # here.
+        #
+        # Budget the gather at ~8 GiB assuming ~40 edges per seed (measured: the
+        # corpus graph gave ~38 at k=8+16 symmetrised), i.e.
+        #     seeds <= 8 GiB / (40 x genes x 4 B) ~= 5.0e7 / genes
+        # which is 5,222 at 9,574 genes and 10,105 at 4,948. Never RAISES the
+        # default -- only lowers it when the panel is wide enough to matter --
+        # and a smaller batch only costs extra passes, since predict is a single
+        # sweep. An explicit --predict-batch-size still wins.
+        _genes = config["model"].get("in_channels") or 0
+        if _genes:
+            _safe = max(512, min(65536, int(5.0e7 // int(_genes))))
+            _cur = int(config["datamodule"]["inference_params"].get(
+                "predict_batch_size", 65536) or 65536)
+            if _safe < _cur:
+                config["datamodule"]["inference_params"]["predict_batch_size"] = _safe
+                print(
+                    f"Predict: predict_batch_size {_cur} -> {_safe}, derived "
+                    f"from {_genes} genes. The 1-hop gather is "
+                    f"O(batch x degree x genes) and {_cur} seeds at this width "
+                    f"would ask for ~{_cur * 40 * int(_genes) * 4 / 2**30:.0f} "
+                    f"GiB. Pass --predict-batch-size to override."
+                )
 
     if silver_dir:
         silver_dir = Path(silver_dir)
