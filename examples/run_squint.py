@@ -39631,6 +39631,58 @@ def _build_clean_adata_from_inference(
     return adata
 
 
+def _derive_terra_split_map(section_rels, split_sections, pos_to_blob_id):
+    """
+    Map each predicted section's blob id to its TERRA split.
+
+    A streaming run records its split under `datamodule.split_sections` as REL
+    PATHS and leaves `train_transform_params.test_batches` empty, so predict's
+    `data_split` column -- derived from `test_batches` -- tags every cell
+    "train", held-out sections included. `compute_inference_metrics.py`
+    stratifies on that column, so held-out numbers get reported as training
+    numbers: silent, and in the flattering direction.
+
+    `validation` is kept SEPARATE from `test`. Both are held out from the
+    weights, but validation selected the checkpoint, so a generalisation claim
+    measured on it is not clean -- the corpus run's whole `unseen_assay` rung
+    (chr78 + shp75, 15 sections) lives in validation.
+
+    Parameters
+    ----------
+    section_rels
+        The blob's rel path per row, in row order (manifest v4).
+    split_sections
+        The saved config's `datamodule.split_sections`, keyed `val` / `test`.
+        Anything not named in either is train.
+    pos_to_blob_id
+        Blob row position -> `adata_batch_id`, for the predicted rows only.
+        These are NOT interchangeable: corpus ids were renumbered positionally
+        where the source `uns['batch']` counters collided.
+
+    Returns
+    -------
+    dict
+        `adata_batch_id` -> one of "train" / "validation" / "test".
+    """
+    rels = list(section_rels or [])
+    if not isinstance(split_sections, dict):
+        return {}
+    rel_to_split = {}
+    for key, name in (("val", "validation"), ("test", "test")):
+        for rel in (split_sections.get(key) or []):
+            rel_to_split[rel] = name
+    if not rel_to_split:
+        # Nothing held out was recorded. Return no map rather than a map that
+        # says "all train" -- absence of a split is not evidence of one, and
+        # predict only stamps `terra_split` when there is something to stamp.
+        return {}
+    out = {}
+    for pos, bid in (pos_to_blob_id or {}).items():
+        rel = rels[pos] if 0 <= pos < len(rels) else None
+        out[int(bid)] = rel_to_split.get(rel, "train")
+    return out
+
+
 def _resolve_checkpoint(run_dir, select: str) -> Optional[str]:
     """
     Turn a checkpoint SELECTION POLICY into a path.
@@ -39890,8 +39942,51 @@ def predict(
         silver_dir = Path(cfg_root) / "silver" / cfg_name
 
     # Sanity: list of .h5ad files (also used to label cells with their source).
-    source_paths = _infer_adata_files_in_dir(silver_dir)
-    print(f"Running inference on {len(source_paths)} file(s) under {silver_dir}:")
+    #
+    # When `--predict-sections` names the sections, those names ARE the source
+    # files -- resolve them directly instead of globbing a directory. Two
+    # reasons, both learned the hard way:
+    #
+    #   * `_infer_adata_files_in_dir` globs `*.h5ad` in ONE directory, not
+    #     recursively, so any rung spanning subdirs (the natural shape of a
+    #     TERRA split -- the cheapest test rung spans xhs1022-1/-2/-3) simply
+    #     cannot be expressed as a single `--silver-dir`.
+    #   * A directory glob and a section list are two independent statements of
+    #     the same thing, and when they disagreed the run died an hour in with
+    #     "Could not match blob adata_batch_ids". Deriving one from the other
+    #     removes the disagreement rather than diagnosing it.
+    #
+    # Rel paths resolve under the corpus silver root; a bare stem also resolves
+    # under a `--silver-dir` pointed at a single sub-dataset, so existing
+    # invocations keep working.
+    if predict_sections:
+        _root = Path(silver_dir)
+        _cand, _missing = [], []
+        for _rel in predict_sections:
+            _hit = None
+            for _try in (_root / _rel, _root / Path(_rel).name):
+                if _try.exists():
+                    _hit = _try
+                    break
+            if _hit is None:
+                _missing.append(_rel)
+            else:
+                _cand.append(_hit)
+        if _missing:
+            raise FileNotFoundError(
+                f"--predict-sections named {len(_missing)} section(s) with no "
+                f"silver file under {_root}: {_missing[:5]}"
+                f"{' ...' if len(_missing) > 5 else ''}. Point --silver-dir at "
+                f"the corpus silver root (the parent of the sub-dataset dirs) "
+                f"so rel paths resolve."
+            )
+        source_paths = _cand
+        print(f"Running inference on {len(source_paths)} named section(s) "
+              f"under {_root}:")
+    else:
+        source_paths = _infer_adata_files_in_dir(silver_dir)
+        print(f"Running inference on {len(source_paths)} file(s) under "
+              f"{silver_dir}:")
     for p in source_paths:
         print(f"  - {p.name}")
 
@@ -39983,11 +40078,18 @@ def predict(
         print(f"Predict restricted to {len(rows)} of {len(dataset_blob)} "
               f"sections.")
     if config["dataset"]["adata_batch_idx"] != _orig_idx:
+        _now = config["dataset"]["adata_batch_idx"]
+        # Say which of the two happened. Under `--predict-sections` this is a
+        # RESTRICTION, and calling it "expanding to all N sections" while
+        # printing 11 row ids sent me looking for a blob problem that was not
+        # there when the cell_id matching failed downstream.
+        _what = ("restricting to the named sections"
+                 if len(_now) < len(dataset_blob)
+                 else f"expanding to all {len(dataset_blob)} sections")
         print(
-            f"Predict: expanding adata_batch_idx {_orig_idx} -> "
-            f"all {len(dataset_blob)} sections "
-            f"{config['dataset']['adata_batch_idx']} so held-out sections "
-            f"are encoded and visible in downstream plots."
+            f"Predict: {_what}: adata_batch_idx {_orig_idx} -> "
+            f"{len(_now)} rows {_now if len(_now) <= 24 else str(_now[:24]) + ' ...'} "
+            f"so the intended sections are encoded and visible downstream."
         )
 
     # Try to load the canonical gene panel saved at blob-build time so we can
@@ -40019,16 +40121,30 @@ def predict(
               .get("train_batches", []) or []
     )
     _train_batch_ids_set = {int(b) for b in _train_batch_ids}
-    _train_labels: set = set()
-    for _pos in range(len(dataset_blob)):
-        _d = dataset_blob[_pos]
-        if int(_d.adata_batch_id) in _train_batch_ids_set:
-            grp = getattr(_d, "obs_batch", None)
-            if grp:
-                _train_labels.add(str(grp[0]))
-    _train_label_to_dense: dict = {
-        lbl: i for i, lbl in enumerate(sorted(_train_labels))
-    }
+
+    # A streaming blob already KNOWS the map training used, from its manifest
+    # (see the note below on why rebuilding it would be wrong). Ask first: the
+    # reconstruction scan below deserialises every section in the blob -- counts,
+    # edges and 128-dim Laplacian eigenvectors per graph -- to read one string
+    # from each, and on the corpus that is ~944 GB of I/O whose result is then
+    # thrown away in favour of the manifest map. Reconstruct only when there is
+    # no manifest map to reconstruct against.
+    _stream_map = None
+    if hasattr(dataset_blob, "batch_label_to_dense"):
+        _stream_map = dataset_blob.batch_label_to_dense() or None
+
+    _train_label_to_dense: dict = {}
+    if _stream_map is None:
+        _train_labels: set = set()
+        for _pos in range(len(dataset_blob)):
+            _d = dataset_blob[_pos]
+            if int(_d.adata_batch_id) in _train_batch_ids_set:
+                grp = getattr(_d, "obs_batch", None)
+                if grp:
+                    _train_labels.add(str(grp[0]))
+        _train_label_to_dense = {
+            lbl: i for i, lbl in enumerate(sorted(_train_labels))
+        }
 
     # ---- Streaming backend uses a DIFFERENT train-time map --------------------
     # The reconstruction above mirrors `build_batch_one_hot_from_obs`, which
@@ -40055,18 +40171,15 @@ def predict(
     #
     # Predict must reproduce whatever map training used, so read it from the
     # dataset for streaming blobs rather than reconstructing it.
-    if hasattr(dataset_blob, "batch_label_to_dense"):
-        _stream_map = dataset_blob.batch_label_to_dense()
-        if _stream_map and _stream_map != _train_label_to_dense:
-            print(
-                f"Predict: streaming blob -- using the manifest-wide "
-                f"label->dense map training actually used "
-                f"({len(_stream_map)} labels) instead of the "
-                f"train-sections-only reconstruction ({len(_train_label_to_dense)} "
-                f"labels). Rebuilding would shift every dense id and index the "
-                f"decoder covariate embedding on the wrong row."
-            )
-            _train_label_to_dense = dict(_stream_map)
+    if _stream_map is not None:
+        print(
+            f"Predict: streaming blob -- using the manifest-wide label->dense "
+            f"map training actually used ({len(_stream_map)} labels) rather "
+            f"than reconstructing it over train sections. Rebuilding would "
+            f"shift every dense id and index the decoder covariate embedding "
+            f"on the wrong row."
+        )
+        _train_label_to_dense = dict(_stream_map)
 
     if _train_label_to_dense:
         print(
@@ -40316,9 +40429,29 @@ def predict(
 
     # Step 1: read each blob section's first cell_id and adata_batch_id.
     # The blob has the canonical id assignments (whatever they are).
+    #
+    # Scan ONLY the sections being predicted. `adata_batch_idx` holds the blob
+    # row positions this predict call covers -- every row when unrestricted, and
+    # just the rung's rows under `--predict-sections`. Scanning all of them
+    # regardless is wrong on both counts:
+    #
+    #   * It cannot succeed. `source_paths` comes from `--silver-dir`, i.e. the
+    #     rung's 11 files, so the 625 sections outside the rung have nothing to
+    #     match against and the unmatched-ids guard below raises. That is what
+    #     killed the first scoped predict on the corpus: ids 21-31 (chr78)
+    #     matched fine, and the other 625 were reported as a silver/blob
+    #     mismatch that did not exist.
+    #   * It is not free. `dataset_blob[_pos]` fully deserialises a section --
+    #     counts, edges and Laplacian eigenvectors -- so an unscoped scan pays
+    #     636 section reads to use 11 of them.
+    _scan_positions = config["dataset"].get("adata_batch_idx")
+    if not _scan_positions:
+        _scan_positions = list(range(len(dataset_blob)))
     blob_id_to_first_cell: dict = {}
-    for _pos in range(len(dataset_blob)):
+    _pos_to_blob_id: dict = {}
+    for _pos in _scan_positions:
         _d = dataset_blob[_pos]
+        _pos_to_blob_id[int(_pos)] = int(_d.adata_batch_id)
         if hasattr(_d, "cell_id") and len(_d.cell_id) > 0:
             blob_id_to_first_cell[int(_d.adata_batch_id)] = str(_d.cell_id[0])
         else:
@@ -40387,6 +40520,50 @@ def predict(
               .get("test_batches", [])
         or []
     )
+
+    # ---- where the held-out sections actually are, on a streaming run -------
+    # `data_split` was derived from `test_batches`, which the in-memory backend
+    # sets. A streaming run does NOT: it records the split under
+    # `datamodule.split_sections` as REL PATHS, and leaves `test_batches` empty.
+    # The corpus run's saved config has `test_batches: None` and
+    # `train_batches: [0..635]`, so EVERY cell -- including the 219 genuinely
+    # held-out sections -- would be tagged `data_split="train"`, and
+    # `compute_inference_metrics.py`, which stratifies on that column, would
+    # report held-out numbers as training numbers. Silent, and exactly the
+    # direction that flatters a result.
+    #
+    # Note val and test are kept DISTINCT here. Both are held out from the
+    # weights, but validation is the model-SELECTION set -- it chose the
+    # checkpoint -- so a generalisation claim measured on it is not clean. The
+    # binary `data_split` keeps its meaning ("not trained on") for existing
+    # consumers, while `terra_split` carries the three-way truth.
+    _split_map: dict = {}
+    _sections_cfg = (config.get("datamodule", {}) or {}).get("split_sections")
+    if isinstance(_sections_cfg, dict) and hasattr(dataset_blob, "section_rels"):
+        _split_map = _derive_terra_split_map(
+            getattr(dataset_blob, "section_rels", None),
+            _sections_cfg,
+            _pos_to_blob_id,
+        )
+        # ONLY the test split. `compute_inference_metrics.py` documents that it
+        # folds val into "train" ("early-stopping val is in-distribution"), and
+        # tagging validation as test here would do the precise thing this block
+        # exists to prevent: report the checkpoint-SELECTION set as held out.
+        # The val/test distinction lives in `terra_split` instead.
+        _derived = [b for b, s in _split_map.items() if s == "test"]
+        if _derived and not test_batch_ids:
+            test_batch_ids = sorted(_derived)
+            _counts: dict = {}
+            for _sp in _split_map.values():
+                _counts[_sp] = _counts.get(_sp, 0) + 1
+            print(
+                f"Predict: `test_batches` is empty but `split_sections` is "
+                f"present -- deriving the split from it. Predicted sections by "
+                f"TERRA split: {_counts}. Blob ids tagged data_split='test' "
+                f"(TERRA test only; validation folds into 'train' per "
+                f"compute_inference_metrics.py, and is distinguished in "
+                f"obs['terra_split']): {test_batch_ids}"
+            )
     # Per-batch held-out regions (downstream gene-reconstruction task).
     # Read from the saved training config so predict()'s `data_split`
     # tagging matches what `SpatialBatchSplit` masked out at train time.
@@ -40408,6 +40585,25 @@ def predict(
     )
     adata.uns["squint"]["run_dir"] = run_dir
     adata.uns["squint"]["ckpt"] = str(config["model"]["model_ckpt_fname"])
+
+    # Three-way split, alongside the binary `data_split`. `validation` selected
+    # the checkpoint, so it is not interchangeable with `test` for a
+    # generalisation claim -- the whole `unseen_assay` rung (chr78 + shp75) sits
+    # in validation, and collapsing the two would let the selection set be
+    # reported as held-out.
+    if _split_map:
+        import pandas as _pd   # predict() has no module-level pandas in scope
+        _ids = adata.obs["adata_batch_id"].to_numpy()
+        adata.obs["terra_split"] = _pd.Categorical(
+            [_split_map.get(int(i), "train") for i in _ids],
+            categories=["train", "validation", "test"],
+        )
+        adata.uns["squint"]["terra_split_counts"] = {
+            k: int(v) for k, v in
+            adata.obs["terra_split"].value_counts().items()
+        }
+        print(f"Predict: terra_split cell counts = "
+              f"{adata.uns['squint']['terra_split_counts']}")
 
     # If the run was produced by the variant-aware layout, surface the variant
     # name + ablation description on the predicted AnnData so plotting scripts
