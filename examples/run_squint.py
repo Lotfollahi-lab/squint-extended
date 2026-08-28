@@ -39239,6 +39239,8 @@ def _build_clean_adata_from_inference(
     obs_per_batch_id: dict | None = None,
     obs_per_filename: dict | None = None,
     cross_panel: bool = False,
+    include_expression: bool = True,
+    keep_obs_cols: list | None = None,
 ) -> "ad.AnnData":
     """
     Build the predicted AnnData by starting from the source AnnDatas
@@ -39388,8 +39390,28 @@ def _build_clean_adata_from_inference(
                 f"silver file changed since the blob was built — rebuild."
             )
 
-        sub = source[src_rows].copy()
-        if gene_names is not None:
+        if not include_expression:
+            # EXPRESSION-FREE BUILD. Identification, integration and latent
+            # geometry read `obsm` and `obs` only -- never `.X`. Materialising
+            # it anyway is not a minor overhead on a cross-panel corpus: the
+            # widening below allocates a DENSE `np.zeros((n_obs, 9574))` per
+            # section, which is 3.9 TiB over the 112.6M-cell corpus and 590 GiB
+            # over the 219 held-out sections. Dropping it is the difference
+            # between 49 sharded jobs and one.
+            #
+            # An (n, 0) AnnData is legal and concatenates normally. `spatial`
+            # comes from `inference_data["XY_coordinates"]`, not from the
+            # source obsm, so nothing downstream loses a coordinate.
+            _obs = source.obs.iloc[src_rows].copy()
+            if keep_obs_cols is not None:
+                _obs = _obs[[c for c in _obs.columns if c in set(keep_obs_cols)]]
+            sub = ad.AnnData(obs=_obs, var=pd.DataFrame(index=pd.Index([])))
+        else:
+            sub = source[src_rows].copy()
+            if keep_obs_cols is not None:
+                sub.obs = sub.obs[[c for c in sub.obs.columns
+                                   if c in set(keep_obs_cols)]]
+        if include_expression and gene_names is not None:
             if list(sub.var_names) != list(gene_names):
                 missing = [g for g in gene_names if g not in set(sub.var_names)]
                 if missing and cross_panel:
@@ -39768,6 +39790,7 @@ def predict(
     ckpt_select: str | None = None,
     inference_cache_mode: str | None = None,
     predict_sections: Optional[List[str]] = None,
+    keep_obs_cols: Optional[List[str]] = None,
     output_dir: str | None = None,
     precision: Optional[str] = None,
     strategy: Optional[str] = None,
@@ -40585,6 +40608,20 @@ def predict(
               .get("train_transform_params", {})
               .get("test_regions", None)
     )
+    # Expression is only ever read by the reconstruction metrics, which need
+    # the `X_hat*` layers -- and those layers exist only in `full` mode. So in
+    # `codes` / `codes+latents` the widened `.X` is written and never read.
+    # On the cross-panel corpus that is not a rounding error: a dense
+    # zero-filled `.X` at the 9,574-gene vocabulary is 590 GiB over the 219
+    # held-out sections and 3.9 TiB over all 636.
+    _cache_mode = str(config.get("model", {}).get("inference_cache_mode")
+                      or "full")
+    _include_expr = (_cache_mode == "full")
+    if not _include_expr:
+        print(f"Predict: inference_cache_mode='{_cache_mode}' -- building "
+              f"WITHOUT expression. `.X` and the gene-width layers are absent; "
+              f"identification / integration / latent geometry read obsm and "
+              f"obs only. Reconstruction metrics will be skipped.")
     adata = _build_clean_adata_from_inference(
         inference_data=predict_data_dict,
         source_adatas=source_adatas,
@@ -40594,10 +40631,30 @@ def predict(
         test_regions=test_regions,
         # Narrow sections legitimately lack part of the vocabulary; reindex
         # with zero fill instead of demanding every gene be present.
-        cross_panel=bool(getattr(dataset_blob, 'cross_panel', False))
+        cross_panel=bool(getattr(dataset_blob, 'cross_panel', False)),
+        include_expression=_include_expr,
+        keep_obs_cols=keep_obs_cols,
     )
     adata.uns["squint"]["run_dir"] = run_dir
     adata.uns["squint"]["ckpt"] = str(config["model"]["model_ckpt_fname"])
+
+    # Codebook geometry, so post-hoc utilisation has a denominator without
+    # re-reading the training config. RVQ stores one index column per level,
+    # and the levels have DIFFERENT sizes here ([30, 90]) -- a single scalar
+    # would silently mis-normalise level 1.
+    _enc = (config.get("model", {}) or {}).get("encoder_params", {}) or {}
+    _cb = {}
+    for _branch, _key in (("cell", "vq_cell_params"), ("niche", "vq_niche_params")):
+        _pr = _enc.get(_key) or {}
+        _sz = _pr.get("codebook_size")
+        if _sz is None:
+            continue
+        _nq = int(_pr.get("num_quantizers", 1) or 1)
+        _cb[_branch] = ([int(s) for s in _sz] if isinstance(_sz, (list, tuple))
+                        else [int(_sz)] * _nq)
+    if _cb:
+        adata.uns["squint"]["codebook_sizes"] = _cb
+        print(f"Predict: codebook sizes {_cb}")
 
     # Three-way split, alongside the binary `data_split`. `validation` selected
     # the checkpoint, so it is not interchangeable with `test` for a
@@ -41421,6 +41478,14 @@ def main():
                         "folder used for training).")
     p.add_argument("--model-ckpt-fname", type=str, default=None,
                    help="Explicit path to a .ckpt. Wins over --ckpt-select.")
+    p.add_argument("--keep-obs-cols", type=str, nargs="*", default=None,
+                   help="Restrict predicted obs to these columns (plus the "
+                        "ones predict stamps itself). `ad.concat(join=\"outer\")` "
+                        "materialises the UNION of obs columns across sections, "
+                        "and the corpus carries 127+ distinct label columns "
+                        "alone, most NaN for most cells -- at 20M cells that "
+                        "union costs tens of GiB for columns no metric reads. "
+                        "Pass the label keys the metrics actually use.")
     p.add_argument("--predict-sections", type=str, nargs="*", default=None,
                    help=(
                        "Restrict predict to these sections, by relative path "
@@ -41741,6 +41806,7 @@ def main():
             ckpt_select=args.ckpt_select,
             inference_cache_mode=args.inference_cache_mode,
             predict_sections=args.predict_sections,
+            keep_obs_cols=args.keep_obs_cols,
             output_dir=args.output_dir,
             predict_batch_size=args.predict_batch_size,
         )

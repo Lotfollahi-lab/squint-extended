@@ -642,6 +642,39 @@ def compute_avg_cosine(emb: np.ndarray) -> float:
 # Main
 # ---------------------------------------------------------------------------
 
+def resolve_split_masks(adata) -> "List[Tuple[str, np.ndarray]]":
+    """
+    (name, boolean mask) per split to report separately, plus "all".
+
+    Prefers `obs['terra_split']` (train / validation / test), which predict
+    stamps from the training config's `split_sections`, and falls back to the
+    binary `obs['data_split']`. The two are NOT the same question: validation
+    is held out from the weights but SELECTED the checkpoint, so a
+    generalisation number measured on it is not clean, and `data_split` folds
+    it into "train" by project convention.
+
+    Integration and latent-geometry metrics were previously pooled over every
+    cell in the object. Pooling is actively misleading here: on a corpus run
+    the object mixes 96M training cells with 16.5M held-out ones, and a single
+    iLISI/MMD/avg-cosine number over that mixture describes neither.
+
+    Splits with fewer than 2 cells are dropped -- every metric here needs a
+    pair at minimum, and several need far more.
+    """
+    n = adata.n_obs
+    out = [("all", np.ones(n, dtype=bool))]
+    key = ("terra_split" if "terra_split" in adata.obs.columns
+           else ("data_split" if "data_split" in adata.obs.columns else None))
+    if key is None:
+        return out
+    vals = adata.obs[key].astype(str).to_numpy()
+    for name in sorted(set(vals)):
+        mask = vals == name
+        if int(mask.sum()) >= 2:
+            out.append((f"{key}={name}" if key != "terra_split" else name, mask))
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -720,6 +753,13 @@ def main() -> None:
         help="For >2 batches, MMD = mean over batch pairs. Cap the number of "
              "pairs sampled (0 = all pairs). Use for datasets with many "
              "batches (e.g. smb1-20b: 20 batches = 190 pairs).",
+    )
+    ap.add_argument(
+        "--codebook-sizes", type=int, nargs="*", default=None,
+        help="Codebook size per RVQ level, e.g. `--codebook-sizes 30 90`. "
+             "Normally read from uns['squint']['codebook_sizes'], which "
+             "predict stamps; pass this for predicted_adata files that "
+             "predate that.",
     )
     ap.add_argument(
         "--seed", type=int, default=0,
@@ -899,21 +939,31 @@ def main() -> None:
               f"skipping all batch integration metrics")
         batch_int_df = pd.DataFrame()
     else:
-        batch = adata.obs[args.batch_key].to_numpy()
+        _batch_all = adata.obs[args.batch_key].to_numpy()
         # iLISI / silhouette / MMD all want a 1D label vector — coerce strings.
-        if batch.dtype.kind not in ("i", "u"):
-            batch = np.asarray([str(b) for b in batch])
+        if _batch_all.dtype.kind not in ("i", "u"):
+            _batch_all = np.asarray([str(b) for b in _batch_all])
         rows = []
-        for emb_key in emb_keys:
+        # Per split, not pooled. A corpus run's object mixes 96M training cells
+        # with 16.5M held-out ones; a single iLISI/ASW/MMD over that mixture
+        # describes neither. Flattened into one loop so the metric bodies below
+        # keep their original nesting.
+        _jobs = [(s, m, e) for s, m in resolve_split_masks(adata)
+                 for e in emb_keys]
+        for _split, _mask, emb_key in _jobs:
             if emb_key not in adata.obsm:
                 continue
-            emb = np.asarray(adata.obsm[emb_key])
+            emb = np.asarray(adata.obsm[emb_key])[_mask]
             if emb.dtype not in (np.float32, np.float64):
                 emb = emb.astype(np.float32)
             if emb.ndim != 2 or emb.shape[1] == 0:
                 print(f"  [{emb_key}] not a 2D embedding (shape={emb.shape}); skipping")
                 continue
-            print(f"  [{emb_key}]")
+            batch = _batch_all[_mask]
+            if len(np.unique(batch)) < 2:
+                print(f"  [{emb_key}] split={_split}: <2 batches present; skipping")
+                continue
+            print(f"  [{emb_key}] split={_split}  ({int(_mask.sum()):,} cells)")
 
             # iLISI builds a FULL kNN graph (no internal subsampling) — it OOMs
             # on large sections and, being un-guarded, would kill the whole
@@ -952,13 +1002,13 @@ def main() -> None:
             )
 
             if ilisi is not None:
-                rows.append({"emb_key": emb_key, "metric": "iLISI", "score": ilisi})
+                rows.append({"split": _split, "emb_key": emb_key, "metric": "iLISI", "score": ilisi})
                 print(f"    iLISI = {ilisi:.4f}")
             if asw is not None:
-                rows.append({"emb_key": emb_key, "metric": "ASW",   "score": asw})
+                rows.append({"split": _split, "emb_key": emb_key, "metric": "ASW",   "score": asw})
                 print(f"    ASW   = {asw:.4f}")
             if mmd is not None:
-                rows.append({"emb_key": emb_key, "metric": "MMD",   "score": mmd})
+                rows.append({"split": _split, "emb_key": emb_key, "metric": "MMD",   "score": mmd})
                 print(f"    MMD   = {mmd:.4f}")
         batch_int_df = pd.DataFrame(rows)
         if not batch_int_df.empty:
@@ -968,18 +1018,108 @@ def main() -> None:
         else:
             print("  (no embeddings produced batch integration scores)")
 
+    # ------------------------------------------------- Codebook utilisation
+    #
+    # How much of the codebook the model actually uses. Reported per split, per
+    # branch, per RVQ level -- the levels have DIFFERENT sizes ([30, 90] on the
+    # corpus run), so one scalar denominator would mis-state level 1 by 3x.
+    #
+    # Two numbers, answering different questions. `utilisation` is the fraction
+    # of codes used at least once: it catches hard collapse but saturates, so
+    # 30/30 looks perfect whether the mass is uniform or 99% on one code.
+    # `perplexity_norm` is exp(entropy) over the code distribution divided by
+    # codebook size -- EFFECTIVE usage, which does not saturate. High
+    # utilisation with low perplexity is a codebook that is nominally alive and
+    # functionally narrow, and only the second number shows it.
+    print("\n=== Codebook utilisation ===")
+    try:
+        _sizes = dict((adata.uns.get("squint", {}) or {}).get("codebook_sizes", {}))
+    except Exception:
+        _sizes = {}
+    if getattr(args, "codebook_sizes", None):
+        _flat = [int(s) for s in args.codebook_sizes]
+        _sizes = {"cell": _flat, "niche": _flat}
+        print(f"  codebook sizes from --codebook-sizes: {_flat}")
+    elif _sizes:
+        print(f"  codebook sizes from uns['squint']: {_sizes}")
+    else:
+        print("  no codebook sizes available -- reporting codes used, "
+              "but no utilisation fraction")
+
+    _cb_rows = []
+    for _split, _mask in resolve_split_masks(adata):
+        for _branch, _obsm_key in (("cell", "cell_code_indices"),
+                                   ("niche", "neighborhood_code_indices")):
+            if _obsm_key not in adata.obsm:
+                continue
+            idx = np.asarray(adata.obsm[_obsm_key])[_mask]
+            if idx.ndim == 1:
+                idx = idx[:, None]
+            # NB `_sizes[branch]` comes back from `uns` as a numpy ARRAY, and
+            # `array or []` raises "truth value ... is ambiguous". Explicit
+            # None check, not truthiness.
+            _s = _sizes.get(_branch)
+            sizes = [] if _s is None else [int(v) for v in _s]
+            for lvl in range(idx.shape[1]):
+                vals, cnts = np.unique(idx[:, lvl], return_counts=True)
+                pk = cnts / cnts.sum()
+                ent = float(-(pk * np.log(pk)).sum())
+                size = int(sizes[lvl]) if lvl < len(sizes) else None
+                _cb_rows.append({
+                    "split": _split, "branch": _branch, "level": lvl,
+                    "n_cells": int(_mask.sum()),
+                    "codebook_size": size,
+                    "n_codes_used": int(vals.size),
+                    "utilisation": (float(vals.size / size) if size else None),
+                    "perplexity": float(np.exp(ent)),
+                    "perplexity_norm": (float(np.exp(ent) / size) if size else None),
+                })
+            if idx.shape[1] > 1:
+                comp = np.unique(idx, axis=0)
+                total = (int(np.prod(sizes)) if len(sizes) == idx.shape[1] else None)
+                _cb_rows.append({
+                    "split": _split, "branch": _branch, "level": "composite",
+                    "n_cells": int(_mask.sum()),
+                    "codebook_size": total,
+                    "n_codes_used": int(comp.shape[0]),
+                    "utilisation": (float(comp.shape[0] / total) if total else None),
+                    "perplexity": None, "perplexity_norm": None,
+                })
+    cb_df = pd.DataFrame(_cb_rows)
+    if not cb_df.empty:
+        for _, r in cb_df.iterrows():
+            # None becomes NaN going through the DataFrame, and `NaN is not
+            # None` is True -- so test for both or composite rows print "nan".
+            def _fmt(v):
+                return "  n/a" if v is None or pd.isna(v) else f"{v:.3f}"
+            u, pn = _fmt(r["utilisation"]), _fmt(r["perplexity_norm"])
+            print(f"  split={str(r['split']):<12} {r['branch']:<6} "
+                  f"level={str(r['level']):<9} used={r['n_codes_used']:>5} / "
+                  f"{str(r['codebook_size']):>5}  util={u}  pplx_norm={pn}")
+        csv = out_dir / "codebook_utilisation.csv"
+        cb_df.to_csv(csv, index=False)
+        print(f"  -> {csv}")
+    else:
+        print("  (no code indices in obsm)")
+
     # ----------------------------------------------- Average cosine similarity
     print("\n=== Average cosine similarity ===")
     rows = []
-    for emb_key in emb_keys:
+    # Per split too. This is the latent-anisotropy read-out -- average pairwise
+    # cosine over the embedding -- and it is the measure that showed the corpus
+    # run's cell latent narrowing from 0.157 to 0.368 between step 40,000 and
+    # 200,000. Pooling train and held-out cells would blur exactly that.
+    _cjobs = [(s, m, e) for s, m in resolve_split_masks(adata) for e in emb_keys]
+    for _split, _mask, emb_key in _cjobs:
         if emb_key not in adata.obsm:
             continue
-        emb = np.asarray(adata.obsm[emb_key])
+        emb = np.asarray(adata.obsm[emb_key])[_mask]
         if emb.ndim != 2 or emb.shape[1] == 0:
             continue
         avg_cos = compute_avg_cosine(emb)
-        print(f"  [{emb_key}] avg_cos = {avg_cos:.4f}")
-        rows.append({"emb_key": emb_key, "avg_cosine_similarity": avg_cos})
+        print(f"  [{emb_key}] split={_split} avg_cos = {avg_cos:.4f}")
+        rows.append({"split": _split, "emb_key": emb_key,
+                     "avg_cosine_similarity": avg_cos})
     cos_df = pd.DataFrame(rows)
     if not cos_df.empty:
         csv = out_dir / "avg_cosine_similarity.csv"
@@ -996,6 +1136,7 @@ def main() -> None:
         "niche_identification_metrics":     nmi_ari_df.to_dict(orient="records"),
         "pearson_reconstruction_metrics":   pearson_df.to_dict(orient="records"),
         "batch_integration_metrics":        batch_int_df.to_dict(orient="records"),
+        "codebook_utilisation":             cb_df.to_dict(orient="records"),
         "avg_cosine_similarity":            cos_df.to_dict(orient="records"),
     }
     summary_path = out_dir / "analysis_summary.json"
