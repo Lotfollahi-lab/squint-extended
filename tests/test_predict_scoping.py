@@ -260,3 +260,48 @@ def test_only_terra_test_becomes_data_split_test(driver):
         "would be reported as held-out test"
     )
     assert 's != "train"' not in window
+
+
+# --------------------------------------------------------------------------- #
+# The snapshot: the predict loader's split_sections is NOT the training split
+# --------------------------------------------------------------------------- #
+
+def test_the_training_split_is_snapshotted_before_it_is_overwritten():
+    """
+    `--predict-sections` sets `split_sections = {"predict": [...]}` for the
+    loader, which DESTROYS the saved {val, test} record. The first corpus run
+    did exactly that and shipped a predicted_adata with no `terra_split` and
+    every held-out cell tagged "train" -- the derivation was correct and had
+    nothing left to derive from.
+
+    Ordering is the whole fix, so assert the ordering.
+    """
+    src = DRIVER.read_text()
+    snap = src.index("_saved_split_sections = dict(")
+    overwrite = src.index('["split_sections"] = {\n            "predict"')
+    use = src.index("_sections_cfg = _saved_split_sections")
+    assert snap < overwrite, (
+        "the training split is snapshotted after the predict loader overwrites "
+        "it -- the snapshot would capture {'predict': [...]}"
+    )
+    assert overwrite < use
+
+
+def test_the_split_derivation_does_not_read_the_live_config():
+    """
+    Reading `config['datamodule']['split_sections']` at derivation time gets the
+    loader's `{"predict": [...]}`, not the training split.
+    """
+    src = DRIVER.read_text()
+    i = src.index("_sections_cfg = ")
+    line = src[i:src.index("\n", i)]
+    assert "_saved_split_sections" in line, line
+    assert "config" not in line, line
+
+
+def test_predict_sections_still_scopes_the_loader():
+    """The snapshot must not change what the loader is told to load."""
+    src = DRIVER.read_text()
+    i = src.index('["split_sections"] = {\n            "predict"')
+    window = src[i:i + 200]
+    assert '"predict": list(predict_sections)' in window

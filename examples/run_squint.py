@@ -40048,6 +40048,13 @@ def predict(
     _orig_idx = list(config["dataset"].get("adata_batch_idx", []))
     config["dataset"]["adata_batch_idx"] = list(range(len(dataset_blob)))
 
+    # The training split, as saved. Kept separate from the live
+    # `datamodule.split_sections`, which the block below repurposes for the
+    # predict loader.
+    _saved_split_sections = dict(
+        (config.get("datamodule") or {}).get("split_sections") or {}
+    )
+
     # ---- restrict predict to NAMED SECTIONS ---------------------------------
     # Without this, predict runs over EVERY section in the blob -- 636 sections
     # and 112,578,039 cells on the corpus, which at `full` cache mode is ~17 TB.
@@ -40071,6 +40078,12 @@ def predict(
                 "(`section_rels`); this run's blob cannot address rows by name."
             )
         rows = dataset_blob.section_rows_for(list(predict_sections))
+        # NB `_saved_split_sections` was captured ABOVE, before this line
+        # destroys the {val, test} record. The loader needs
+        # `split_sections == {"predict": [...]}` and nothing else, but that
+        # record is what `data_split` / `terra_split` are derived from -- the
+        # first attempt overwrote it and produced a predicted_adata with no
+        # `terra_split` at all and every held-out cell tagged "train".
         config.setdefault("datamodule", {})["split_sections"] = {
             "predict": list(predict_sections)
         }
@@ -40538,7 +40551,7 @@ def predict(
     # binary `data_split` keeps its meaning ("not trained on") for existing
     # consumers, while `terra_split` carries the three-way truth.
     _split_map: dict = {}
-    _sections_cfg = (config.get("datamodule", {}) or {}).get("split_sections")
+    _sections_cfg = _saved_split_sections
     if isinstance(_sections_cfg, dict) and hasattr(dataset_blob, "section_rels"):
         _split_map = _derive_terra_split_map(
             getattr(dataset_blob, "section_rels", None),
