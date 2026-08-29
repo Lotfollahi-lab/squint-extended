@@ -1210,6 +1210,18 @@ class VQNiche_Dual(BaseModel):
         if cache_dict is getattr(self, 'test_inference_data_cache',  None) and test_metrics_empty:
             return cache_dict
 
+        # `inference_cache_mode` prunes `self.cache_keys`, and both the
+        # persistent caches and the fresh local dict are built FROM that list --
+        # so a dropped key is simply absent here. Appending to it unconditionally
+        # raised `KeyError: 'X'` on the first run where the mode actually took
+        # effect. Route every mode-optional key through this.
+        def _put(key, value):
+            lst = cache_dict.get(key)
+            if lst is not None:
+                lst.append(value)
+
+        _want_nbr = ('X_nbr' in cache_dict) or ('X_hat_nbr' in cache_dict)
+
         # ---- niche-branch aggregations (X_nbr, X_hat_nbr) -------------------
         # Three branches, in order of cheapest first:
         #   (a) caller passed them in -> append directly.
@@ -1217,7 +1229,14 @@ class VQNiche_Dual(BaseModel):
         #       _step) -> fall back to one aggregation call here.
         #   (c) neither is available (test_step, predict_step) -> ONE
         #       fused aggregation on stacked [X, xhat_niche], split.
-        if X_nbr_cached is not None and X_hat_nbr_cached is not None:
+        if not _want_nbr:
+            # Neither neighbour product is cached in this mode, and the
+            # aggregation below is the single most expensive thing here: the
+            # gather materialises [n_edges, n_genes], which at 9,574 genes is
+            # what forced `--predict-batch-size` down after a 89.23 GiB CUDA
+            # OOM. Not computing it is worth more than not storing it.
+            x_nbr_out = x_hat_nbr_out = None
+        elif X_nbr_cached is not None and X_hat_nbr_cached is not None:
             x_nbr_out      = X_nbr_cached
             x_hat_nbr_out  = X_hat_nbr_cached
         else:
@@ -1233,8 +1252,8 @@ class VQNiche_Dual(BaseModel):
             x_hat_nbr_out = stacked_nbr[:, n_genes_x:]
 
         # ---- inputs / context ------------------------------------------------
-        cache_dict['X'].append(batch.x[:batch_size])
-        cache_dict['X_nbr'].append(x_nbr_out)
+        _put('X', batch.x[:batch_size])
+        _put('X_nbr', x_nbr_out)
         # Optional one-hot label tensors (named y_*) — propagate as-is
         # (matches the convention used in VQNiche._cache_inference_data).
         for key in batch.keys():
@@ -1272,15 +1291,15 @@ class VQNiche_Dual(BaseModel):
             cache_dict['obs_row_index'].append(batch.obs_row_index[:batch_size])
 
         # ---- cell branch -----------------------------------------------------
-        cache_dict['H_latent_cell'].append(z_mlp[:batch_size])
-        cache_dict['H_quantized_cell'].append(z_q_cell[:batch_size])
+        _put('H_latent_cell', z_mlp[:batch_size])
+        _put('H_quantized_cell', z_q_cell[:batch_size])
         cache_dict['Indices_cell'].append(idx_cell[:batch_size])
-        cache_dict['X_hat'].append(xhat_cell[:batch_size])
+        _put('X_hat', xhat_cell[:batch_size])
 
         # ---- niche branch ----------------------------------------------------
-        cache_dict['H_latent_niche'].append(z_gnn[:batch_size])
-        cache_dict['H_quantized_niche'].append(z_q_niche[:batch_size])
+        _put('H_latent_niche', z_gnn[:batch_size])
+        _put('H_quantized_niche', z_q_niche[:batch_size])
         cache_dict['Indices_niche'].append(idx_niche[:batch_size])
-        cache_dict['X_hat_nbr'].append(x_hat_nbr_out)
+        _put('X_hat_nbr', x_hat_nbr_out)
 
         return cache_dict

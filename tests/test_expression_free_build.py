@@ -306,3 +306,95 @@ def test_gene_width_caches_dominate_the_memory_at_corpus_width():
     assert gene_width / latents > 30
     # per-shard, at the 3.5M-cell budget
     assert 3.5e6 * gene_width / 2**30 > 480      # GiB of pure waste
+
+
+# --------------------------------------------------------------------------- #
+# the cache WRITER has to respect the pruned key set too
+# --------------------------------------------------------------------------- #
+
+MODEL = ROOT / "src" / "vqniche" / "models" / "vqniche_dual.py"
+
+
+def test_mode_optional_keys_are_written_through_a_guard():
+    """
+    `_init_inference_data_caches` prunes `self.cache_keys`, and both the
+    persistent caches and predict's fresh local dict are built FROM that list.
+    `_cache_inference_data` appended to the pruned keys anyway:
+
+        KeyError: 'X'   (vqniche_dual.py:1236, predict_step)
+
+    which only appeared once the mode fix (43b4d0e) made the pruning real --
+    every earlier run silently cached at full width. Both halves are needed:
+    stamping the mode, and honouring it at the write site.
+    """
+    src = MODEL.read_text()
+    for key in ("X", "X_nbr", "X_hat", "X_hat_nbr", "H_latent_cell",
+                "H_quantized_cell", "H_latent_niche", "H_quantized_niche"):
+        assert f"cache_dict['{key}'].append" not in src, (
+            f"{key} is still appended unconditionally; it raises KeyError in "
+            f"any mode that drops it"
+        )
+        assert f"_put('{key}'," in src, f"{key} is not routed through _put"
+
+
+def test_the_guard_skips_rather_than_creating_the_key():
+    """
+    `_put` must not resurrect a key the mode deliberately dropped -- that would
+    reinstate the 149.6 kB/cell this exists to avoid, just later.
+    """
+    src = MODEL.read_text()
+    i = src.index("def _put(key, value):")
+    body = src[i:i + 220]
+    assert "cache_dict.get(key)" in body
+    assert "setdefault" not in body and "cache_dict[key] = []" not in body
+
+
+def test_the_neighbour_gather_is_skipped_when_neither_product_is_cached():
+    """
+    The aggregation is the most expensive step in this function -- the gather
+    materialises [n_edges, n_genes], which is what produced the 89.23 GiB CUDA
+    OOM at the corpus vocabulary. In `codes` / `codes+latents` neither output is
+    kept, so it should not run at all.
+    """
+    src = MODEL.read_text()
+    assert "_want_nbr = ('X_nbr' in cache_dict) or ('X_hat_nbr' in cache_dict)" in src
+    i = src.index("_want_nbr =")
+    j = src.index("aggregate_1hop_neighbor_features", i)
+    between = src[i:j]
+    assert "if not _want_nbr:" in between, (
+        "the gather runs before the guard -- the cost is paid regardless"
+    )
+
+
+def _simulate_put(cache_keys, writes):
+    """The _put contract, on the real key sets."""
+    cache = {k: [] for k in cache_keys}
+    for k, v in writes:
+        lst = cache.get(k)
+        if lst is not None:
+            lst.append(v)
+    return cache
+
+
+@pytest.mark.parametrize("mode,expect_kept", [
+    ("full", 12), ("codes+latents", 8), ("codes", 4),
+])
+def test_put_never_raises_for_any_mode(mode, expect_kept):
+    ALL = ["X", "X_nbr", "X_hat", "X_hat_nbr",
+           "H_latent_cell", "H_quantized_cell",
+           "H_latent_niche", "H_quantized_niche",
+           "XY_coordinates", "adata_batch_ids",
+           "Indices_cell", "Indices_niche"]
+    GENE_WIDTH = {"X", "X_nbr", "X_hat", "X_hat_nbr"}
+    LATENTS = {"H_latent_cell", "H_quantized_cell",
+               "H_latent_niche", "H_quantized_niche"}
+    drop = set()
+    if mode == "codes":
+        drop = GENE_WIDTH | LATENTS
+    elif mode == "codes+latents":
+        drop = GENE_WIDTH
+    keys = [k for k in ALL if k not in drop]
+    assert len(keys) == expect_kept
+    cache = _simulate_put(keys, [(k, 1) for k in ALL])   # writer attempts all
+    assert set(cache) == set(keys), "a dropped key came back"
+    assert all(len(v) == 1 for v in cache.values())
