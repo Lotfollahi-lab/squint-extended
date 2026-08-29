@@ -226,3 +226,83 @@ def test_the_ambiguous_truth_value_pattern_is_gone_everywhere_in_that_block():
     # the replacement, on the same value
     assert ([] if arr is None else [int(v) for v in arr]) == [30, 90]
     assert ([] if None is None else "unreachable") == []
+
+
+# --------------------------------------------------------------------------- #
+# --inference-cache-mode has to reach the model
+# --------------------------------------------------------------------------- #
+
+def test_predict_stamps_the_cache_mode_onto_the_loaded_model():
+    """
+    `initialize_model` is what sets `inference_cache_mode` and rebuilds the
+    caches (initialize.py:947-952). Predict does NOT call it -- it goes straight
+    to `Model.load_from_checkpoint`, so the flag was a no-op and the model kept
+    caching at `full`.
+
+    Invisible while every run passed `full`. The first `codes+latents` run
+    cached all four gene-width keys anyway and died assigning them to the
+    expression-free AnnData:
+
+        ValueError: Value passed for key 'X_hat' is of incorrect shape.
+        Value had shape (444251, 9574) while it should have had (444251, 0)
+
+    The silent half was the expensive one: 4 x 37.4 kB/cell of tensors the job
+    had asked not to build, which is most of why four sharded elements hit a
+    700 GB limit.
+    """
+    src = DRIVER.read_text()
+    i = src.index("model = Model.load_from_checkpoint(")
+    w = src[i:i + 1800]
+    assert 'model.inference_cache_mode = str(_mode)' in w, (
+        "the cache mode is never stamped on the model predict actually uses"
+    )
+    assert "model._init_inference_data_caches()" in w, (
+        "stamping the attribute is not enough -- the caches were already built "
+        "by __init__ and must be rebuilt for the mode to take effect"
+    )
+    assert w.index('model.inference_cache_mode') < w.index("model.eval()")
+
+
+def test_an_unsupported_model_refuses_rather_than_caching_at_full_width():
+    src = DRIVER.read_text()
+    i = src.index("model = Model.load_from_checkpoint(")
+    w = src[i:i + 1800]
+    assert "Refusing rather than" in w, (
+        "a model without `_init_inference_data_caches` must raise, not silently "
+        "ignore the flag -- that is precisely the failure this fixes"
+    )
+
+
+@pytest.mark.parametrize("mode,drops_gene_width,drops_latents", [
+    ("full", False, False),
+    ("codes+latents", True, False),
+    ("codes", True, True),
+])
+def test_the_documented_drop_sets(mode, drops_gene_width, drops_latents):
+    """
+    Verified against the real corpus checkpoint: 12 cache keys ->
+    8 for codes+latents (X, X_nbr, X_hat, X_hat_nbr dropped) and
+    4 for codes (those plus the four H_* latents).
+    """
+    GENE_WIDTH = {"X", "X_nbr", "X_hat", "X_hat_nbr"}
+    LATENTS = {"H_latent_cell", "H_quantized_cell",
+               "H_latent_niche", "H_quantized_niche"}
+    drop = set()
+    if mode == "codes":
+        drop = GENE_WIDTH | LATENTS
+    elif mode in ("codes+latents", "codes_latents"):
+        drop = GENE_WIDTH
+    assert bool(GENE_WIDTH & drop) is drops_gene_width
+    assert bool(LATENTS & drop) is drops_latents
+
+
+def test_gene_width_caches_dominate_the_memory_at_corpus_width():
+    """
+    Why the no-op was costly rather than merely untidy, at V=9,574.
+    """
+    V = 9574
+    gene_width = 4 * V * 4
+    latents = 4 * 256 * 4
+    assert gene_width / latents > 30
+    # per-shard, at the 3.5M-cell budget
+    assert 3.5e6 * gene_width / 2**30 > 480      # GiB of pure waste

@@ -40285,6 +40285,35 @@ def predict(
 
     Model = set_model_class(config["model"]["model_name"])
     model = Model.load_from_checkpoint(config["model"]["model_ckpt_fname"])
+
+    # `--inference-cache-mode` was a NO-OP here. `initialize_model` is what
+    # stamps the attribute and rebuilds the caches (initialize.py:947-952), and
+    # predict does not call it -- it goes straight to `load_from_checkpoint`,
+    # so the model kept its default `full` no matter what the flag said.
+    #
+    # Nothing showed while every run passed `full`. The first `codes+latents`
+    # run cached all four gene-width keys anyway and then died assigning them
+    # to the expression-free AnnData:
+    #
+    #     ValueError: Value passed for key 'X_hat' is of incorrect shape ...
+    #     Value had shape (444251, 9574) while it should have had (444251, 0)
+    #
+    # which is the flag's absence surfacing as a shape error two stages later.
+    # The silent half was worse: those caches are 4 x 37.4 kB per cell, so the
+    # sharded jobs were carrying ~150 kB/cell of tensors they had explicitly
+    # asked not to build, and four of them hit the 700 GB memory limit.
+    _mode = config.get("model", {}).get("inference_cache_mode")
+    if _mode:
+        model.inference_cache_mode = str(_mode)
+        if hasattr(model, "_init_inference_data_caches"):
+            model._init_inference_data_caches()
+        else:
+            raise RuntimeError(
+                f"--inference-cache-mode={_mode!r} was requested but "
+                f"{type(model).__name__} has no `_init_inference_data_caches`, "
+                f"so the mode cannot take effect. Refusing rather than "
+                f"silently caching at full width."
+            )
     model.eval()
 
     # Resolve optimization overrides. Each kwarg defaults to the legacy
