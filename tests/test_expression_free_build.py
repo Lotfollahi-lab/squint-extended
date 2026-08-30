@@ -159,9 +159,7 @@ def test_utilisation_normalises_each_rvq_level_by_its_own_size():
     The levels are [30, 90]. One scalar denominator would report level 1 as
     3x its true utilisation.
     """
-    src = METRICS.read_text()
-    i = src.index("=== Codebook utilisation ===")
-    w = src[i:i + 3000]
+    w = _metrics_section("Codebook utilisation")
     assert "sizes[lvl]" in w, "per-level size lookup missing"
     assert '"utilisation": (float(vals.size / size) if size else None)' in w
 
@@ -171,9 +169,7 @@ def test_utilisation_reports_perplexity_too():
     Fraction-used saturates: 30/30 looks perfect whether the mass is uniform
     or 99% on one code. exp(entropy) does not.
     """
-    src = METRICS.read_text()
-    i = src.index("=== Codebook utilisation ===")
-    w = src[i:i + 3000]
+    w = _metrics_section("Codebook utilisation")
     assert "perplexity_norm" in w and "np.exp(ent)" in w
 
 
@@ -191,9 +187,7 @@ def test_perplexity_separates_uniform_from_concentrated_usage():
 
 
 def test_no_size_means_no_fraction_rather_than_a_guessed_one():
-    src = METRICS.read_text()
-    i = src.index("=== Codebook utilisation ===")
-    w = src[i:i + 3000]
+    w = _metrics_section("Codebook utilisation")
     assert "if size else None" in w, (
         "utilisation must be None when the codebook size is unknown, not "
         "normalised by a guess"
@@ -315,6 +309,22 @@ def test_gene_width_caches_dominate_the_memory_at_corpus_width():
 MODEL = ROOT / "src" / "vqniche" / "models" / "vqniche_dual.py"
 
 
+def _metrics_section(name: str) -> str:
+    """
+    Source of one `=== <name> ===` block in compute_inference_metrics.
+
+    Sliced to the NEXT section marker rather than a fixed character count --
+    fixed windows made three of these tests fail when a comment was added
+    above the code they assert on, which is a property of the test, not of
+    the code.
+    """
+    src = METRICS.read_text()
+    i = src.index(f"=== {name} ===")
+    j = src.find('print("\\n=== ', i + 10)
+    return src[i:(j if j != -1 else len(src))]
+
+
+
 def test_mode_optional_keys_are_written_through_a_guard():
     """
     `_init_inference_data_caches` prunes `self.cache_keys`, and both the
@@ -398,3 +408,93 @@ def test_put_never_raises_for_any_mode(mode, expect_kept):
     cache = _simulate_put(keys, [(k, 1) for k in ALL])   # writer attempts all
     assert set(cache) == set(keys), "a dropped key came back"
     assert all(len(v) == 1 for v in cache.values())
+
+
+# --------------------------------------------------------------------------- #
+# what the first corpus metrics run exposed
+# --------------------------------------------------------------------------- #
+
+def test_identification_and_pearson_stratify_on_terra_split():
+    """
+    Both looped over `data_split` ("train", "test"), which folds validation into
+    train -- so the corpus run reported splits ['all', 'test', 'train'] and no
+    `validation` row at all. Validation is the split that SELECTED the
+    checkpoint, so it is the one that cannot be left mixed into train.
+    """
+    src = METRICS.read_text()
+    for anchor in ("nmi_ari_frames: List[pd.DataFrame] = []",
+                   "pearson_frames: List[pd.DataFrame] = []"):
+        i = src.index(anchor)
+        w = src[i:i + 500]
+        assert "resolve_split_masks(adata)" in w, anchor
+        assert 'for split_name in ("train", "test")' not in w, anchor
+
+
+def test_the_niche_aggregate_does_not_collide_with_a_real_column():
+    """
+    The weighted aggregate was emitted as label_key="niche" -- and the corpus
+    carries an obs column literally named `niche`. Both landed on the same
+    (split, code_key, label_key) with only n_cells differing: 8 duplicated keys
+    in the real output, indistinguishable to any consumer.
+    """
+    src = METRICS.read_text()
+    i = src.index("agg_rows.append({")
+    w = src[i:i + 700]
+    assert '"label_key":        "niche_weighted"' in w
+    assert '"is_aggregate":     True' in w
+    assert '"label_key":        "niche",' not in w
+
+
+def test_codebook_sizes_survive_the_uns_flattener():
+    """
+    predict casts every non-scalar `uns['squint']` value with `str()`
+    (run_squint.py, "AnnData can't write nested-dict .uns"), so codebook_sizes
+    arrives as the literal string "{'cell': [30, 90], 'niche': [30, 90]}".
+    `dict(<str>)` raises, and a bare `except Exception` turned that into a
+    silent "no codebook sizes available" -- both corpus runs emitted
+    n_codes_used with utilisation and perplexity_norm as NaN.
+    """
+    import ast as _ast
+    import re as _re
+
+    def parse(raw):
+        if not isinstance(raw, str):
+            return raw
+        try:
+            return _ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            m = _re.findall(r"'([^']+)':\s*(?:array\()?\[([0-9,\s]+)\]", raw)
+            return ({k: [int(x) for x in v.replace(" ", "").split(",") if x]
+                     for k, v in m} if m else None)
+
+    # the form the real corpus files carry
+    assert parse("{'cell': [30, 90], 'niche': [30, 90]}") == {
+        "cell": [30, 90], "niche": [30, 90]}
+    # the form produced when the values were numpy arrays before str()
+    assert parse("{'cell': array([30, 90]), 'niche': array([30, 90])}") == {
+        "cell": [30, 90], "niche": [30, 90]}
+    assert parse("not a dict at all") is None
+
+    w = _metrics_section("Codebook utilisation")
+    assert "ast.literal_eval" in w
+    # Match the STATEMENT, not the phrase -- the comment above the fix names
+    # `except Exception` when explaining what went wrong, and a substring test
+    # flags that as a regression.
+    import re as _re2
+    code = "\n".join(ln for ln in w.splitlines()
+                      if not ln.lstrip().startswith("#"))
+    assert not _re2.search(r"except\s+Exception\s*:", code), "the swallow is back"
+
+
+def test_utilisation_is_recoverable_from_n_codes_used():
+    """
+    The recovery used on the existing CSVs: no rerun was needed, because
+    n_codes_used and perplexity were computed correctly and only the
+    normalisation was missing.
+    """
+    sizes = {"cell": [30, 90], "niche": [30, 90]}
+    import numpy as np
+    for branch in ("cell", "niche"):
+        for level, used, expect in ((0, 30, 1.0), (1, 45, 0.5)):
+            assert used / sizes[branch][level] == pytest.approx(expect)
+        assert 1350 / int(np.prod(sizes[branch])) == pytest.approx(0.5)

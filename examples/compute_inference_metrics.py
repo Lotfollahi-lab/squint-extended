@@ -75,7 +75,9 @@ Usage:
 """
 
 import argparse
+import ast
 import json
+import re
 import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -834,20 +836,21 @@ def main() -> None:
     # rows so the user can read off train- vs test-set NMI/ARI directly.
     # Per the user spec, val cells are folded into "train" upstream — so
     # only "train" and "test" splits exist (in addition to "all").
-    nmi_ari_frames: List[pd.DataFrame] = [
-        compute_nmi_ari(adata, code_label_pairs, cell_mask=None, split_label="all"),
-    ]
-    if "data_split" in adata.obs.columns:
-        split_col = adata.obs["data_split"].astype("object")
-        for split_name in ("train", "test"):
-            mask = (split_col == split_name).to_numpy()
-            if mask.any():
-                nmi_ari_frames.append(
-                    compute_nmi_ari(
-                        adata, code_label_pairs,
-                        cell_mask=mask, split_label=split_name,
-                    )
-                )
+    # Stratify with `resolve_split_masks`, which prefers `terra_split`
+    # (train / validation / test) over the binary `data_split`. The binary
+    # column folds validation into "train", so the corpus run reported only
+    # all/train/test -- and validation is exactly the split that SELECTED the
+    # checkpoint, so it cannot be read off a number that has it mixed into
+    # train. `data_split` remains the fallback when terra_split is absent.
+    nmi_ari_frames: List[pd.DataFrame] = []
+    for _split, _mask in resolve_split_masks(adata):
+        nmi_ari_frames.append(
+            compute_nmi_ari(
+                adata, code_label_pairs,
+                cell_mask=(None if _split == "all" else _mask),
+                split_label=_split,
+            )
+        )
     nmi_ari_df = pd.concat(
         [df for df in nmi_ari_frames if not df.empty],
         ignore_index=True,
@@ -880,9 +883,14 @@ def main() -> None:
                 f"sources={list(grp['label_key'])})"
             )
             agg_rows.append({
+                # NOT "niche": the corpus carries an obs column literally named
+                # `niche`, so the aggregate and that real column produced rows
+                # with the same (split, code_key, label_key) and only differing
+                # n_cells -- indistinguishable to any consumer.
                 "split":            split,
                 "code_key":         code_key,
-                "label_key":        "niche",
+                "label_key":        "niche_weighted",
+                "is_aggregate":     True,
                 "NMI":              w_nmi,
                 "ARI":              w_ari,
                 "n_cells":          n_cells_total,
@@ -907,19 +915,14 @@ def main() -> None:
 
     # ----------------------------------------------- Pearson reconstruction
     print("\n=== Pearson reconstruction (cell + niche branch) ===")
-    pearson_frames: List[pd.DataFrame] = [
-        compute_pearson_metrics(adata, cell_mask=None, split_label="all"),
-    ]
-    if "data_split" in adata.obs.columns:
-        split_col = adata.obs["data_split"].astype("object")
-        for split_name in ("train", "test"):
-            mask = (split_col == split_name).to_numpy()
-            if mask.any():
-                pearson_frames.append(
-                    compute_pearson_metrics(
-                        adata, cell_mask=mask, split_label=split_name,
-                    )
-                )
+    pearson_frames: List[pd.DataFrame] = []
+    for _split, _mask in resolve_split_masks(adata):
+        pearson_frames.append(
+            compute_pearson_metrics(
+                adata, cell_mask=(None if _split == "all" else _mask),
+                split_label=_split,
+            )
+        )
     pearson_df = pd.concat(
         [df for df in pearson_frames if not df.empty],
         ignore_index=True,
@@ -1032,10 +1035,37 @@ def main() -> None:
     # utilisation with low perplexity is a codebook that is nominally alive and
     # functionally narrow, and only the second number shows it.
     print("\n=== Codebook utilisation ===")
-    try:
-        _sizes = dict((adata.uns.get("squint", {}) or {}).get("codebook_sizes", {}))
-    except Exception:
-        _sizes = {}
+    # `uns['squint']` is FLATTENED on write: predict casts every non-scalar
+    # value with `str()` (run_squint.py:40735, "AnnData can't write nested-dict
+    # .uns"), so this arrives as the literal string
+    #
+    #     "{'cell': [30, 90], 'niche': [30, 90]}"
+    #
+    # not as a dict. `dict(<str>)` raises, and a bare `except Exception` here
+    # silently reported "no codebook sizes available" -- which is exactly what
+    # both corpus runs did, emitting n_codes_used with utilisation and
+    # perplexity_norm as NaN. Parse the repr, and let anything unexpected be
+    # visible rather than swallowed.
+    _raw = (adata.uns.get("squint", {}) or {}).get("codebook_sizes", None)
+    _sizes = {}
+    if isinstance(_raw, str):
+        _txt = _raw
+        try:
+            _raw = ast.literal_eval(_txt)
+        except (ValueError, SyntaxError):
+            # `str()` of a dict whose values are numpy arrays gives
+            # "{'cell': array([30, 90]), ...}", which is not a Python literal.
+            # Pull the integers out per key rather than give up.
+            _m = re.findall(r"'([^']+)':\s*(?:array\()?\[([0-9,\s]+)\]", _txt)
+            _raw = ({k: [int(x) for x in v.replace(" ", "").split(",") if x]
+                     for k, v in _m} if _m else None)
+            if _raw is None:
+                print(f"  WARNING: could not parse uns codebook_sizes {_txt!r}")
+    if isinstance(_raw, dict):
+        _sizes = {str(k): [int(x) for x in v] for k, v in _raw.items()}
+    elif _raw is not None:
+        print(f"  WARNING: uns codebook_sizes has unexpected type "
+              f"{type(_raw).__name__}; ignoring")
     if getattr(args, "codebook_sizes", None):
         _flat = [int(s) for s in args.codebook_sizes]
         _sizes = {"cell": _flat, "niche": _flat}
