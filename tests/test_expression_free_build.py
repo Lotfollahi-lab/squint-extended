@@ -498,3 +498,23 @@ def test_utilisation_is_recoverable_from_n_codes_used():
         for level, used, expect in ((0, 30, 1.0), (1, 45, 0.5)):
             assert used / sizes[branch][level] == pytest.approx(expect)
         assert 1350 / int(np.prod(sizes[branch])) == pytest.approx(0.5)
+
+
+def test_split_masks_come_back_in_pipeline_order():
+    """
+    `sorted()` yields test, train, validation -- alphabetical, and the reason
+    three report tables listed splits backwards relative to the other two.
+    Order should be train, validation, test, with "all" first.
+    """
+    m = _load(METRICS, "_cim_order_test")
+    a = _FakeAdata(["test"] * 5 + ["validation"] * 5 + ["train"] * 5)
+    assert [n for n, _ in m.resolve_split_masks(a)] == [
+        "all", "train", "validation", "test"]
+
+
+def test_unknown_split_names_sort_after_the_known_ones():
+    m = _load(METRICS, "_cim_order_test2")
+    a = _FakeAdata(["test"] * 3 + ["zzz"] * 3 + ["train"] * 3 + ["aaa"] * 3)
+    got = [n for n, _ in m.resolve_split_masks(a)]
+    assert got[:3] == ["all", "train", "test"]
+    assert got[3:] == ["aaa", "zzz"]

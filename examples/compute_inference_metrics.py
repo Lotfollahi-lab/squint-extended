@@ -670,7 +670,13 @@ def resolve_split_masks(adata) -> "List[Tuple[str, np.ndarray]]":
     if key is None:
         return out
     vals = adata.obs[key].astype(str).to_numpy()
-    for name in sorted(set(vals)):
+    # Canonical order: train, validation, test -- the pipeline order, and the
+    # order every table in the report lists them in. `sorted()` gives
+    # test/train/validation alphabetically, which had two report tables running
+    # forwards and three backwards for no reason anyone chose.
+    _ORDER = {"train": 0, "validation": 1, "val": 1, "test": 2}
+    present = set(vals)
+    for name in sorted(present, key=lambda n: (_ORDER.get(n, 3), n)):
         mask = vals == name
         if int(mask.sum()) >= 2:
             out.append((f"{key}={name}" if key != "terra_split" else name, mask))
