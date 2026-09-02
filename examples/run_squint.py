@@ -5871,6 +5871,150 @@ def _r0_reference_stack() -> dict:
     return cfg
 
 
+def _patch_heartbeat(cfg: dict, every_n_steps: int) -> dict:
+    """
+    Set the periodic step log without touching the rest of the step budget.
+
+    `_patch_step_budget` owns this key, but it also owns `max_steps`,
+    `val_check_interval`, `save_top_k` and early stopping -- so calling it a
+    second time just to turn the heartbeat on would silently reset those. The
+    heartbeat is also where a scheduled LR becomes visible (see
+    `_maybe_log_heartbeat`), which a short smoke run needs and the default of
+    0 disables.
+    """
+    cfg["trainer"]["heartbeat_every_n_steps"] = int(every_n_steps)
+    return cfg
+
+
+def _patch_tier1(
+        cfg: dict,
+        adj_weight: float = 150.0,
+        diversity_weight: float = 0.0,
+        dead_code_all_levels: bool = True,
+        warmup_steps: int = 2_000,
+        min_lr_ratio: float = 0.05,
+        total_steps: int | None = None,
+    ) -> dict:
+    """
+    Tier 1: the four config deficits found by the corpus evaluation.
+
+    Applied as one patch, and applied LAST so it can read
+    `trainer.max_steps` for the LR horizon.
+
+    Every number here is a response to something MEASURED on
+    `artifacts/hst_corpus_110m/corpus-holdout/20260827_082804_seed0`
+    (200,000 steps = 1.07 epochs). See `CORPUS_EVAL_FINDINGS.md` §4. Run
+    this at the SAME 200,000-step budget as that run -- the whole point is
+    that the delta is attributable, which a simultaneous budget change would
+    destroy.
+
+    Parameters
+    ----------
+    adj_weight : float
+        `wt_adj_reconstr`, default 150 (from 1000).
+
+        THE OBJECTIVE WAS 55% ADJACENCY. Measured decomposition at the end
+        of the corpus run: `bce_cosine_adjacency` 1,872 of a 3,385 total,
+        and it was the ONE term getting *worse* across training (+130
+        between the two epoch ends while NB improved by -44.6). At 150 the
+        unweighted ~1.872 contributes ~281 of ~1,794, i.e. ~16%.
+
+        This is also what un-drowns the commit terms. `commitment_weight` is
+        deliberately 0.0 (the lucidrains-internal loss); the real commit
+        signal is the external `mse_commit_loss_{cell,niche}` at
+        `wt_commit_* = 1.0`, which measured 0.1% of the loss purely because
+        adjacency was 55% of it. Dropping adjacency 6.7x raises their
+        relative influence 6.7x WITHOUT touching `wt_commit_*` -- one lever,
+        not two, so the effect stays attributable.
+
+    diversity_weight : float
+        `codebook_diversity_loss_weight` on BOTH branches, default 0.0.
+
+        The reference stack sets 10.0 on cell and leaves niche at 0.0, which
+        is almost certainly unintended. Symmetrising DOWNWARD rather than up
+        because the only evidence available points that way: the branch
+        WITHOUT the term used more of its second codebook (niche 55/90 vs
+        cell 45/90). Confounded across branches, so this is a weak read --
+        but it removes a term from an objective whose headline problem is
+        one term dominating, and `dead_code_all_levels` now addresses code
+        collapse directly. Pass 10.0 to symmetrise upward instead.
+
+    dead_code_all_levels : bool
+        Arm dead-code revival on RVQ level 1 as well as level 0, default True.
+
+        THE CORRECTED MECHANISM for the half-dead codebook. Level 1 used
+        45/90 (cell) and 55/90 (niche) codes at a normalised perplexity of
+        0.25-0.43. `ResidualVQ_Squint` passes
+        `threshold_ema_dead_code if i == 0 else 0`, so revival was never
+        armed above level 0 -- reasoned as avoiding spurious revival from
+        sparse usage AT INIT, but the switch is permanent and over 200,000
+        steps it simply costs half the codebook.
+
+        Note what this is NOT expected to fix. Per `CORPUS_EVAL_FINDINGS.md`
+        §1, effective codebook size is not the identification bottleneck
+        (matched-K clustering wins ARI in only 6/96 groups), so do not
+        expect NMI/ARI to move. Finer quantisation should help
+        RECONSTRUCTION, which is the actual deficit at ~half the paper on
+        the cell branch.
+
+    warmup_steps, min_lr_ratio, total_steps
+        Linear warmup then cosine decay to `min_lr_ratio` x `lr` over
+        `total_steps`. The corpus run was plain Adam at a CONSTANT 7e-4 for
+        200,000 steps with no warmup and no decay. `total_steps` defaults to
+        `cfg["trainer"]["max_steps"]`, so apply this patch after
+        `_patch_step_budget`.
+
+    Returns
+    -------
+    - dict
+        The same cfg, mutated in place.
+    """
+    # ---- 1. loss rebalance -------------------------------------------------
+    cfg = _patch_dual_adj_weight(cfg, weight=adj_weight)
+
+    # ---- 2. symmetric codebook diversity -----------------------------------
+    cfg = _patch_dual_codebook_diversity(
+        cfg, weight=diversity_weight, temperature=100.0, branch="both")
+
+    # ---- 3. dead-code revival on every RVQ level ---------------------------
+    # Only meaningful for `ResidualVQ_Squint`; the flag is an unexpected
+    # kwarg to the other VQ classes, so refuse rather than pass it silently
+    # to a constructor that will raise deep inside encoder construction.
+    enc = cfg["model"]["encoder_params"]
+    for slot in ("vq_cell_params", "vq_niche_params"):
+        vqp = enc.get(slot)
+        if vqp is None:
+            raise KeyError(
+                f"_patch_tier1 expects a dual-VQ config with {slot!r}; got "
+                f"encoder_params keys {sorted(enc)}. Build on `_BD()`."
+            )
+        if dead_code_all_levels:
+            if vqp.get("vq_name") != "ResidualVQ_Squint":
+                raise ValueError(
+                    f"dead_code_all_levels=True needs ResidualVQ_Squint in "
+                    f"{slot!r}, got {vqp.get('vq_name')!r}. It is a per-level "
+                    "switch and has no meaning for a single codebook."
+                )
+            vqp["dead_code_all_levels"] = True
+
+    # ---- 4. LR warmup + cosine decay ---------------------------------------
+    if total_steps is None:
+        total_steps = cfg["trainer"].get("max_steps")
+        if not total_steps or int(total_steps) <= 0:
+            raise ValueError(
+                "_patch_tier1 needs a step horizon for the cosine schedule. "
+                "Apply it AFTER `_patch_step_budget` (so `trainer.max_steps` "
+                "is set), or pass `total_steps=` explicitly. Got "
+                f"trainer.max_steps={total_steps!r}."
+            )
+    opt = cfg["model"]["optimizer_params"]
+    opt["lr_schedule"] = "cosine"
+    opt["warmup_steps"] = int(warmup_steps)
+    opt["min_lr_ratio"] = float(min_lr_ratio)
+    opt["total_steps"] = int(total_steps)
+    return cfg
+
+
 # R0 whole-section test holdout, as `adata_batch_id` VALUES (batchN -> N), NOT
 # blob positions -- SpatialBatchSplit matches data.adata_batch_id against these.
 # Chosen to span the size distribution of the 39 sections
@@ -6174,6 +6318,60 @@ VARIANTS: dict = {
             # would rebuild every block in the corpus to reach them, ~51 min a
             # pass, which is what forced validation off entirely before.
             val_checks=10,
+        ),
+    },
+
+    "corpus-holdout-tier1": {
+        "description": (
+            "corpus-holdout plus the four Tier 1 fixes from the corpus "
+            "evaluation: adjacency BCE 1000 -> 150 (it was 55% of the "
+            "objective and the one term getting WORSE), LR warmup + cosine "
+            "decay (was constant 7e-4 for 200,000 steps), dead-code revival "
+            "armed on RVQ level 1 (it was off by construction, costing half "
+            "the second codebook), and a symmetric codebook-diversity weight "
+            "(was 10.0 cell / 0.0 niche). SAME 200,000-step budget, same "
+            "data, same split, same everything else -- built by calling "
+            "corpus-holdout's own builder, so the diff against it is exactly "
+            "`_patch_tier1` and nothing else. Expect RECONSTRUCTION to "
+            "respond most; identification should not move much "
+            "(CORPUS_EVAL_FINDINGS.md §1) and integration probably will not "
+            "at all, because the encoder still receives no batch information "
+            "-- that is Tier 2. REQUIRES --split-sections-json _splitspec.json."
+        ),
+        "patches": [
+            "=corpus-holdout (all of it)",
+            "+tier1(wt_adj_reconstr=150, lr cosine w/ 2k warmup -> 0.05x, "
+            "dead_code_all_levels=True, diversity symmetric at 0.0)",
+        ],
+        # Built from corpus-holdout's OWN builder rather than a copy of its
+        # 14-deep nest, so the two cannot drift apart. Resolved at call time.
+        "build": lambda: _patch_tier1(VARIANTS["corpus-holdout"]["build"]()),
+    },
+
+    "smoke-tier1+stream+xhs1000-39b_1p": {
+        "description": (
+            "Proof that the Tier 1 paths EXECUTE, before spending 7 h of GPU "
+            "on the corpus. Everything `_patch_tier1` touches is new code or "
+            "a never-exercised branch: the LR scheduler return from "
+            "`configure_optimizers` (which returned a bare optimizer until "
+            "now, so Lightning has never been handed a scheduler by this "
+            "model), and `dead_code_all_levels` reaching level 1 of "
+            "`ResidualVQ_Squint`. 3,000 steps on R0, ~10 min. Watch for the "
+            "'LR schedule: cosine' banner and a falling lr in the logs -- an "
+            "absent banner means the schedule silently did not arm."
+        ),
+        "patches": [
+            "=smoke-steps+stream+xhs1000-39b_1p",
+            "+tier1(warmup=100 to fit a 3,000-step budget)",
+        ],
+        # heartbeat every 250 steps: the smoke's whole job is to show the LR
+        # curve, and `smoke-steps` leaves the heartbeat off (0).
+        "build": lambda: _patch_heartbeat(
+            _patch_tier1(
+                VARIANTS["smoke-steps+stream+xhs1000-39b_1p"]["build"](),
+                warmup_steps=100,
+            ),
+            every_n_steps=250,
         ),
     },
     "smoke-steps+stream+xhs1000-39b_1p": {
@@ -39120,6 +39318,15 @@ def train(
                 verbose   = True,
             )
         )
+
+    # LR monitor, attached only when a schedule is actually active. Without
+    # it the LR is invisible: the schedule prints one banner at
+    # `configure_optimizers` and then nothing, so a schedule that armed but
+    # decayed on the wrong grid (per-epoch instead of per-step, say) would
+    # look identical in the logs to one that worked. Pointless when the LR is
+    # constant, hence the guard.
+    if cfg["model"].get("optimizer_params", {}).get("lr_schedule", "none") != "none":
+        callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval="step"))
 
     callbacks = callbacks or None   # PL wants None, not [], when empty
 

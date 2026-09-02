@@ -82,8 +82,14 @@ class ResidualVQ_Squint(nn.Module):
     - kmeans_init is only enabled on level 0; deeper levels see residuals
       that are not directly clusterable from the data distribution and are
       better initialised randomly.
-    - Dead-code resampling is enabled only on level 0 (>0 threshold). Deeper
-      levels can have very sparse usage at init and would spuriously revive.
+    - Dead-code resampling is enabled only on level 0 by DEFAULT (>0
+      threshold), because deeper levels can have very sparse usage at init
+      and would spuriously revive. That reasoning is about INIT but the
+      switch is permanent, and on a long run it costs codes: measured on the
+      200,000-step corpus run, level 1 used 45/90 (cell) and 55/90 (niche)
+      at a normalised perplexity of 0.25-0.43. Pass
+      `dead_code_all_levels=True` to arm revival on every level and take the
+      init risk instead -- see `_patch_tier1` in `run_squint.py`.
     """
 
     def __init__(
@@ -96,6 +102,11 @@ class ResidualVQ_Squint(nn.Module):
             decay: float = 0.8,
             eps: float = 1e-5,
             threshold_ema_dead_code: int = 2,
+            # Arm dead-code revival on EVERY level, not just level 0.
+            # Default False = legacy behaviour. See the class docstring for
+            # the tradeoff: init-time spurious revival vs. permanently dead
+            # codes on a long run.
+            dead_code_all_levels: bool = False,
             kmeans_init: bool = True,
             kmeans_iters: int = 10,
             sync_kmeans: bool = True,
@@ -140,7 +151,11 @@ class ResidualVQ_Squint(nn.Module):
                 kmeans_init=(kmeans_init if i == 0 else False),
                 kmeans_iters=kmeans_iters,
                 sync_kmeans=sync_kmeans,
-                threshold_ema_dead_code=(threshold_ema_dead_code if i == 0 else 0),
+                threshold_ema_dead_code=(
+                    threshold_ema_dead_code
+                    if (i == 0 or dead_code_all_levels)
+                    else 0
+                ),
                 commitment_weight=commitment_weight,
                 sample_codebook_temp=sample_codebook_temp,
                 # Diversity loss applies per-codebook; identical weight +

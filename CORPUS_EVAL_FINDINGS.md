@@ -137,12 +137,56 @@ Four things in `user_specified_config.yaml` that plausibly explain the last two:
 | finding | value |
 |---|---|
 | adjacency BCE dominates the objective | 1,872 of 3,385 = **55%**, and it was the one term getting *worse* across training |
-| nothing drives the second RVQ level | `commitment_weight: 0.0` in both VQs; the `mse_commit` terms are 0.1% of the loss. Level 1 uses 45/90 and 55/90 codes |
+| level 1 of each RVQ can never revive a dead code | `ResidualVQ_Squint` passes `threshold_ema_dead_code if i == 0 else 0`, so revival is armed on level 0 only. Level 1 uses 45/90 and 55/90 codes at perplexity_norm 0.25-0.43 |
+| the commit signal is drowned, not absent | `commitment_weight: 0.0` is deliberate (the lucidrains-internal loss); the real signal is the external `mse_commit_loss_{cell,niche}` at `wt_commit_* = 1.0`, which measures 0.1% of the loss *because* adjacency is 55% of it |
 | the encoder gets no batch information | `adversarial_alpha: 0.0`, `adversarial_batch_dim_request: False`; decoder covariate only, **16 dims for 635 batches** |
 | no LR schedule | plain Adam, constant 7e-4, 200k steps, no warmup or decay |
 
 Also `codebook_diversity_loss_weight` is 10.0 on cell and **0.0** on niche —
 almost certainly unintended, and niche's level 1 is *better* used without it.
+
+**Two of these were initially mis-attributed, and the corrected reading changes
+the fix.** The half-dead level-1 codebooks are not caused by
+`commitment_weight: 0.0` — that value is a documented convention, with the
+external `mse_commit_loss_{cell,niche}` carrying the commit signal at weight
+1.0. The cause is `hierarchical_vq.py`: dead-code revival is hard-wired to
+level 0, reasoned as avoiding spurious revival from sparse usage *at init*,
+but the switch is permanent and over 200,000 steps it simply costs half the
+codebook. So the fix is per-level revival (`dead_code_all_levels`), not a
+commitment weight; and the commit terms are raised 6.7x for free by the
+adjacency reduction, without touching `wt_commit_*` — one lever, so the effect
+stays attributable.
+
+Note what the codebook fix is *not* expected to buy: per §1, effective
+codebook size does not bind identification, so NMI/ARI should not move. Finer
+quantisation should help **reconstruction**, which is the actual deficit.
+
+### Tier 1: these four, as one run
+
+`_patch_tier1` in `run_squint.py`, registered as the variant
+`corpus-holdout-tier1`, built by calling `corpus-holdout`'s own builder so the
+diff against it is exactly the patch. Same 200,000-step budget, same data,
+same split — the point is an attributable delta, which a simultaneous budget
+change would destroy.
+
+| change | from | to |
+|---|---|---|
+| `wt_adj_reconstr` | 1000 | 150 (~16% of the objective) |
+| RVQ dead-code revival | level 0 only | all levels (`dead_code_all_levels=True`) |
+| LR | constant 7e-4 | 2,000-step warmup, cosine decay to 0.05x |
+| `codebook_diversity_loss_weight` | 10.0 cell / 0.0 niche | 0.0 both |
+
+Diversity is symmetrised *downward* because the only evidence available points
+that way (the branch without the term used more of its second codebook), and
+because it removes a term from an objective whose headline problem is one term
+dominating. It is the weakest-motivated of the four; `diversity_weight=10.0`
+symmetrises upward instead.
+
+The LR schedule needed code: `BaseModel.configure_optimizers` returned a bare
+optimizer, so this model had never handed Lightning a scheduler. It now returns
+the `{"optimizer", "lr_scheduler"}` mapping when `lr_schedule='cosine'`, and a
+bare optimizer otherwise — so every variant predating the keyword is unaffected.
+Both new paths are covered by `tests/test_tier1_config.py`.
 
 `best` (step 40,000) vs `last` (step 200,000): `best` wins identification and
 reconstruction on every row; `last` wins batch integration on the quantised

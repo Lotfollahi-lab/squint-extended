@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from pathlib import Path
@@ -61,6 +62,10 @@ class BaseModel(pl.LightningModule):
             weight_decay: float = 0.0,
             mask_lr_scale: float = 1.0,
             fused: bool = False,
+            lr_schedule: Literal['none', 'cosine'] = 'none',
+            warmup_steps: int = 0,
+            min_lr_ratio: float = 0.0,
+            total_steps: Optional[int] = None,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
         ) -> None:
@@ -98,6 +103,17 @@ class BaseModel(pl.LightningModule):
             The weight decay.
         - mask_lr_scale: float
             The learning rate scale for the learnable mask.
+        - lr_schedule: 'none' | 'cosine'
+            Learning-rate schedule. 'none' (default) keeps the legacy
+            constant-LR behaviour and returns a bare optimizer.
+        - warmup_steps: int
+            Linear warmup length in OPTIMIZER STEPS. Ignored when
+            `lr_schedule='none'`.
+        - min_lr_ratio: float
+            Floor of the cosine decay, as a fraction of `lr`.
+        - total_steps: Optional[int]
+            Schedule horizon in optimizer steps. When None it is taken
+            from `trainer.estimated_stepping_batches`.
 
         - loss_names: List[str]
             The loss function names.
@@ -136,6 +152,16 @@ class BaseModel(pl.LightningModule):
         # legacy behaviour for any caller that builds a cfg without
         # the new key; set via `cfg["model"]["optimizer_params"]["fused"]`.
         self.fused = bool(fused)
+
+        # LR schedule. Default 'none' returns a bare optimizer, which is
+        # exactly the legacy path -- every variant predating this keyword
+        # trains as it did before.
+        self.lr_schedule = str(lr_schedule)
+        self.warmup_steps = int(warmup_steps)
+        self.min_lr_ratio = float(min_lr_ratio)
+        self.total_steps = None if total_steps is None else int(total_steps)
+        # Resolved in `configure_optimizers` when a schedule is active.
+        self._horizon = None
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
@@ -833,9 +859,100 @@ class BaseModel(pl.LightningModule):
             )
 
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
+    def _schedule_horizon(self) -> int:
         """
-        Configure the optimizer for the model.
+        Total optimizer steps the LR schedule should span.
+
+        Prefers the explicit `total_steps` because
+        `trainer.estimated_stepping_batches` is unreliable on the
+        streaming backend: a corpus epoch is ~187,562 steps and the
+        whole budget finishes inside epoch 0, so Lightning's estimate
+        comes from `max_steps` when set and from a per-epoch batch
+        count that the block loader cannot report otherwise.
+
+        Returns
+        -------
+        - int
+            The horizon, always >= 1.
+        """
+        if self.total_steps is not None:
+            return max(1, self.total_steps)
+
+        est = getattr(self.trainer, "estimated_stepping_batches", None) if self.trainer else None
+        if est is None or not math.isfinite(float(est)) or float(est) <= 0:
+            raise ValueError(
+                "lr_schedule='cosine' needs a finite step horizon, but "
+                f"trainer.estimated_stepping_batches is {est!r}. Set "
+                "`optimizer_params.total_steps` (normally equal to "
+                "`trainer.max_steps`) explicitly."
+            )
+        return max(1, int(est))
+
+    def _lr_lambda(self, step: int) -> float:
+        """
+        The LR multiplier at a given optimizer step.
+
+        Linear warmup, then cosine decay to `min_lr_ratio`. `step` is
+        0-based, and the multiplier is clamped at the floor past the
+        horizon rather than being allowed to turn back up.
+        """
+        warmup = self.warmup_steps
+        if step < warmup:
+            # (step + 1) so the very first step is not a zero-LR no-op.
+            return (step + 1) / max(1, warmup)
+        horizon = self._horizon
+        prog = (step - warmup) / max(1, horizon - warmup)
+        prog = min(1.0, max(0.0, prog))
+        cos = 0.5 * (1.0 + math.cos(math.pi * prog))
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cos
+
+    def configure_optimizers(self):
+        """
+        Configure the optimizer, and the LR scheduler when one is asked for.
+
+        Returns
+        -------
+        - torch.optim.Optimizer, or dict
+            A bare optimizer when `lr_schedule='none'` (the legacy
+            behaviour, preserved so pre-existing variants are
+            unaffected); otherwise Lightning's
+            `{"optimizer": ..., "lr_scheduler": ...}` mapping stepped
+            per optimizer step.
+        """
+        optimizer = self._build_optimizer()
+
+        if self.lr_schedule == 'none':
+            return optimizer
+        if self.lr_schedule != 'cosine':
+            raise NotImplementedError(
+                f"lr_schedule {self.lr_schedule!r} not implemented "
+                "(expected 'none' or 'cosine')"
+            )
+
+        # Resolved once, here rather than inside the lambda: the horizon
+        # must not change under the schedule mid-run, and reading the
+        # trainer on every step would.
+        self._horizon = self._schedule_horizon()
+        if self.warmup_steps >= self._horizon:
+            raise ValueError(
+                f"warmup_steps ({self.warmup_steps}) must be less than the "
+                f"schedule horizon ({self._horizon}); the LR would never decay."
+            )
+        print(
+            f"LR schedule: cosine, base lr={self.lr:g}, "
+            f"warmup={self.warmup_steps} steps, horizon={self._horizon} steps, "
+            f"floor={self.min_lr_ratio:g}x"
+        )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self._lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        """
+        Build the bare optimizer.
 
         Returns
         -------
@@ -1232,6 +1349,18 @@ class BaseModel(pl.LightningModule):
             msg += f" | loss {float(loss):.2f}"
         except Exception:  # noqa: BLE001 - loss shape varies by variant
             pass
+        # LR, but only when it is actually scheduled. `LearningRateMonitor`
+        # logs to the LOGGER, i.e. wandb -- which is exactly the place the job
+        # log cannot see, and the job log is the only artefact available while
+        # a farm run is in flight. Without this a schedule that armed but
+        # stepped on the wrong grid (per-epoch rather than per-step) is
+        # indistinguishable from one that worked. Omitted for a constant LR so
+        # existing runs' heartbeats are unchanged.
+        if getattr(self, "lr_schedule", "none") != "none":
+            try:
+                msg += f" | lr {self.optimizers().param_groups[0]['lr']:.3e}"
+            except Exception:  # noqa: BLE001 - no optimizer during sanity check
+                pass
         print(msg, flush=True)
         if os.environ.get("SQUINT_TENSOR_CENSUS") == "1":
             print(self._tensor_census(), flush=True)
