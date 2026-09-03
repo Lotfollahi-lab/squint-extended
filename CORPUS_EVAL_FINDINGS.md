@@ -345,12 +345,35 @@ Cosine annealing sharpens the decoder onto the training distribution, so
 in-distribution reconstruction improves and extrapolation to a width nothing
 in training covers degrades. A textbook annealing/OOD tradeoff.
 
-**Still open, and it decides whether Tier 1 is adoptable as-is:** whether the
-penalty is *narrow panels* (64% of training sections, 12% of test) or *OOD
-widths only* (chr78 alone, which is absent from the test set). `xhs1009`
-separates them — 252 genes, the narrowest width in TERRA test, but IN
-distribution because 4 training sections share it exactly. `_narrowtest_job.sh`
-runs it, both arms, both runs. Its identification already improved under
-`last` (+0.027 NMI, +0.052 ARI), which leans toward OOD-only but does not test
-the decoder, where the regression lives.
+**Settled: it is OOD widths only, not narrow panels.** `_narrowtest_job.sh`
+ran `xhs1009` — 252 genes, the narrowest width in TERRA test, but IN
+distribution because 4 training sections share it exactly — with a full cache
+on both arms of both runs. Tier 1 improved cell-wise ρ in **13/13 sections on
+both arms**: `best` +0.0914, `last` +0.0565.
+
+The dispersion tells the same story from the other side. On the
+in-distribution narrow panel `last` SHARPENS (CV 1.9 → 2.2 against a true
+3.3), exactly as on the wide panel; on the OOD narrow panel it FLATTENS
+(1.5 → 1.25 against a true 5.0). Same model, opposite direction, split purely
+by whether that width appeared in training.
+
+| rung | width | in training? | Δρ (`last`) |
+|---|---|---|---|
+| xhs1022 | 4,947 | yes | +0.031 |
+| xhs1009 | 252 | yes (4 sections) | **+0.057** (13/13) |
+| chr78 | **169** | **no** (floor is 237) | **−0.161** |
+
+**Verdict: Tier 1 is adoptable as-is.** The regression is confined to the one
+dataset below the training panel-width floor, and that dataset is entirely in
+validation — it does not appear in TERRA test at all, so no reported test
+number is affected. Every in-distribution dataset measured improves.
+
+**The caveat that must be reported**, though: after annealing the model
+extrapolates worse to panels narrower than anything it trained on. Applying
+SQUINT to a new 100–200 gene panel should expect degraded reconstruction (not
+degraded identification — that was unaffected). The corpus contains no panels
+below 237 genes to learn from, so a fix would have to be training-side —
+width augmentation, i.e. randomly subsetting wide panels during training so
+the model sees narrow ones. Untested, and not required for the current
+claims.
 
