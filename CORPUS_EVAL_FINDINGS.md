@@ -237,3 +237,69 @@ sections, 23/40 panels, 15/18 tissues, and all three assays present in training.
   back as `"{'cell': [30, 90], ...}"`. A bare `except Exception` around the
   parse turned that into a plausible-sounding "no codebook sizes available" and
   produced NaN utilisation across two full corpus runs.
+
+---
+
+## 6. Tier 1 outcome: the LR schedule is the win, and it moved the checkpoint
+
+Run `corpus-holdout-tier1/20260902_221324_seed0`, 200,000 steps in 4.89 h
+(baseline 6.9 h), against `corpus-holdout/20260827_082804_seed0`. Identical
+data, split, budget and scoring code.
+
+**The four changes did what the mechanism said they would.**
+
+| | baseline | tier1 |
+|---|---|---|
+| RVQ level 1 used, cell / niche | 43/90, 54/90 | **90/90, 90/90** (util 1.000, every split) |
+| adjacency share of the objective | 55.3% | **16.9%** |
+| NB cell / neighbour recon loss | 704.7 / 773.2 | 680.4 / 721.7 (−3.5% / −6.7%) |
+| adjacency RAW (weight removed) | 1.8722 | 1.9468 (+4.0%) |
+
+Every term improved except the one deliberately down-weighted.
+
+**The headline: the cosine schedule inverted which checkpoint is best.**
+Under the baseline's constant 7e-4, `best` (step 40,000) beat `last`
+everywhere. Under the schedule the LR at step 40,000 is still 6.414e-04 —
+near peak — so `best` is no longer the annealed model and `last` is. Held-out
+test, per dataset, level-0 codes:
+
+| arm | branch | ΔNMI | ΔARI |
+|---|---|---|---|
+| last | cell | **+0.050 (87/87)** | **+0.046 (87/87)** |
+| last | niche | +0.063 (15/17) | +0.045 (12/17) |
+| best | cell | −0.025 (4/87) | −0.026 (18/87) |
+| best | niche | +0.024 (13/17) | −0.030 (5/17) |
+
+Under TERRA's own protocol (latent @ matched K, test): `last` cell NMI
+0.391 → **0.482** (81/81) and niche 0.399 → **0.434** (15/15). `tier1/last`
+is the strongest configuration measured so far on that protocol.
+
+**Reconstruction improved on the test rung and REGRESSED on the val rung.**
+R_test (xhs1022, Xenium skin, 120,889 cells) improved in 7 of 8 measures,
+`last`/niche cell-wise most: 0.395 → **0.594**. But R_val (chr78, CosMx, a
+DIFFERENT ASSAY carrying 2 distinct gene sets across its 11 sections) fell,
+worst at `last`/cell 0.244 → **0.083**. Whether that is assay specialisation
+or a chr78-specific panel effect is untested and is the first thing to check
+before treating Tier 1 as a clean win.
+
+**What did NOT move: batch integration**, exactly as predicted. iLISI on test
+fell slightly (cell_emb 0.0496 → 0.0435), still ~14% of the 0.30 ceiling. The
+encoder still receives no batch information — that is Tier 2. ASW did improve
+(cell_latent under `last`, −0.250 → −0.118).
+
+**What Tier 1 did not achieve:** it did not beat `baseline/best` on raw
+code-based CELL identification (NMI 0.385–0.498, ARI 0.227–0.323 per dataset,
+still the highest of the four configurations). Codebook expansion remains
+ruled out by §1, so that ceiling is still the latent's class separability.
+
+### A measurement trap the fix opened, in three places
+
+Fixing the `--keep-obs-cols` quoting made the technical columns reach the
+predicted object for the first time, and each label-consuming path discovers
+labels independently. `Xenium region number` / `number2` therefore had to be
+excluded in `compute_inference_metrics` (via the pool job), in `_tier0.py`
+and in `_tier0c.py` — 112 spurious rows across FOUR datasets (xhs1000,
+xhs1009, xhs1010, xhs1011) on the first Tier 1 pass, not just xhs1011. A
+silent omission became a silent inclusion; grep for every label-discovery
+site when changing what reaches `.obs`.
+
