@@ -92,14 +92,27 @@ is MERFISH-Human-Brain. Composition: 20 tissues, 5 assays, all human.
 
 ## 3. Held-out annotation coverage is the binding evaluation constraint
 
-Of 79 logical datasets, **5** have a held-out section carrying a curated
-annotation, and **4** were measured (`xhs1011` was lost to a shell bug, §5).
-All four are Xenium and all four are skin.
+Of 79 logical datasets, **4** have a held-out section carrying a usable
+curated annotation. All four are Xenium and all four are skin.
+
+**Corrected 2026-09-03.** This previously read "5 ... and 4 were measured
+(`xhs1011` was lost to a shell bug)". The shell bug (§5) was real and is
+fixed, but recovering the columns showed `xhs1011` was never the fifth
+dataset: it has **no cell-label column at all**, and its only niche column is
+`Xenium region number2` — the instrument's slide-region index, whose 10
+categories are `'1'..'8'`, `'MISSING'` and `'psoriasis'`, with 747,233 of
+1,553,516 non-null cells (48%) in `MISSING` and the one meaningful value a
+DISEASE label. Scoring it would measure recovery of a technical slide-region
+effect, the opposite of what the niche branch is for. So the bug was masking
+an unusable dataset rather than costing a usable one, and it must now be
+excluded explicitly — the fix makes these two columns reach the predicted
+object for the first time, which would otherwise *add* two spurious rows.
+The binding constraint is tighter than recorded, not looser.
 
 ```
 sub-datasets in the corpus                        156
 ... with >=1 section in TERRA test                 27
-... whose test sections carry a curated label       7   (5 logical)
+... whose test sections carry a curated label       7   (5 logical, 4 usable)
 ```
 
 No config change fixes this. Broadening it means annotations on held-out
@@ -213,8 +226,13 @@ sections, 23/40 panels, 15/18 tissues, and all three assays present in training.
   pairs give the same answer in minutes.
 - **`--keep-obs-cols` was word-split by the shell**, silently dropping every obs
   column whose name contains a space (`Xenium region number2`,
-  `L2_dist_broad_anatomy_Genital Tubercle`, …). Cost one whole dataset
-  (`xhs1011`) from the evaluation. Pass such lists via a file, not shell words.
+  `L2_dist_broad_anatomy_Genital Tubercle`, …) — 121 names became 128 words,
+  none of the 7 fragments matched a real column, and nothing in the log said
+  so. Pass such lists as a quoted bash ARRAY (`mapfile -t` + `"${arr[@]}"`),
+  never as a single space-joined string. Fixed in `_tier1eval_job.sh`.
+  Note the fix has a sharp edge: those columns now REACH the predicted object,
+  so anything technical among them must be excluded from scoring explicitly
+  (see §3) — a silent omission became a silent inclusion.
 - **`uns['squint']` is flattened with `str()` on write**, so nested values come
   back as `"{'cell': [30, 90], ...}"`. A bare `except Exception` around the
   parse turned that into a plausible-sounding "no codebook sizes available" and
