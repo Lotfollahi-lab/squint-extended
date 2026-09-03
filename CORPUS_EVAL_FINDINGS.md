@@ -303,3 +303,54 @@ xhs1009, xhs1010, xhs1011) on the first Tier 1 pass, not just xhs1011. A
 silent omission became a silent inclusion; grep for every label-discovery
 site when changing what reaches `.obs`.
 
+---
+
+## 7. The chr78 reconstruction regression is an OOD-width effect, not assay specialisation
+
+§6 flagged Tier 1's R_val regression (chr78, CosMx, `last`/cell cell-wise ρ
+0.244 → 0.083) as untested. Tested now, from the existing full-cache predicts.
+Three candidate causes ruled out **by measurement**:
+
+- **Not the assay.** chr78 IDENTIFICATION is unchanged (ΔNMI −0.0004), and
+  chl59 (+0.044) and shp75 (+0.046) — also non-Xenium validation datasets —
+  both improved. The encoder generalises fine; the regression is decoder-only.
+- **Not a masking bug.** Predicted mass inside each section's OWN panel is
+  exactly **1.0000** in both runs, checked per section against that section's
+  own `var`. An earlier reading of "3.5pp leakage" was an artefact of slicing
+  20,000 rows that spanned THREE sections while applying one section's panel;
+  it does not reproduce per section. Check `adata_batch_id` before assuming a
+  row slice is one section.
+- **Not chr78's internal panel split.** Its two gene sets are 169 genes each
+  with a 165-gene intersection, and the regression is uniform across all 11
+  sections (−0.12 to −0.18), not bimodal.
+
+**What it is: the decoder's per-cell profile flattens on an unseen panel
+width.** Measured per section, predicted profile CV against a true CV of
+~5.0–5.8: CM008 1.495 → 1.253, CM013 1.965 → 1.374, CM017 1.663 → 1.317
+(−16% to −30%). On the wide panel it moves the OTHER way — xhs1022 (4,947
+genes) 1.504 → **2.100**, and ρ rises 0.269 → 0.281. Flatter within-cell
+profile ⇒ lower cell-wise ρ; gene-wise ρ is unaffected by within-cell
+flatness and indeed IMPROVED on chr78 (+0.015), which is the signature.
+
+**Why that width:** panel width by split —
+
+| split | min | p5 | median |
+|---|---|---|---|
+| train | **237** | 289 | 477 |
+| validation | **169** | 169 | 946 |
+| test | **252** | 252 | 4,948 |
+
+**No training section has ≤200 genes.** chr78's 169 occurs only in validation.
+Cosine annealing sharpens the decoder onto the training distribution, so
+in-distribution reconstruction improves and extrapolation to a width nothing
+in training covers degrades. A textbook annealing/OOD tradeoff.
+
+**Still open, and it decides whether Tier 1 is adoptable as-is:** whether the
+penalty is *narrow panels* (64% of training sections, 12% of test) or *OOD
+widths only* (chr78 alone, which is absent from the test set). `xhs1009`
+separates them — 252 genes, the narrowest width in TERRA test, but IN
+distribution because 4 training sections share it exactly. `_narrowtest_job.sh`
+runs it, both arms, both runs. Its identification already improved under
+`last` (+0.027 NMI, +0.052 ARI), which leans toward OOD-only but does not test
+the decoder, where the regression lives.
+
