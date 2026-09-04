@@ -877,6 +877,12 @@ def initialize_model(
         # `decoupled_decoder_covariate=True` -> two independent
         # nn.Embedding modules (one per decoder) instead of one shared
         # embedding. Default False = legacy single-embedding behaviour.
+        # Width of the per-cell batch one-hot for encoder FiLM on the
+        # streaming path. Absent for every variant predating Tier 2a, where
+        # the default 0 leaves the unconditioned path untouched.
+        model_param_dict['encoder_batch_condition_dim'] = int(
+            config['model'].get('encoder_batch_condition_dim', 0)
+        )
         model_param_dict['decoupled_decoder_covariate'] = bool(
             config['model'].get('decoupled_decoder_covariate', False)
         )

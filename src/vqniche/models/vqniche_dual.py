@@ -115,6 +115,12 @@ class VQNiche_Dual(BaseModel):
             attribute_decoder_cell_params: Optional[dict]  = None,
             attribute_decoder_niche_params: Optional[dict] = None,
             adjacency_decoder_params: Optional[dict] = None,  # ignored
+            # Width of the per-cell batch one-hot fed to ENCODER FiLM on the
+            # streaming path, where `initialize_databatch` (which would
+            # normally build `encoder_conditions`) is skipped. 0 = off, which
+            # is every variant predating Tier 2a. Must equal
+            # `conditioning_params.condition_dim`.
+            encoder_batch_condition_dim: int = 0,
             optimizer_params: Optional[dict] = None,
             loss_params: Optional[dict] = None,
             decoder_covariate_dim: int = 0,
@@ -186,6 +192,12 @@ class VQNiche_Dual(BaseModel):
         # `train()` sets `decoder_covariate_dim` to n_distinct_train_
         # batches after data loading.
         self.decoder_covariate_dim       = int(decoder_covariate_dim)
+        # Width of the per-cell batch one-hot for ENCODER FiLM. Needed only on
+        # the streaming path, where `initialize_databatch` -- which builds
+        # `encoder_conditions` on the in-memory path -- is skipped because it
+        # would collate the corpus. 0 = off, which is every variant predating
+        # Tier 2a. See `_encoder_batch_conditions`.
+        self.encoder_batch_condition_dim = int(encoder_batch_condition_dim)
         self.decoder_covariate_embed_dim = (
             int(decoder_covariate_embed_dim) if self.decoder_covariate_dim > 0 else 0
         )
@@ -693,6 +705,49 @@ class VQNiche_Dual(BaseModel):
             )
         return panel_masks[panel_id]
 
+    def _encoder_batch_conditions(self, batch) -> Optional[torch.Tensor]:
+        """
+        Per-cell batch one-hot for encoder FiLM, on the streaming path.
+
+        On the IN-MEMORY path `initialize_databatch` concatenates the batch
+        one-hot into `encoder_conditions` up front, and that value is used
+        unchanged -- this method only fills the gap where it is absent.
+        Streaming skips `initialize_databatch` entirely (it would collate the
+        corpus), so nothing there ever built the one-hot and encoder FiLM
+        could not run at all.
+
+        Materialised HERE rather than carried per-cell through the block, for
+        the same reason as `_per_cell_gene_mask`: a [N, 416] one-hot over a
+        900,000-cell block is ~1.5 GB in f32, while the same gather at
+        mini-batch size is a few hundred kilobytes.
+
+        Returns `None` when the model has no encoder conditioning module or
+        the block carries no batch IDs, so the unconditioned path is
+        untouched.
+        """
+        if getattr(self, 'encoder_batch_condition_dim', 0) <= 0:
+            return None
+        ids = getattr(batch, 'adata_batch_ids', None)
+        if ids is None:
+            raise ValueError(
+                "encoder batch conditioning is enabled "
+                f"(encoder_batch_condition_dim="
+                f"{self.encoder_batch_condition_dim}) but the block carries no "
+                "`adata_batch_ids`. On the streaming path these are stamped by "
+                "`_stamp_batch_ids` after collation; without them FiLM would "
+                "silently receive no batch signal, which is the failure this "
+                "check exists to prevent."
+            )
+        n = int(self.encoder_batch_condition_dim)
+        ids = ids.reshape(-1).long()
+        if int(ids.max()) >= n:
+            raise ValueError(
+                f"adata_batch_ids max {int(ids.max())} exceeds the "
+                f"conditioning width {n}; the densification map and the "
+                "encoder condition dim disagree."
+            )
+        return torch.nn.functional.one_hot(ids, num_classes=n).to(batch.x.dtype)
+
     def _step(self, batch: torch_geometric.data.Data, mode: str):
         """
         Shared step body for train/val/predict. Mode controls only logging
@@ -701,6 +756,11 @@ class VQNiche_Dual(BaseModel):
         batch_size = batch.batch_size
 
         encoder_conditions      = getattr(batch, 'encoder_conditions',      None)
+        # Streaming supplies no `encoder_conditions`; build the batch one-hot
+        # from the block's IDs instead. No-op when the block already carries
+        # them (in-memory) or when encoder conditioning is off.
+        if encoder_conditions is None:
+            encoder_conditions = self._encoder_batch_conditions(batch)
         attr_decoder_conditions = getattr(batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(batch, 'adata_batch_ids',         None)
         unseen_mask             = getattr(batch, 'adata_batch_ids_unseen_mask', None)

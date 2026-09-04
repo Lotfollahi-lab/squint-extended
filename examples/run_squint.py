@@ -5871,6 +5871,104 @@ def _r0_reference_stack() -> dict:
     return cfg
 
 
+def _patch_tier2a(
+        cfg: dict,
+        decoder_covariate_embed_dim: int = 64,
+        init_mode: str = "identity",
+        use_residual: bool = False,
+    ) -> dict:
+    """
+    Tier 2a: give the ENCODER batch information, and widen the decoder's.
+
+    The one axis Tier 1 did not move. Measured on Tier 1's annealed
+    checkpoint, held-out test: global iLISI 0.0435 against a 0.479 ceiling.
+    Scoped per tissue (`_ilisiscope.py`) that is 0.221 in skin and 0.245 in
+    brain -- 3-7x the global raw value, because the global number spans four
+    organs and partly asks a skin cell to have kidney neighbours. But at
+    9-27% of achievable, sections of the SAME organ still do not mix. That
+    residue is the target here.
+
+    **Evaluate this per tissue, not globally.** Pushing the global number up
+    would mean mixing organs, i.e. deleting the strongest biological signal in
+    the code space (tissue is +0.223 in the section-similarity regression,
+    against +0.077 for panel width and +0.012 for assay).
+
+    Two changes, both about giving the model the means to normalise batch out:
+
+    1. **Encoder FiLM on the batch one-hot.** Today the latent is never
+       de-batched: `adversarial_alpha` is 0.0 and no encoder conditioning
+       module is even instantiated, so batch is handled ONLY at the decoder.
+       FiLM computes per-feature scale and shift from the batch label and
+       applies `h <- gamma(batch) * h + beta(batch)` to the encoder trunk, so
+       the encoder can subtract each section's characteristic offset and gain.
+
+       `init_mode="identity"` starts at gamma=1, beta=0 -- step 0 is exactly
+       the unconditioned model, so any change is attributable to the
+       conditioning rather than to a different initialisation.
+
+    2. **Decoder covariate embedding 16 -> 64.** 16 dimensions to distinguish
+       416 batches is implausibly few; this is the decoder's own capacity to
+       absorb batch, which indirectly relieves the latent.
+
+    Deliberately NOT included: the adversarial head. It is the other half of
+    the idea -- FiLM gives the encoder the MEANS, an adversary gives it the
+    MOTIVE -- but a 416-way classifier is miscalibrated here. A block holds
+    ~3 sections, so it would see 3 classes per step, and `wt_adv_batch=150`
+    was tuned for TWO batches (CE bounded by log 2 = 0.69, against log 416 =
+    6.03). That is Tier 2b and needs design work first, not a config flip.
+
+    Requires the streaming plumbing added alongside this patch:
+    `initialize_databatch` builds `encoder_conditions` on the in-memory path
+    and streaming skips it, so the model derives the one-hot per mini-batch
+    in `VQNiche_Dual._encoder_batch_conditions`.
+
+    Parameters
+    ----------
+    decoder_covariate_embed_dim : int
+        New width of the decoder's batch embedding. Default 64 (from 16).
+    init_mode : str
+        FiLM initialisation. Default "identity" -- see above.
+    use_residual : bool
+        FiLM residual connection. Default False, matching `_patch_film`.
+
+    Returns
+    -------
+    - dict
+        The same cfg, mutated in place.
+    """
+    enc = cfg["model"]["encoder_params"]
+    if "vq_cell_params" not in enc:
+        raise KeyError(
+            "_patch_tier2a expects a dual-VQ config; got encoder_params keys "
+            f"{sorted(enc)}. Build on `_BD()`."
+        )
+    # `cell_batch_id` ONLY. Under streaming the other condition sources
+    # (rbf_distances, absolute_xy, ...) are built by `initialize_databatch`,
+    # which is skipped -- `train()` refuses anything else rather than
+    # conditioning on a wrong-width vector.
+    enc["conditioning_params"] = {
+        "condition_list": ["cell_batch_id"],
+        "use_bias": True,
+        "use_residual": bool(use_residual),
+        "residual_weight": 0.2,
+        "init_mode": str(init_mode),
+    }
+    # `condition_dim` is bound in `train()` once the batch count is known
+    # (416 for the train-restricted map, not the blob's 635).
+
+    # Guard on the REQUEST flag, not on `decoder_covariate_dim`: that is set
+    # at runtime in `train()` from the batch count and is absent at build
+    # time, so checking it here would reject every valid config.
+    if not cfg["model"].get("decoder_covariate_dim_request", False):
+        raise ValueError(
+            "_patch_tier2a widens the decoder covariate embedding, but this "
+            "config has no decoder covariate requested. Apply "
+            "`_patch_dual_decoder_covariate` first (the reference stack does)."
+        )
+    cfg["model"]["decoder_covariate_embed_dim"] = int(decoder_covariate_embed_dim)
+    return cfg
+
+
 def _patch_heartbeat(cfg: dict, every_n_steps: int) -> dict:
     """
     Set the periodic step log without touching the rest of the step budget.
@@ -6346,6 +6444,48 @@ VARIANTS: dict = {
         # Built from corpus-holdout's OWN builder rather than a copy of its
         # 14-deep nest, so the two cannot drift apart. Resolved at call time.
         "build": lambda: _patch_tier1(VARIANTS["corpus-holdout"]["build"]()),
+    },
+
+    "corpus-holdout-tier2a": {
+        "description": (
+            "Tier 1 plus ENCODER batch conditioning: FiLM on the batch "
+            "one-hot, and the decoder's batch embedding widened 16 -> 64. "
+            "Targets the one axis Tier 1 did not move -- integration. "
+            "EVALUATE PER TISSUE, not globally: the global iLISI spans four "
+            "organs, so pushing it up would mean mixing organs and deleting "
+            "the strongest biological signal in the code space. The number to "
+            "beat is within-tissue, where Tier 1 sits at 0.221 (skin) and "
+            "0.245 (brain) against a 1.0 ceiling. Built by calling "
+            "corpus-holdout-tier1's own builder, so the diff is exactly "
+            "`_patch_tier2a`. NO adversarial head -- that is Tier 2b and a "
+            "416-way classifier fed ~3 classes per block needs design work "
+            "first. REQUIRES --split-sections-json _splitspec.json."
+        ),
+        "patches": [
+            "=corpus-holdout-tier1 (all of it)",
+            "+tier2a(encoder FiLM on cell_batch_id, identity init; "
+            "decoder_covariate_embed_dim 16 -> 64)",
+        ],
+        "build": lambda: _patch_tier2a(VARIANTS["corpus-holdout-tier1"]["build"]()),
+    },
+
+    "smoke-tier2a+stream+xhs1000-39b_1p": {
+        "description": (
+            "Proof that the Tier 2a paths EXECUTE. Encoder FiLM has NEVER run "
+            "on the streaming backend: `initialize_databatch` builds "
+            "`encoder_conditions` on the in-memory path and streaming skips "
+            "it, so enabling `conditioning_params` used to raise NameError on "
+            "`data_batch`. The one-hot is now derived per mini-batch in "
+            "`VQNiche_Dual._encoder_batch_conditions`. Watch for the "
+            "'encoder FiLM: batch one-hot, condition_dim=' banner -- its "
+            "absence means FiLM did not arm and the run is just Tier 1."
+        ),
+        "patches": [
+            "=smoke-tier1+stream+xhs1000-39b_1p",
+            "+tier2a(encoder FiLM, decoder covariate embed 64)",
+        ],
+        "build": lambda: _patch_tier2a(
+            VARIANTS["smoke-tier1+stream+xhs1000-39b_1p"]["build"]()),
     },
 
     "smoke-tier1+stream+xhs1000-39b_1p": {
@@ -39019,15 +39159,6 @@ def train(
         obs_per_batch_id=getattr(dataset_blob, 'obs_per_batch_id', None),
     )
 
-    # ---- Model: bind condition dims if FiLM is enabled --------------------
-    if "conditioning_params" in cfg["model"]["encoder_params"]:
-        cfg["model"]["encoder_params"]["conditioning_params"]["condition_dim"] = (
-            data_batch.encoder_condition_dim
-        )
-    if "spatial_prior_params" in cfg["model"]["encoder_params"]:
-        cfg["model"]["encoder_params"]["spatial_prior_params"][
-            "spatial_prior_feature_dim"
-        ] = data_batch.spatial_prior_feature_dim
     # Helper: derive the number of distinct batches in this run from the
     # densified per-cell batch IDs. `adata_batch_ids` is ALWAYS populated
     # by `initialize_databatch` (regardless of whether encoder FiLM is on),
@@ -39042,6 +39173,38 @@ def train(
         if explicit is not None:
             return int(explicit)
         return int(db.adata_batch_ids.max().item()) + 1
+
+    # ---- Model: bind condition dims if FiLM is enabled --------------------
+    # STREAMING has no `data_batch` -- `initialize_databatch` is skipped
+    # because it would collate the corpus -- so `encoder_condition_dim` does
+    # not exist and the in-memory binding below would raise NameError. That is
+    # exactly why encoder FiLM had never run at corpus scale.
+    #
+    # Under streaming the only encoder condition supported is the batch
+    # one-hot, whose width is the number of distinct batches; the model builds
+    # the one-hot itself per mini-batch (`_encoder_batch_conditions`). Refuse
+    # anything else rather than silently conditioning on a wrong-width vector.
+    if "conditioning_params" in cfg["model"]["encoder_params"]:
+        _cond = cfg["model"]["encoder_params"]["conditioning_params"]
+        if _streaming:
+            _cl = list(_cond.get("condition_list") or [])
+            if _cl != ["cell_batch_id"]:
+                raise ValueError(
+                    f"streaming supports only condition_list=['cell_batch_id'] "
+                    f"for the encoder, got {_cl}. The others "
+                    "(rbf_distances, absolute_xy, ...) are built by "
+                    "`initialize_databatch`, which streaming skips."
+                )
+            _cond["condition_dim"] = _n_distinct_batches(dataset_blob)
+            cfg["model"]["encoder_batch_condition_dim"] = _cond["condition_dim"]
+            print(f"encoder FiLM: batch one-hot, condition_dim="
+                  f"{_cond['condition_dim']}")
+        else:
+            _cond["condition_dim"] = data_batch.encoder_condition_dim
+    if "spatial_prior_params" in cfg["model"]["encoder_params"]:
+        cfg["model"]["encoder_params"]["spatial_prior_params"][
+            "spatial_prior_feature_dim"
+        ] = data_batch.spatial_prior_feature_dim
 
     # NicheCompass-style decoder covariate (concat-based batch correction).
     # When the user enables it via _patch_dual_decoder_covariate, the dual
