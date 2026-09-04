@@ -5871,6 +5871,49 @@ def _r0_reference_stack() -> dict:
     return cfg
 
 
+def _n_distinct_batches(db) -> int:
+    """
+    Number of distinct batches in this run, from whichever object carries it.
+
+    Two shapes reach this. The STREAMING PROBE carries the count explicitly:
+    it is built from ONE section, so `adata_batch_ids.max()` there would only
+    ever see that section's own batch. The IN-MEMORY data batch carries
+    densified per-cell ids instead, and `initialize_databatch` always
+    populates them regardless of whether FiLM is on -- `encoder_condition_dim`
+    was the wrong source, because it is set only when FiLM is enabled, which
+    is not the case for adversarial-only or covariate-only variants.
+
+    Passing anything else -- the DATASET BLOB, most plausibly, since it is in
+    scope at every call site -- is a programming error, and one that cost a
+    Tier 2a smoke run: `OnDiskDatasetBlob` has neither attribute and the bare
+    `AttributeError: 'OnDiskDatasetBlob' object has no attribute
+    'adata_batch_ids'` named the symbol but not the mistake. Say which object
+    was wanted instead.
+
+    Parameters
+    ----------
+    db : object
+        The streaming probe or the in-memory data batch -- NOT the blob.
+
+    Returns
+    -------
+    - int
+        The batch count.
+    """
+    explicit = getattr(db, "n_distinct_batches", None)
+    if explicit is not None:
+        return int(explicit)
+    ids = getattr(db, "adata_batch_ids", None)
+    if ids is None:
+        raise TypeError(
+            f"{type(db).__name__} carries neither `n_distinct_batches` nor "
+            "`adata_batch_ids`, so the batch count cannot be derived from it. "
+            "Pass the streaming probe or the in-memory data batch (both are "
+            "bound to `data_batch` in `train()`), not the dataset blob."
+        )
+    return int(ids.max().item()) + 1
+
+
 def _patch_tier2a(
         cfg: dict,
         decoder_covariate_embed_dim: int = 64,
@@ -6474,8 +6517,10 @@ VARIANTS: dict = {
             "Proof that the Tier 2a paths EXECUTE. Encoder FiLM has NEVER run "
             "on the streaming backend: `initialize_databatch` builds "
             "`encoder_conditions` on the in-memory path and streaming skips "
-            "it, so enabling `conditioning_params` used to raise NameError on "
-            "`data_batch`. The one-hot is now derived per mini-batch in "
+            "it, so `condition_dim` bound to 0 from a zero-width placeholder "
+            "and FiLM trained on a condition carrying nothing -- silently, "
+            "with the logs looking normal. The width now comes from the batch "
+            "count and the one-hot is derived per mini-batch in "
             "`VQNiche_Dual._encoder_batch_conditions`. Watch for the "
             "'encoder FiLM: batch one-hot, condition_dim=' banner -- its "
             "absence means FiLM did not arm and the run is just Tier 1."
@@ -39159,31 +39204,23 @@ def train(
         obs_per_batch_id=getattr(dataset_blob, 'obs_per_batch_id', None),
     )
 
-    # Helper: derive the number of distinct batches in this run from the
-    # densified per-cell batch IDs. `adata_batch_ids` is ALWAYS populated
-    # by `initialize_databatch` (regardless of whether encoder FiLM is on),
-    # so this is a reliable source. `encoder_condition_dim` was the wrong
-    # source — it only gets set when FiLM is enabled, which is not the
-    # case for adversarial-only or covariate-only variants.
-    def _n_distinct_batches(db) -> int:
-        # The streaming probe carries the corpus-wide count explicitly: it is
-        # built from ONE section, so `adata_batch_ids.max()` there would only
-        # ever see that section's own batch.
-        explicit = getattr(db, "n_distinct_batches", None)
-        if explicit is not None:
-            return int(explicit)
-        return int(db.adata_batch_ids.max().item()) + 1
 
     # ---- Model: bind condition dims if FiLM is enabled --------------------
-    # STREAMING has no `data_batch` -- `initialize_databatch` is skipped
-    # because it would collate the corpus -- so `encoder_condition_dim` does
-    # not exist and the in-memory binding below would raise NameError. That is
-    # exactly why encoder FiLM had never run at corpus scale.
+    # STREAMING cannot use `encoder_condition_dim`, and the failure is SILENT.
+    # `data_batch` does exist on that path -- it is the streaming probe -- but
+    # the width it reports is 0: the transform stamps `cell_batch_id` as a
+    # zero-width placeholder (`torch.empty(0)`) and the real one-hot is
+    # concatenated by `initialize_databatch`, which streaming skips because it
+    # would collate the corpus. Binding `condition_dim = 0` builds a FiLM whose
+    # condition carries nothing, so the model trains exactly like the
+    # unconditioned one while every log line says conditioning is on. That is
+    # why encoder FiLM had never actually worked at corpus scale.
     #
-    # Under streaming the only encoder condition supported is the batch
-    # one-hot, whose width is the number of distinct batches; the model builds
-    # the one-hot itself per mini-batch (`_encoder_batch_conditions`). Refuse
-    # anything else rather than silently conditioning on a wrong-width vector.
+    # So take the width from the batch COUNT instead, the same source the
+    # decoder covariate uses, which keeps the two consistent by construction.
+    # The model builds the one-hot itself per mini-batch
+    # (`_encoder_batch_conditions`). Refuse any other condition source rather
+    # than silently conditioning on a wrong-width vector.
     if "conditioning_params" in cfg["model"]["encoder_params"]:
         _cond = cfg["model"]["encoder_params"]["conditioning_params"]
         if _streaming:
@@ -39195,7 +39232,7 @@ def train(
                     "(rbf_distances, absolute_xy, ...) are built by "
                     "`initialize_databatch`, which streaming skips."
                 )
-            _cond["condition_dim"] = _n_distinct_batches(dataset_blob)
+            _cond["condition_dim"] = _n_distinct_batches(data_batch)
             cfg["model"]["encoder_batch_condition_dim"] = _cond["condition_dim"]
             print(f"encoder FiLM: batch one-hot, condition_dim="
                   f"{_cond['condition_dim']}")

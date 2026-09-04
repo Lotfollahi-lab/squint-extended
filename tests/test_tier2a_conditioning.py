@@ -2,12 +2,15 @@
 Tier 2a gives the ENCODER batch information. Two paths need testing because
 neither could previously run.
 
-Encoder FiLM has never executed on the streaming backend. `encoder_conditions`
-carrying the batch one-hot is assembled only in `initialize_databatch`, which
-streaming skips because it would collate the corpus -- so `conditioning_params`
-was not merely off, it would have raised NameError on the `data_batch` that
-the condition-dim binding referenced. The one-hot is now derived per mini-batch
-from the block's `adata_batch_ids`.
+Encoder FiLM has never actually worked on the streaming backend, and the way
+it failed was SILENT. `encoder_conditions` carrying the batch one-hot is
+assembled only in `initialize_databatch`, which streaming skips because it
+would collate the corpus; the transform stamps `cell_batch_id` as a zero-width
+placeholder. So `condition_dim` bound to 0, FiLM was built with a condition
+carrying nothing, and the model trained exactly like the unconditioned one
+while every log line said conditioning was on. The width now comes from the
+batch count and the one-hot is derived per mini-batch from the block's
+`adata_batch_ids`.
 
 The failure this guards against is silence: FiLM handed a zero-width or absent
 condition trains exactly like the unconditioned model while every log line
@@ -174,3 +177,40 @@ def test_tier2a_refuses_a_single_vq_config(rs):
     cfg["model"]["decoder_covariate_dim_request"] = True
     with pytest.raises(KeyError, match="dual-VQ"):
         rs._patch_tier2a(cfg)
+
+
+# --------------------------------------------------------------------------
+# The batch-count helper, which is where the first Tier 2a smoke run failed
+# --------------------------------------------------------------------------
+
+def test_n_distinct_batches_prefers_the_explicit_streaming_count(rs):
+    """
+    The streaming probe is built from ONE section, so `adata_batch_ids.max()`
+    on it would only ever see that section's own batch. It carries the
+    corpus-wide count explicitly and that must win.
+    """
+    class _Probe:
+        n_distinct_batches = 416
+        adata_batch_ids = torch.tensor([7])      # would give 8 if consulted
+
+    assert rs._n_distinct_batches(_Probe()) == 416
+
+
+def test_n_distinct_batches_falls_back_to_ids_in_memory(rs):
+    class _InMemory:
+        adata_batch_ids = torch.tensor([0, 3, 2, 3])
+
+    assert rs._n_distinct_batches(_InMemory()) == 4
+
+
+def test_n_distinct_batches_rejects_an_object_carrying_neither(rs):
+    """
+    Passing the DATASET BLOB rather than the data batch is what broke the
+    first Tier 2a smoke run: `OnDiskDatasetBlob` has neither attribute, and
+    the bare AttributeError said nothing about which object was wrong.
+    """
+    class _Blob:
+        pass
+
+    with pytest.raises(TypeError, match="neither"):
+        rs._n_distinct_batches(_Blob())
