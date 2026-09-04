@@ -377,3 +377,62 @@ width augmentation, i.e. randomly subsetting wide panels during training so
 the model sees narrow ones. Untested, and not required for the current
 claims.
 
+---
+
+## 8. What "batch" means here, and what Tier 2 should actually target
+
+`batch_key` is `dataset_batch` = **one tissue section**, and iLISI is computed
+over it. The 187 test sections span **four organs** (skin 111, kidney 42,
+pancreas 24, brain 10), so the global number partly asks a skin cell to have
+kidney neighbours. Scoped per tissue (`_ilisiscope.py`, `cell_emb`, k=90,
+50,000 cells, same settings as the metrics script):
+
+| scope | sections | iLISI | ceiling | % of achievable |
+|---|---|---|---|---|
+| global | 187 | 0.0363 | 0.479 | 7.6% |
+| skin | 111 | **0.2210** | 0.809 | 27.3% |
+| brain | 10 | **0.2452** | 1.000 | 24.5% |
+| pancreas | 24 | 0.1828 | 1.000 | 18.3% |
+| kidney | 42 | 0.0950 | 1.000 | 9.5% |
+
+**Both halves matter.** Within-tissue iLISI is **3–7× the global raw value**,
+so the headline number really does overstate the problem — tissue separation,
+which we want, is a large part of the shortfall. But at 9–27% of achievable,
+sections of the *same organ* still do not mix well, so there IS a real
+technical batch effect. **Tier 2 is justified, but the target is within-tissue
+section mixing and the metric to report is per-tissue iLISI, not global.**
+
+**The assay row is degenerate — do not quote it.** It reads 0.0000 on every
+embedding, which looks like total assay separation. TERRA test is 186 xenium
+sections against **1 cosmx section** (0.05M cells, 0.35% of test); in a
+50,000-cell subsample that is ~175 cells, so a cell's 90 neighbours essentially
+never contain one. Class imbalance, not a batch effect. A per-assay claim needs
+a balanced subsample.
+
+**A ceiling formula correction.** §5 records the iLISI ceiling as
+`(k-1)/(n_batches-1)`. That holds only when `n_batches > k`; below it the
+ceiling is 1.0. The correct general form is
+`(min(k, n_batches) - 1) / (n_batches - 1)`. Applied unguarded to a
+within-tissue scope of 10 sections the old formula returns 9.89, which is how
+the bug announced itself. The 0.30 figure for 297 batches at k=90 is
+unaffected.
+
+### Tier 1 reduced technical nuisance where iLISI could not see it
+
+The section-similarity regression, rerun on Tier 1's annealed checkpoint:
+
+| coefficient | baseline | tier1 | |
+|---|---|---|---|
+| same tissue (niche) | 0.1327 | **0.1477** | +11% — biology, kept |
+| same panel width (niche) | 0.0657 | **0.0497** | −24% — nuisance, reduced |
+| same assay (niche) | 0.0224 | **0.0115** | −49% — nuisance, reduced |
+| same panel width (cell) | 0.0770 | 0.0694 | −10% |
+| same assay (cell) | 0.0116 | 0.0060 | −48% |
+
+Biology-to-nuisance ratio (tissue ÷ panel width) on the niche branch:
+**2.02 → 2.97, a 47% improvement**; on the cell branch 2.89 → 3.07. So Tier 1
+*did* move integration in the right direction — pushing technical structure out
+while holding or increasing tissue structure — it simply is not what a
+section-level iLISI measures. Worth reporting alongside iLISI rather than
+instead of it.
+
