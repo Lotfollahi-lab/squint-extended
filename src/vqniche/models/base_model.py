@@ -62,6 +62,7 @@ class BaseModel(pl.LightningModule):
             weight_decay: float = 0.0,
             mask_lr_scale: float = 1.0,
             fused: bool = False,
+            no_decay_patterns: Optional[List[str]] = None,
             lr_schedule: Literal['none', 'cosine'] = 'none',
             warmup_steps: int = 0,
             min_lr_ratio: float = 0.0,
@@ -103,6 +104,9 @@ class BaseModel(pl.LightningModule):
             The weight decay.
         - mask_lr_scale: float
             The learning rate scale for the learnable mask.
+        - no_decay_patterns: Optional[List[str]]
+            Parameter-name substrings to EXEMPT from weight decay. None
+            (default) keeps the legacy single-group optimizer.
         - lr_schedule: 'none' | 'cosine'
             Learning-rate schedule. 'none' (default) keeps the legacy
             constant-LR behaviour and returns a bare optimizer.
@@ -156,6 +160,23 @@ class BaseModel(pl.LightningModule):
         # LR schedule. Default 'none' returns a bare optimizer, which is
         # exactly the legacy path -- every variant predating this keyword
         # trains as it did before.
+        # Parameters exempted from weight decay, by name substring.
+        #
+        # WHY THIS EXISTS. Adam applies weight decay every step regardless of
+        # whether a parameter received gradient, and the adaptive
+        # normalisation makes the decay step ~`lr` no matter the magnitude --
+        # so a zero-gradient parameter reaches EXACTLY 0.0 within ~1,000
+        # steps at lr=7e-4, wd=1e-3. Measured on the corpus runs: the
+        # per-batch `batch_embedding` had only 52/416, 69/416 and 67/416
+        # non-zero rows, because a section appears in roughly one block out
+        # of ~114 and then takes ~198,000 steps of pure decay. The decoder
+        # covariate -- the paper's batch-correction lever -- was structurally
+        # disabled for ~85% of sections in every run.
+        #
+        # Embeddings are conventionally excluded from weight decay for
+        # exactly this reason. Default None = legacy single group, so every
+        # variant predating this trains as before.
+        self.no_decay_patterns = list(no_decay_patterns or [])
         self.lr_schedule = str(lr_schedule)
         self.warmup_steps = int(warmup_steps)
         self.min_lr_ratio = float(min_lr_ratio)
@@ -950,6 +971,56 @@ class BaseModel(pl.LightningModule):
             "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
         }
 
+    def _param_groups(self):
+        """
+        Optimizer parameter groups, splitting out anything exempt from decay.
+
+        Returns `self.parameters()` unchanged when `no_decay_patterns` is
+        empty, so the legacy single-group path is untouched.
+
+        Matching is on a NAME SUBSTRING rather than on module type, because
+        the parameters that need exempting are reached by different routes --
+        `batch_embedding` is an `nn.Embedding` on the model while
+        `conditioning_module.param_generator` is an `nn.Linear` inside the
+        encoder -- and a type-based rule would either miss one or sweep in
+        every other Linear in the network.
+
+        Returns
+        -------
+        - Iterable
+            Either `self.parameters()` or a list of two param-group dicts.
+        """
+        if not self.no_decay_patterns:
+            return self.parameters()
+
+        decay, no_decay, matched = [], [], []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(pat in name for pat in self.no_decay_patterns):
+                no_decay.append(param)
+                matched.append(name)
+            else:
+                decay.append(param)
+
+        if not no_decay:
+            # A pattern that matches nothing is a silent no-op that leaves
+            # the very parameters it names being decayed to zero, which is
+            # the bug this feature exists to fix. Fail instead.
+            raise ValueError(
+                f"no_decay_patterns={self.no_decay_patterns} matched no "
+                f"parameter. Available names include: "
+                f"{[n for n, _ in list(self.named_parameters())[:8]]}..."
+            )
+        print(
+            f"weight decay: {self.weight_decay} on {len(decay)} tensors, "
+            f"0.0 on {len(no_decay)} exempt ({', '.join(sorted(matched))})"
+        )
+        return [
+            {"params": decay, "weight_decay": self.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
     def _build_optimizer(self) -> torch.optim.Optimizer:
         """
         Build the bare optimizer.
@@ -961,16 +1032,9 @@ class BaseModel(pl.LightningModule):
         """
         # TODO: Add support for multiple optimizers
         if self.optimizer_name == 'adam':
-            # mask_params, other_params = [], []
-            # for name, param in self.named_parameters():
-            #     (mask_params if name.endswith("learnable_mask") else other_params).append(param)
-            
-            # return torch.optim.Adam(
-            #     [
-            #         {"params": other_params, "lr": self.lr, "weight_decay": self.weight_decay},
-            #         {"params": mask_params, "lr": self.lr * self.mask_lr_scale, "weight_decay": 0.0},
-            #     ]
-            # )
+            # Parameter groups. One group unless `no_decay_patterns` is set,
+            # which keeps the legacy path byte-identical.
+            params = self._param_groups()
             # `fused=True` (when configured) coalesces parameter updates
             # into a single CUDA kernel. Best-effort: if PyTorch refuses
             # the request (CPU params, exotic dtype, older PyTorch
@@ -978,7 +1042,7 @@ class BaseModel(pl.LightningModule):
             # warning rather than crashing training.
             try:
                 return torch.optim.Adam(
-                    self.parameters(),
+                    params,
                     lr=self.lr,
                     weight_decay=self.weight_decay,
                     fused=self.fused,
@@ -991,7 +1055,7 @@ class BaseModel(pl.LightningModule):
                         f"fused=False."
                     )
                 return torch.optim.Adam(
-                    self.parameters(),
+                    params,
                     lr=self.lr,
                     weight_decay=self.weight_decay,
                 )

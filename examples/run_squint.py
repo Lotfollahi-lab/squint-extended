@@ -5914,6 +5914,60 @@ def _n_distinct_batches(db) -> int:
     return int(ids.max().item()) + 1
 
 
+def _patch_nodecay(
+        cfg: dict,
+        patterns: tuple = ("batch_embedding", "conditioning_module"),
+    ) -> dict:
+    """
+    Exempt the batch-representation parameters from weight decay.
+
+    THE BUG. Adam applies weight decay every step whether or not a parameter
+    received gradient, and its adaptive normalisation makes the decay step
+    ~`lr` regardless of magnitude -- so a zero-gradient parameter reaches
+    EXACTLY 0.0 within ~1,000 steps at lr=7e-4, wd=1e-3 (simulated directly;
+    see CORPUS_EVAL_FINDINGS.md §9). `BaseModel._build_optimizer` passed
+    `self.parameters()` as ONE group, so this hit the per-batch embedding like
+    everything else.
+
+    Measured on the three corpus runs, non-zero rows of `batch_embedding`:
+
+        baseline  52/416      tier1  69/416      tier2a  67/416
+
+    A section appears in roughly ONE block out of ~114 over a 200,000-step
+    run -- about 1,758 consecutive steps -- and then takes ~198,000 steps of
+    pure decay. Only the largest sections and those sampled near the end
+    survive. So the decoder covariate, which is the paper's batch-correction
+    lever (Eq. 6), has been structurally disabled for ~85% of sections in
+    every corpus run to date, and Tier 2a's encoder FiLM was erased the same
+    way (355 of 416 generator columns exactly zero).
+
+    WHY THIS IS THE RIGHT NEXT EXPERIMENT ON TIER 1, NOT TIER 2a. Tier 1
+    already carries the decoder covariate; this restores a mechanism it was
+    supposed to have, rather than adding a new one. If integration moves,
+    Tier 2a's encoder FiLM may not be needed at all -- and applying the fix to
+    Tier 2a first would change two things at once against the Tier 1 baseline
+    and lose attribution.
+
+    Embeddings are conventionally excluded from weight decay for exactly this
+    reason, so this is a correction rather than a tuning knob.
+
+    Parameters
+    ----------
+    patterns : tuple of str
+        Parameter-name substrings to exempt. Defaults cover the decoder's
+        `batch_embedding` and the encoder's `conditioning_module` (harmless
+        when the latter is absent, as it is on Tier 1 -- the matcher only
+        needs ONE hit, and `batch_embedding` always provides it).
+
+    Returns
+    -------
+    - dict
+        The same cfg, mutated in place.
+    """
+    cfg["model"]["optimizer_params"]["no_decay_patterns"] = list(patterns)
+    return cfg
+
+
 def _patch_tier2a(
         cfg: dict,
         decoder_covariate_embed_dim: int = 64,
@@ -6487,6 +6541,58 @@ VARIANTS: dict = {
         # Built from corpus-holdout's OWN builder rather than a copy of its
         # 14-deep nest, so the two cannot drift apart. Resolved at call time.
         "build": lambda: _patch_tier1(VARIANTS["corpus-holdout"]["build"]()),
+    },
+
+    "corpus-holdout-tier1-nodecay": {
+        "description": (
+            "Tier 1 with the batch embedding EXEMPTED from weight decay. One "
+            "change from corpus-holdout-tier1, and it restores a mechanism "
+            "Tier 1 was supposed to have rather than adding a new one: Adam's "
+            "weight decay drives zero-gradient parameters to exactly 0 within "
+            "~1,000 steps, and a section appears in ~1 block out of ~114, so "
+            "only 69 of 416 batch-embedding rows survived. The decoder "
+            "covariate is the paper's batch-correction lever (Eq. 6) and has "
+            "been disabled for ~85% of sections in every corpus run. RUN THIS "
+            "BEFORE Tier 2a: if integration moves, the encoder FiLM may not be "
+            "needed, and applying the fix to Tier 2a first would change two "
+            "things at once. Evaluate PER TISSUE. REQUIRES "
+            "--split-sections-json _splitspec.json."
+        ),
+        "patches": [
+            "=corpus-holdout-tier1 (all of it)",
+            "+nodecay(batch_embedding, conditioning_module)",
+        ],
+        "build": lambda: _patch_nodecay(VARIANTS["corpus-holdout-tier1"]["build"]()),
+    },
+
+    "smoke-tier1-nodecay+stream+xhs1000-39b_1p": {
+        "description": (
+            "Proof that the no-decay grouping arms and that the batch "
+            "embedding survives. The check that matters is not that the run "
+            "completes -- it is that the embedding rows are NON-ZERO "
+            "afterwards, which is exactly what fails today. Watch for the "
+            "'weight decay: ... 0.0 on N exempt' banner."
+        ),
+        "patches": [
+            "=smoke-tier1+stream+xhs1000-39b_1p",
+            "+nodecay(batch_embedding, conditioning_module)",
+        ],
+        "build": lambda: _patch_nodecay(
+            VARIANTS["smoke-tier1+stream+xhs1000-39b_1p"]["build"]()),
+    },
+
+    "corpus-holdout-tier2a-nodecay": {
+        "description": (
+            "Tier 2a with the no-decay fix -- encoder FiLM AND the batch "
+            "embedding exempted from weight decay. Only worth running if "
+            "corpus-holdout-tier1-nodecay leaves integration short, since "
+            "that run tests whether the decoder covariate alone suffices."
+        ),
+        "patches": [
+            "=corpus-holdout-tier2a (all of it)",
+            "+nodecay(batch_embedding, conditioning_module)",
+        ],
+        "build": lambda: _patch_nodecay(VARIANTS["corpus-holdout-tier2a"]["build"]()),
     },
 
     "corpus-holdout-tier2a": {
