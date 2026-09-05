@@ -436,3 +436,49 @@ while holding or increasing tissue structure — it simply is not what a
 section-level iLISI measures. Worth reporting alongside iLISI rather than
 instead of it.
 
+---
+
+## 9. Weight decay is erasing the batch embedding, in every corpus run
+
+Tier 2a trained cleanly (200,000 steps, 5.08 h, all 25 preflight checks) and
+encoder FiLM armed correctly at `condition_dim=416`. But its FiLM generator
+has **355 of 416 columns exactly zero**, and the decoder's batch embedding is
+no better -- non-zero rows are **52/416 (baseline), 69/416 (Tier 1), 67/416
+(Tier 2a)**. Roughly 85% of sections have no usable batch representation in
+any of the three runs.
+
+**This is not "those sections were never sampled".** A never-sampled row would
+keep its `N(0, 0.02^2)` init, norm ~0.08 -- not zero. The rows were actively
+driven there. Simulated directly: `Adam(lr=7e-4, weight_decay=0.001)` applied
+to a parameter receiving zero gradient reaches **0.000000 within 1,000 steps**,
+because the adaptive normalisation makes the decay step ~`lr` regardless of
+the parameter's magnitude.
+
+`BaseModel._build_optimizer` passes `self.parameters()` as ONE group, so decay
+hits the batch embedding and the FiLM generator like everything else. With
+~114 blocks over a 200,000-step run at ~3-4 sections per block, a given
+section appears in roughly one block -- about 1,758 consecutive steps -- and
+then receives ~198,000 steps of pure decay. Only the largest sections, and
+those sampled near the end, survive.
+
+**This is a strong candidate for the actual cause of the integration failure.**
+The decoder covariate is the paper's batch-correction lever (Eq. 6) and it has
+been structurally disabled for 85% of sections in every run measured. It also
+explains why Tier 2a moved nothing: FiLM cannot condition on a batch whose
+column is zero.
+
+**The fix is a no-decay parameter group** for `batch_embedding` and
+`conditioning_module` -- embeddings and normalisation-style parameters are
+conventionally excluded from weight decay for exactly this reason.
+`configure_optimizers` already builds the optimizer in one place, and a
+commented-out two-group version is sitting in that method's history.
+
+**Do not evaluate Tier 2a as a test of encoder conditioning.** It measures a
+model whose conditioning was erased. Fix the parameter grouping and rerun
+before spending the ~6 h evaluation.
+
+**A measurement note.** "Exactly zero" and "never updated" are different
+claims, and only the second was interesting. Checking against the INIT value
+rather than against zero is what separates them -- a parameter at exactly 0.0
+under Adam+weight-decay is evidence of decay winning, not of absence.
+
