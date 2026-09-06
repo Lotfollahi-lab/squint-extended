@@ -5970,9 +5970,13 @@ def _patch_epochs(cfg: dict, epochs: float = 3.0, batch_size: int = 512,
     section->block assignment EVERY EPOCH, "so over epochs a given section
     co-occurs with many others". At 200,000 steps that machinery is inert: a
     corpus epoch is 187,562 steps, so the model sees ONE grouping for 94% of
-    the run. Each section is visited 0.82 times -- most are seen once, some
-    never -- in a single burst of ~1,757 consecutive steps, after which the
-    model never returns to them.
+    the run. Each section is visited **1.07 times** -- essentially once -- in
+    a single burst of ~1,758 consecutive steps, after which the model does not
+    return to it.
+
+    Visits are `steps * batch_size / train_cells`, i.e. the epoch count, and
+    depend on NOTHING else: block width changes how many sections share a
+    mini-batch, not how often any of them recurs.
 
     That is sequential fine-tuning on one tissue-and-panel slice at a time,
     not SGD over a corpus, and it matches the symptom: on a FIXED 32-section
@@ -6698,7 +6702,7 @@ VARIANTS: dict = {
             "The primary lever on the plateau: KSectionBlockLoader reshuffles "
             "section->block assignment every EPOCH, so at 1.07 epochs that "
             "machinery is inert -- the model sees one grouping for 94% of the "
-            "run and visits each section 0.82 times, in a single burst of "
+            "run and visits each section 1.07 times, in a single burst of "
             "~1,757 consecutive steps. On a FIXED validation set val_loss "
             "bottoms at step 40,000 and then oscillates by 138 with no trend. "
             "Blocks unchanged, so the diff against corpus-holdout-tier1-nodecay "
