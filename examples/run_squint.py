@@ -5914,6 +5914,103 @@ def _n_distinct_batches(db) -> int:
     return int(ids.max().item()) + 1
 
 
+def _patch_blocks(
+        cfg: dict,
+        sections_per_block: int = 8,
+        max_cells_per_block: int = 1_900_000,
+    ) -> dict:
+    """
+    Widen the streaming block so a mini-batch mixes more sections.
+
+    WHY. Block size is what decides how many sections a mini-batch can draw
+    seeds from, and that is the mechanism every batch-integration signal
+    depends on (see `KSectionBlockLoader`'s docstring: "K=1 == per-section (no
+    mixing); K=all == the in-memory blob"). The corpus runs were configured
+    with `sections_per_block=8` but a 900,000-cell cap, and the mean train
+    section is 230,292 cells -- so the CAP binds and blocks actually held
+    **3.9 sections**, less than half the intent.
+
+    HEADROOM. The cap was chosen when the memory request was 150 GB and two
+    runs had already died (102 GB, then 253 GB). The request is now 400 GB and
+    the four completed corpus runs peaked at 82.4, 80.9, 79.5 and 79.3 GB --
+    about 20% utilisation. At the recorded ~12.1 GB median / 21.6 GB worst per
+    block at 900k, doubling the cap adds roughly that again, landing near
+    105-120 GB. Still less than a third of the request.
+
+    1,900,000 rather than more because it is the point where
+    `sections_per_block=8` becomes the binding constraint again
+    (8 x 230,292 = 1,842,339), which is what the variant asked for in the
+    first place. Raising both together is possible but couples two changes.
+
+    WHAT THIS DOES NOT FIX. Bigger blocks also mean LONGER blocks -- steps per
+    block is block cells / batch size, so mixing and burstiness scale
+    together. Recurrence is a separate lever; see `_patch_epochs`.
+
+    Returns
+    -------
+    - dict
+        The same cfg, mutated in place.
+    """
+    if cfg["dataset"].get("backend") != "on-disk":
+        raise ValueError(
+            "_patch_blocks only applies to the streaming backend; this config "
+            f"has backend={cfg['dataset'].get('backend')!r}."
+        )
+    cfg["datamodule"]["sections_per_block"] = int(sections_per_block)
+    cfg["datamodule"]["max_cells_per_block"] = int(max_cells_per_block)
+    return cfg
+
+
+def _patch_epochs(cfg: dict, epochs: float = 3.0, batch_size: int = 512,
+                  train_cells: int = 96_031_937) -> dict:
+    """
+    Set the step budget from an EPOCH count over the training cells.
+
+    WHY THIS IS THE PRIMARY LEVER. `KSectionBlockLoader` reshuffles the
+    section->block assignment EVERY EPOCH, "so over epochs a given section
+    co-occurs with many others". At 200,000 steps that machinery is inert: a
+    corpus epoch is 187,562 steps, so the model sees ONE grouping for 94% of
+    the run. Each section is visited 0.82 times -- most are seen once, some
+    never -- in a single burst of ~1,757 consecutive steps, after which the
+    model never returns to them.
+
+    That is sequential fine-tuning on one tissue-and-panel slice at a time,
+    not SGD over a corpus, and it matches the symptom: on a FIXED 32-section
+    validation set (`limit_val_batches=1.0`, `val_panel_width_mean` identical
+    across checks) `val_loss` bottoms at step 40,000 and then oscillates by
+    138 with no trend across the remaining 160,000 steps. It is also the same
+    access pattern that let weight decay erase the batch embedding (§9): one
+    burst of gradient, then ~198,000 steps of nothing.
+
+    More epochs is what switches the reshuffling on -- each section is seen
+    `epochs` times, co-occurring with a different set each time.
+
+    COST. 3 epochs is ~562,700 steps, ~14 h at the measured 11 steps/s,
+    against the 48 h wall clock. `_patch_step_budget` is called with
+    `val_checks=10` so validation stays at ten passes regardless of budget.
+
+    Returns
+    -------
+    - dict
+        The same cfg, mutated in place.
+    """
+    steps = int(round(epochs * train_cells / batch_size))
+    cfg = _patch_step_budget(
+        cfg, max_steps=steps, val_checks=10,
+        heartbeat_every_n_steps=2_000, save_top_k=-1, early_stopping=False,
+    )
+    # RE-SYNC THE LR HORIZON. `_patch_tier1` copies `total_steps` from
+    # `trainer.max_steps` at BUILD time, so changing the budget afterwards
+    # would leave the cosine schedule decaying to its 0.05x floor at the OLD
+    # horizon and sitting there for the rest of the run -- at 3 epochs that is
+    # 362,687 steps, 64% of the budget, at 3.5e-5. Silent: the banner still
+    # prints, the LR still moves, and only the horizon it prints gives it away.
+    _opt = cfg["model"].get("optimizer_params", {})
+    if _opt.get("lr_schedule", "none") != "none":
+        _opt["total_steps"] = steps
+    return cfg
+
+
 def _patch_nodecay(
         cfg: dict,
         patterns: tuple = ("batch_embedding", "conditioning_module"),
@@ -6593,6 +6690,40 @@ VARIANTS: dict = {
             "+nodecay(batch_embedding, conditioning_module)",
         ],
         "build": lambda: _patch_nodecay(VARIANTS["corpus-holdout-tier2a"]["build"]()),
+    },
+
+    "corpus-holdout-nodecay-3ep": {
+        "description": (
+            "nodecay at THREE epochs (~562,700 steps, ~14 h) instead of 1.07. "
+            "The primary lever on the plateau: KSectionBlockLoader reshuffles "
+            "section->block assignment every EPOCH, so at 1.07 epochs that "
+            "machinery is inert -- the model sees one grouping for 94% of the "
+            "run and visits each section 0.82 times, in a single burst of "
+            "~1,757 consecutive steps. On a FIXED validation set val_loss "
+            "bottoms at step 40,000 and then oscillates by 138 with no trend. "
+            "Blocks unchanged, so the diff against corpus-holdout-tier1-nodecay "
+            "is the budget alone. REQUIRES --split-sections-json _splitspec.json."
+        ),
+        "patches": ["=corpus-holdout-tier1-nodecay", "+epochs(3.0)"],
+        "build": lambda: _patch_epochs(
+            VARIANTS["corpus-holdout-tier1-nodecay"]["build"](), epochs=3.0),
+    },
+
+    "corpus-holdout-nodecay-bigblocks": {
+        "description": (
+            "nodecay with the block cap raised 900k -> 1.9M so "
+            "sections_per_block=8 binds again. Blocks held 3.9 sections, not "
+            "8, because the mean train section is 230,292 cells and the CAP "
+            "was the binding constraint -- so a mini-batch mixed less than "
+            "half the intended number of sections, which is the mechanism "
+            "every batch-integration signal depends on. Memory allows it: the "
+            "four completed corpus runs peaked at ~80 GB of a 400 GB request. "
+            "Same 200,000-step budget, so the diff is the block width alone."
+        ),
+        "patches": ["=corpus-holdout-tier1-nodecay",
+                    "+blocks(sections_per_block=8, max_cells_per_block=1.9M)"],
+        "build": lambda: _patch_blocks(
+            VARIANTS["corpus-holdout-tier1-nodecay"]["build"]()),
     },
 
     "corpus-holdout-tier2a": {

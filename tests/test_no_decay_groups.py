@@ -158,3 +158,59 @@ def test_nodecay_does_not_leak_into_tier1(rs):
     rs.VARIANTS["corpus-holdout-tier1-nodecay"]["build"]()
     t1 = rs.VARIANTS["corpus-holdout-tier1"]["build"]()
     assert "no_decay_patterns" not in t1["model"]["optimizer_params"]
+
+
+# --------------------------------------------------------------------------
+# Block width and epoch budget
+# --------------------------------------------------------------------------
+
+def test_bigblocks_changes_only_the_block_width(rs):
+    nd = rs.VARIANTS["corpus-holdout-tier1-nodecay"]["build"]()
+    bb = rs.VARIANTS["corpus-holdout-nodecay-bigblocks"]["build"]()
+    # The cap bound at 900k while sections_per_block was already 8, so blocks
+    # held 3.9 sections rather than 8. 1.9M makes the section count bind again.
+    assert nd["datamodule"]["max_cells_per_block"] == 900_000
+    assert bb["datamodule"]["max_cells_per_block"] == 1_900_000
+    assert bb["datamodule"]["sections_per_block"] == \
+        nd["datamodule"]["sections_per_block"] == 8
+    # budget, optimizer and losses untouched, or the comparison is void
+    assert bb["trainer"]["max_steps"] == nd["trainer"]["max_steps"] == 200_000
+    assert bb["model"]["optimizer_params"] == nd["model"]["optimizer_params"]
+    assert bb["model"]["loss_params"] == nd["model"]["loss_params"]
+
+
+def test_epochs_budget_matches_the_requested_epoch_count(rs):
+    ep = rs.VARIANTS["corpus-holdout-nodecay-3ep"]["build"]()
+    # 3 epochs over 96,031,937 training cells at batch 512
+    assert ep["trainer"]["max_steps"] == round(3.0 * 96_031_937 / 512)
+
+
+def test_epochs_resyncs_the_lr_horizon(rs):
+    """
+    `_patch_tier1` copies `total_steps` from `trainer.max_steps` at BUILD
+    time. Without a re-sync, a later budget change leaves the cosine schedule
+    decaying to its 0.05x floor at the OLD horizon and sitting there for the
+    remainder -- at 3 epochs that is 362,687 steps, 64% of the run, at
+    3.5e-05. The banner still prints and the LR still moves, so nothing in
+    the logs looks wrong.
+    """
+    ep = rs.VARIANTS["corpus-holdout-nodecay-3ep"]["build"]()
+    assert ep["model"]["optimizer_params"]["lr_schedule"] == "cosine"
+    assert ep["model"]["optimizer_params"]["total_steps"] == \
+        ep["trainer"]["max_steps"]
+
+
+def test_epochs_leaves_a_scheduleless_config_alone(rs):
+    """The re-sync must not invent `total_steps` where no schedule is set."""
+    cfg = rs._patch_dual_hst_corpus(rs._r0_reference_stack(), batch_size=512)
+    cfg = rs._patch_streaming(cfg, sections_per_block=8,
+                              max_cells_per_block=900_000)
+    out = rs._patch_epochs(cfg, epochs=1.0)
+    assert out["model"]["optimizer_params"].get("lr_schedule", "none") == "none"
+    assert "total_steps" not in out["model"]["optimizer_params"]
+
+
+def test_blocks_refuses_the_in_memory_backend(rs):
+    cfg = rs._patch_step_budget(rs._BD(), max_steps=1_000)
+    with pytest.raises(ValueError, match="streaming backend"):
+        rs._patch_blocks(cfg)
