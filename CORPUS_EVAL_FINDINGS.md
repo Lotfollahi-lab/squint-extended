@@ -482,3 +482,67 @@ claims, and only the second was interesting. Checking against the INIT value
 rather than against zero is what separates them -- a parameter at exactly 0.0
 under Adam+weight-decay is evidence of decay winning, not of absence.
 
+---
+
+## 10. The batch embedding is repaired, and integration still did not move
+
+`corpus-holdout-tier1-nodecay`, one change from Tier 1. The repair is total:
+
+| run | non-zero rows | median row norm |
+|---|---|---|
+| baseline | 52/416 | 0.0000 |
+| tier1 | 69/416 | 0.0000 |
+| tier2a | 67/416 | 0.0000 |
+| **tier1-nodecay** | **416/416** | **0.3293** |
+
+0.3293 is well above the `N(0, 0.02^2)` init norm of 0.08, so all 416 rows
+genuinely learned rather than merely surviving. The decoder covariate — the
+paper's batch-correction lever (Eq. 6) — is functional for the first time in
+any corpus run.
+
+**And integration is flat.** Per-tissue iLISI on `cell_emb`, held-out test:
+
+| scope | tier1 | nodecay | Δ |
+|---|---|---|---|
+| skin (111 sections) | 0.2210 | 0.2364 | +0.015 |
+| kidney (42) | 0.0950 | 0.1092 | +0.014 |
+| brain (10) | 0.2452 | 0.2470 | +0.002 |
+| pancreas (24) | 0.1828 | **0.1544** | **−0.028** |
+| global (187) | 0.0363 | 0.0378 | +0.002 |
+
+Inconsistent in sign and within noise of each other; `neighborhood_emb` mostly
+moved the *wrong* way (skin −0.009, kidney −0.011). Repairing a structurally
+broken mechanism bought nothing on the axis it exists to serve.
+
+**Why this is architecturally unsurprising, and what it implies.** The decoder
+covariate lets the DECODER absorb batch effects, which only *indirectly*
+relieves the encoder. Nothing in the objective rewards a batch-free latent, so
+the encoder has no reason to produce one. The same argument applies to Tier
+2a's encoder FiLM: it gives the encoder the MEANS to subtract batch out, but
+still no MOTIVE. **On this evidence the expected outcome of Tier 2a-nodecay is
+also flat**, and what would actually force batch-invariance is a term in the
+OBJECTIVE — the adversarial head (Tier 2b) or an MMD batch term, both of which
+already exist in `loss/` and are switched off by `_patch_dual_no_batch_int` in
+the reference stack.
+
+**What the repair did buy**, held-out test unless noted:
+
+- **Cell identification on `best`: NMI 0.3841 → 0.4144, +0.030, winning
+  87/87 rows.** The largest identification gain of any change so far.
+- **R_val reconstruction, the OOD narrow panel (chr78)**: `last`/cell
+  0.0832 → **0.1222**, `last`/niche 0.0749 → **0.1157** — roughly +50%
+  relative, partially recovering the §7 regression. Consistent with the
+  mechanism: a held-out section takes the mean of trained embeddings, and that
+  mean is now an average over 416 real rows rather than 69.
+- Training objective ~3% worse across every term (total 1724 → 1775), which
+  is the cost of the decoder actually using a per-batch signal.
+- `last` degraded on identification (cell NMI −0.018, 0/87), so the arms
+  flipped again: `nodecay/best` is now the strongest cell-identification
+  configuration measured.
+
+**Do not read the flat iLISI as "the fix was pointless."** The embedding was
+broken and is now correct; every number above is measured on a model that
+finally has the mechanism the paper describes. The finding is narrower and
+more useful: *batch conditioning at the decoder does not de-batch the latent*,
+so integration needs an objective term, not more conditioning capacity.
+
