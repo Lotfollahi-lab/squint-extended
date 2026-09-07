@@ -5917,7 +5917,7 @@ def _n_distinct_batches(db) -> int:
 def _patch_tier2b(
         cfg: dict,
         group_map_json: str = "_mmdgroups.json",
-        wt_mmd_batch: float = 500.0,
+        wt_mmd_batch: float = 400.0,
         n_sub: int = 512,
     ) -> dict:
     """
@@ -5957,13 +5957,28 @@ def _patch_tier2b(
     against `ep3` remains attributable to the MMD term -- with the caveat that
     its solo effect was measured at 1.07 epochs, not 3.
 
-    WEIGHT IS A GUESS AND MUST BE CHECKED IN THE PREFLIGHT. The default 50.0
-    was tuned for a 2-batch single-tissue setting. Corpus MMD on the quantised
-    cell embedding measured 0.0608, so at 50 the term would contribute ~3 of a
-    ~1775 objective -- 0.17%, i.e. nothing. 500 targets roughly the
-    contrastive term's share (29.6, 1.7%). MMD^2 on `z_mlp` within tissue is
-    NOT the same quantity as that measurement, so read the preflight's loss
-    decomposition and adjust before committing to the long run.
+    WEIGHT = 400, CALIBRATED (`_mmdcal_job.sh`, 3,000 steps, five arms).
+
+    The useful signal is not the term's share of the objective -- that was the
+    wrong heuristic, and it selects the one arm to avoid. It is whether MMD^2
+    itself (the term divided by its weight) actually falls:
+
+        wt     MMD^2     share    NB cell   contrastive   commit cell
+         0     --        0.00%    231.95      13.02         0.039
+       100     0.0158    0.26%    234.12      13.32         0.493
+       200     0.0112    0.37%    235.35      13.67         0.695
+       400     0.0087    0.58%    237.35      14.61         1.119
+       800     0.0139    1.79%    239.75      17.11         2.211
+
+    MMD^2 falls 45% from wt=100 to wt=400 and then REBOUNDS at 800 -- past
+    that point the model cannot reduce the distance further and only pays the
+    cost, which accelerates (contrastive +31%, commit cell 57x baseline). At
+    400 the costs are modest and well-located: the NB NEIGHBOUR term is flat
+    across every arm (247.8), NB cell is +2.3%, and commit cell is 1.12 of a
+    605 objective.
+
+    Measured at 3,000 steps near peak LR, so it calibrates the term's scale
+    rather than predicting the 3-epoch outcome.
 
     Parameters
     ----------

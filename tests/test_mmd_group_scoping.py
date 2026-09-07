@@ -153,7 +153,7 @@ def test_tier2b_diff_against_ep3(rs):
 
     assert "mmd_batch_loss" not in ep3["model"]["loss_params"]["loss_names"]
     assert "mmd_batch_loss" in mmd["model"]["loss_params"]["loss_names"]
-    assert mmd["model"]["loss_params"]["loss_kwargs"]["wt_mmd_batch"] == 500.0
+    assert mmd["model"]["loss_params"]["loss_kwargs"]["wt_mmd_batch"] == 400.0
 
     # 416 batches / 18 tissues, matching decoder_covariate_dim for this split
     gm = mmd["model"]["mmd_group_map"]
