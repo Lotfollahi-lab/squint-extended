@@ -121,6 +121,15 @@ class VQNiche_Dual(BaseModel):
             # is every variant predating Tier 2a. Must equal
             # `conditioning_params.condition_dim`.
             encoder_batch_condition_dim: int = 0,
+            # Group id per DENSE batch id, for scoping `mmd_batch_loss` to
+            # within-group pairs. At corpus scale the group is the tissue:
+            # random section->block assignment puts more than one of the 18
+            # training tissues in 100% of blocks, so an unscoped MMD would
+            # align cells across ORGANS and delete the strongest signal in the
+            # code space (tissue is +0.223 in the section-similarity
+            # regression). None = unscoped, which is right for the 2-batch
+            # single-tissue setting the loss was written for.
+            mmd_group_map: Optional[List[int]] = None,
             optimizer_params: Optional[dict] = None,
             loss_params: Optional[dict] = None,
             decoder_covariate_dim: int = 0,
@@ -198,6 +207,17 @@ class VQNiche_Dual(BaseModel):
         # would collate the corpus. 0 = off, which is every variant predating
         # Tier 2a. See `_encoder_batch_conditions`.
         self.encoder_batch_condition_dim = int(encoder_batch_condition_dim)
+        # Registered as a buffer, not a plain attribute, so it moves with the
+        # module and is checkpointed alongside the weights -- the mapping is
+        # part of what the run means, not a runtime convenience.
+        if mmd_group_map is None:
+            self.mmd_group_map = None
+        else:
+            self.register_buffer(
+                "mmd_group_map",
+                torch.as_tensor(list(mmd_group_map), dtype=torch.long),
+                persistent=True,
+            )
         self.decoder_covariate_embed_dim = (
             int(decoder_covariate_embed_dim) if self.decoder_covariate_dim > 0 else 0
         )
@@ -748,6 +768,29 @@ class VQNiche_Dual(BaseModel):
             )
         return torch.nn.functional.one_hot(ids, num_classes=n).to(batch.x.dtype)
 
+    def _mmd_group_labels(self, ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Per-cell group id for scoping `mmd_batch_loss`, from dense batch ids.
+
+        A gather against `mmd_group_map`, the same shape of lookup as
+        `_per_cell_gene_mask` uses for panel masks. Returns `None` when no map
+        was supplied, leaving the loss globally scoped.
+
+        Raises rather than clamping on an out-of-range id: a short map means
+        the run's batch count and the supplied mapping disagree, and silently
+        folding the overflow into group 0 would scope the loss wrongly while
+        looking like it worked.
+        """
+        if getattr(self, "mmd_group_map", None) is None:
+            return None
+        n = int(self.mmd_group_map.numel())
+        if int(ids.max()) >= n:
+            raise ValueError(
+                f"batch id {int(ids.max())} is outside mmd_group_map of length "
+                f"{n}; the mapping and the run's batch count disagree."
+            )
+        return self.mmd_group_map[ids]
+
     def _step(self, batch: torch_geometric.data.Data, mode: str):
         """
         Shared step body for train/val/predict. Mode controls only logging
@@ -1045,7 +1088,12 @@ class VQNiche_Dual(BaseModel):
         # apply_to='full', MMD always uses seed-only).
         if adata_batch_ids is not None:
             loss_data['mmd_target'] = z_mlp[:batch_size]
-            loss_data['mmd_target_labels'] = adata_batch_ids[:batch_size].long()
+            _mmd_ids = adata_batch_ids[:batch_size].long()
+            loss_data['mmd_target_labels'] = _mmd_ids
+            # Scope, when a map was supplied. Absent -> the loss stays global.
+            _grp = self._mmd_group_labels(_mmd_ids)
+            if _grp is not None:
+                loss_data['mmd_group_labels'] = _grp
 
         loss_value = self.common_step(
             batch_loss_data=loss_data,

@@ -54,6 +54,7 @@ def mmd_batch_loss(
         mmd_target_labels: torch.Tensor,     # (B,)   — long-tensor per-cell batch IDs
         wt_mmd_batch: float = 1.0,
         n_sub: int = 512,
+        mmd_group_labels: Optional[torch.Tensor] = None,  # (B,) — scope, e.g. tissue
     ) -> torch.Tensor:
     """
     Differentiable MMD between per-batch embedding distributions.
@@ -69,6 +70,22 @@ def mmd_batch_loss(
 
     Sums pairwise MMD^2 across all (batch_i, batch_j) combinations
     present in the mini-batch (typically only 2 in mmb-smb training).
+
+    `mmd_group_labels` SCOPES which pairs count, and at corpus scale it is
+    not optional. Aligning every batch present would align cells from
+    different ORGANS: the corpus spans 18 training tissues, random
+    section->block assignment puts more than one tissue in 100% of blocks,
+    and tissue is the strongest term in the section-similarity regression
+    (+0.223, against +0.077 for panel width and +0.012 for assay). Global
+    alignment would therefore delete the dominant biological signal to buy a
+    batch-mixing metric -- and the metric that matters is per-TISSUE iLISI
+    anyway, because the global one spans four organs on the test split.
+
+    Passing per-cell tissue ids here restricts the sum to within-tissue pairs,
+    so the pressure removes technical variation between sections of the same
+    organ and leaves the between-organ structure alone. `None` keeps the
+    legacy global behaviour, which is correct for the 2-batch single-tissue
+    setting this loss was written for.
     Sub-samples up to `n_sub` cells per batch to bound memory.
 
     Returns the weighted scalar loss `wt_mmd_batch * MMD^2_sum`.
@@ -132,11 +149,34 @@ def mmd_batch_loss(
     sigma = upper.median().detach()
     sigma = sigma.clamp_min(1e-6)
 
-    # 5. Pairwise MMD^2 across all (batch_i, batch_j) present.
+    # 5. Pairwise MMD^2 across the (batch_i, batch_j) pairs IN SCOPE.
+    #
+    # `groups[i]` is the group of sub-sample i, taken from the first cell of
+    # that batch: a batch belongs to exactly one section and a section to
+    # exactly one tissue, so the group is constant within a batch by
+    # construction. Asserted rather than assumed, because a mismatch here
+    # would silently scope the loss wrongly.
+    groups = None
+    if mmd_group_labels is not None:
+        groups = []
+        for b, sub in zip(unique, samples_per_batch, strict=True):
+            if sub is None:
+                continue
+            g = mmd_group_labels[mmd_target_labels == b]
+            if not bool((g == g[0]).all()):
+                raise ValueError(
+                    f"batch {int(b)} spans multiple group labels "
+                    f"{torch.unique(g).tolist()}; a batch is one section and a "
+                    "section has one group, so this indicates a wrong lookup."
+                )
+            groups.append(g[0])
+
     total = mmd_target.new_zeros(())
     n_pairs = 0
     for i in range(len(valid)):
         for j in range(i + 1, len(valid)):
+            if groups is not None and groups[i] != groups[j]:
+                continue      # different organs: not a batch effect to remove
             a = valid[i]; b = valid[j]
             k_aa = _rbf_kernel(a, a, sigma)
             k_bb = _rbf_kernel(b, b, sigma)

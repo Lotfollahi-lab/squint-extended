@@ -880,6 +880,11 @@ def initialize_model(
         # Width of the per-cell batch one-hot for encoder FiLM on the
         # streaming path. Absent for every variant predating Tier 2a, where
         # the default 0 leaves the unconditioned path untouched.
+        # Dense-batch-id -> group-id map for scoping `mmd_batch_loss`. Absent
+        # for every variant predating Tier 2b, where None leaves the loss
+        # globally scoped.
+        _gm = config['model'].get('mmd_group_map')
+        model_param_dict['mmd_group_map'] = None if _gm is None else list(_gm)
         model_param_dict['encoder_batch_condition_dim'] = int(
             config['model'].get('encoder_batch_condition_dim', 0)
         )

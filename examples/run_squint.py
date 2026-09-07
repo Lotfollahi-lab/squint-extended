@@ -5914,6 +5914,85 @@ def _n_distinct_batches(db) -> int:
     return int(ids.max().item()) + 1
 
 
+def _patch_tier2b(
+        cfg: dict,
+        group_map_json: str = "_mmdgroups.json",
+        wt_mmd_batch: float = 500.0,
+        n_sub: int = 512,
+    ) -> dict:
+    """
+    Tier 2b: an MMD batch term in the OBJECTIVE, scoped to within-tissue pairs.
+
+    WHY THIS AND NOT MORE CONDITIONING. Four interventions have now failed to
+    move per-tissue iLISI: the Tier 1 objective rebalance, encoder FiLM
+    (Tier 2a), repairing the erased batch embedding (69/416 -> 416/416), and
+    tripling the budget. Each supplied CAPACITY to represent batch; none
+    supplied a REASON to remove it from the latent. `_patch_dual_no_batch_int`
+    strips every batch term from the reference stack, so there has never been
+    one. This adds the cheaper of the two candidates.
+
+    MMD RATHER THAN THE ADVERSARY, first. MMD compares only the batches
+    PRESENT in a mini-batch, so it does not degrade when a block holds few
+    sections -- whereas a 416-way classifier fed ~8 classes per step is
+    degenerate, and `wt_adv_batch=150` was calibrated for TWO batches (CE
+    bounded by log 2 = 0.69, against log 416 = 6.03). No min-max game, no
+    warmup pathology, and it reuses the kernel recipe from
+    `compute_inference_metrics.py`, so train-time pressure and test-time
+    measurement are the same quantity.
+
+    SCOPED BY TISSUE, and this is not optional. Random section->block
+    assignment puts more than one of the 18 training tissues in **100%** of
+    blocks, and tissue is the strongest term in the section-similarity
+    regression (+0.223, against +0.077 for panel width and +0.012 for assay).
+    An unscoped MMD would align cells across ORGANS -- buying a batch metric
+    by deleting the dominant biological signal. Scoping also matches what we
+    report: per-tissue iLISI, because the global number spans four organs on
+    the test split.
+
+    REQUIRES WIDE BLOCKS. With ~3.9 sections per block only **56.4%** of
+    blocks contain any same-tissue pair (mean 0.74 in-scope pairs of 6), so
+    44% of steps would produce no gradient at all. At 8 sections it is 98.7%
+    and 3.49 of 28. This patch therefore applies `_patch_blocks` itself.
+    Bigblocks' solo effect was measured as nil on identification, so the delta
+    against `ep3` remains attributable to the MMD term -- with the caveat that
+    its solo effect was measured at 1.07 epochs, not 3.
+
+    WEIGHT IS A GUESS AND MUST BE CHECKED IN THE PREFLIGHT. The default 50.0
+    was tuned for a 2-batch single-tissue setting. Corpus MMD on the quantised
+    cell embedding measured 0.0608, so at 50 the term would contribute ~3 of a
+    ~1775 objective -- 0.17%, i.e. nothing. 500 targets roughly the
+    contrastive term's share (29.6, 1.7%). MMD^2 on `z_mlp` within tissue is
+    NOT the same quantity as that measurement, so read the preflight's loss
+    decomposition and adjust before committing to the long run.
+
+    Parameters
+    ----------
+    group_map_json : str
+        Path to a JSON carrying `group_map`: dense batch id -> group id,
+        built to reproduce `batch_label_to_dense(rows=train_rows)`. See
+        `_mmdgroups.json`.
+    wt_mmd_batch : float
+        Weight on MMD^2. See the calibration note above.
+    n_sub : int
+        Cells sub-sampled per batch for the kernel. 512 keeps the pairwise
+        kernel around 1 MB.
+
+    Returns
+    -------
+    - dict
+        The same cfg, mutated in place.
+    """
+    import json as _json
+    gm = _json.load(open(group_map_json))
+    gmap = list(gm["group_map"])
+    cfg = _patch_blocks(cfg)                      # the prerequisite, see above
+    cfg = _patch_dual_mmd_batch(cfg, wt_mmd_batch=wt_mmd_batch, n_sub=n_sub)
+    cfg["model"]["mmd_group_map"] = gmap
+    print(f"tier2b: MMD scoped by group over {len(gmap)} batches, "
+          f"{len(set(gmap))} groups, wt={wt_mmd_batch}")
+    return cfg
+
+
 def _patch_blocks(
         cfg: dict,
         sections_per_block: int = 8,
@@ -6694,6 +6773,28 @@ VARIANTS: dict = {
             "+nodecay(batch_embedding, conditioning_module)",
         ],
         "build": lambda: _patch_nodecay(VARIANTS["corpus-holdout-tier2a"]["build"]()),
+    },
+
+    "corpus-holdout-ep3-mmd": {
+        "description": (
+            "ep3 plus an MMD batch term in the OBJECTIVE, scoped to "
+            "within-tissue pairs, with the block cap raised so those pairs "
+            "actually occur. The only untried lever on integration: four "
+            "interventions have failed there, all of which added CAPACITY to "
+            "represent batch rather than a REASON to remove it from the "
+            "latent. Scoped by tissue because random blocks mix tissues 100% "
+            "of the time and tissue is the strongest signal in the code space "
+            "(+0.223) -- an unscoped MMD would buy the metric by deleting the "
+            "biology. EVALUATE PER TISSUE. The weight is a guess: read the "
+            "preflight's loss decomposition before trusting the long run. "
+            "REQUIRES --split-sections-json _splitspec.json and _mmdgroups.json."
+        ),
+        "patches": ["=corpus-holdout-nodecay-3ep",
+                    "+blocks(cap 1.9M -> ~8 sections/block, so same-tissue "
+                    "pairs occur in 98.7% of blocks not 56.4%)",
+                    "+mmd_batch(wt=500, scoped by tissue over 416 batches)"],
+        "build": lambda: _patch_tier2b(
+            VARIANTS["corpus-holdout-nodecay-3ep"]["build"]()),
     },
 
     "corpus-holdout-nodecay-3ep": {
