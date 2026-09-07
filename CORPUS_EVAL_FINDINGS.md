@@ -642,3 +642,47 @@ epochs rather than parameters. Codebook expansion stays ruled out (§1), now
 also by ep3: level 1 is 90/90 at perplexity 0.95–0.98 and identification moved
 for unrelated reasons.
 
+---
+
+## 12. Compute nodes can execute stale source, and it looks like a logic bug
+
+Three Tier 2b calibration sweeps failed with `mmd_batch_loss` returning `None`
+to the loss dispatcher. That is impossible for a function whose every exit
+returns a Tensor, and it did not reproduce on the head node with the exact
+failing shapes (512x256 target, 8 sections, the real 416-entry tissue map).
+
+The cause was not in the code. Introspecting the callable from inside the
+failing job:
+
+| | `return` count | diagnostic guard present |
+|---|---|---|
+| head node | **7** | **yes** |
+| compute node, same path | **4** | **no** |
+
+Same absolute path, different content, **thirty minutes after the write** — so
+not a write race. The compute node was serving a cached copy new enough to
+accept the `mmd_group_labels` keyword (hence no unexpected-kwarg error) and
+old enough to lack the guard added later.
+
+**What made this expensive.** Every symptom pointed at logic, so three
+successive explanations were constructed and all were wrong — numerical
+divergence at high weight, failure on the first batch, then weight-dependence.
+Two of those were reinforced by a second problem: **`#BSUB -o` APPENDS**, so
+three sweeps' output accumulated in one file and stale tracebacks read exactly
+like fresh ones. The arm-status line was showing two `exited with` entries for
+one arm, which is the tell that was there and missed. Most `_*_job.sh` in this
+tree use `-o`; the Tier 2b jobs now use `-oo`/`-eo`.
+
+**The guards now in place.** `_codecheck.py` prints the git HEAD, the package
+path, and a SHA over the whole source tree as that node reads it, and
+`--expect module:token` asserts a token is present in a module's source from
+the compute node's view. Both Tier 2b jobs refuse to start if it fails, so a
+run that would execute different code than the working tree dies instead of
+producing a confusing result. Compare the printed `src sha` across array arms:
+they must match.
+
+**The general lesson, worth applying beyond this branch.** When a result is
+impossible given the code, verify that the code that ran IS the code on disk
+before constructing a mechanism that explains the impossible. The check costs
+seconds; the alternative cost three cycles here.
+
