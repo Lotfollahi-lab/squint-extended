@@ -177,3 +177,13 @@ def test_tier2b_does_not_leak_into_ep3(rs):
     assert "mmd_batch_loss" not in ep3["model"]["loss_params"]["loss_names"]
     assert ep3["model"].get("mmd_group_map") is None
     assert ep3["datamodule"]["max_cells_per_block"] == 900_000
+
+
+def test_wt_override_refuses_a_variant_without_the_loss(rs):
+    """
+    A weight override on a variant with no MMD term would set a kwarg nothing
+    reads -- a sweep that varies nothing, and looks like it worked.
+    """
+    import inspect
+    src = inspect.getsource(rs.train)
+    assert "--wt-mmd-batch given but" in src, "the guard is missing from train()"

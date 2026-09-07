@@ -39135,6 +39135,7 @@ def train(
         train_deterministic: Optional[bool] = None,
         split_sections_json: Optional[str] = None,
         max_steps: Optional[int] = None,
+        wt_mmd_batch: Optional[float] = None,
         num_workers: Optional[int] = None,
         prefetch: Optional[bool] = None,
     ):
@@ -39220,6 +39221,21 @@ def train(
     # decide whether the run is worth hours (decoder_covariate_dim, which
     # sections each split visits, no batch-label collision) are checked against
     # the real thing rather than assumed.
+    if wt_mmd_batch is not None:
+        # Weight-only override, so a calibration sweep needs no new variants.
+        # Refuses when the loss is absent rather than setting a kwarg nothing
+        # reads -- which would look like a sweep and vary nothing.
+        _ln = cfg["model"]["loss_params"]["loss_names"]
+        if "mmd_batch_loss" not in _ln:
+            raise ValueError(
+                "--wt-mmd-batch given but `mmd_batch_loss` is not in this "
+                f"variant's loss_names ({[x for x in _ln if 'mmd' in x] or 'no mmd terms'}). "
+                "Use a variant built with `_patch_tier2b` / `_patch_dual_mmd_batch`."
+            )
+        prev = cfg["model"]["loss_params"]["loss_kwargs"].get("wt_mmd_batch")
+        cfg["model"]["loss_params"]["loss_kwargs"]["wt_mmd_batch"] = float(wt_mmd_batch)
+        print(f"wt_mmd_batch override from CLI = {wt_mmd_batch} (was {prev})")
+
     if max_steps is not None and max_steps <= 5_000:
         # A short diagnostic run needs frequent heartbeats to be useful; the
         # 2,000-step production interval would fire at most twice.
@@ -42093,6 +42109,15 @@ def main():
                    help="Force the prefetch thread OFF. Measured flat "
                         "(-1.3 MB/step, ~35 GB peak) and the safe default for a "
                         "long run; costs roughly 1.8x wall-clock.")
+    p.add_argument("--wt-mmd-batch", type=float, default=None,
+                   help=(
+                       "Override the MMD batch term's weight. For calibration "
+                       "sweeps: the same variant at several weights, so nothing "
+                       "else can differ between arms. The loss divides by the "
+                       "number of in-scope pairs, so this is a pure scale on "
+                       "MMD^2 and the right knob to sweep. Errors if the "
+                       "variant has no `mmd_batch_loss`."
+                   ))
     p.add_argument("--max-steps", type=int, default=None,
                    help=(
                        "Override the variant's step budget. Intended for "
@@ -42568,6 +42593,7 @@ def main():
             train_deterministic=_deterministic_override,
             split_sections_json=args.split_sections_json,
             max_steps=args.max_steps,
+            wt_mmd_batch=args.wt_mmd_batch,
             num_workers=args.num_workers,
             prefetch=_prefetch_override,
         )
