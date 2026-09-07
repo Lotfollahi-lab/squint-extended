@@ -729,7 +729,22 @@ control** on the identical budget and rung -- without which a shift cannot be
 told from the effect of shortening the run. About 2 h per arm, both in
 parallel.
 
-**What it is not.** The 46-section scope changes the iLISI ceilings, so its
+**Two design errors on the first attempt, both worth recording.** The predict
+stage was killed at 389 GB and 675 GB because (a) it ran all sections in ONE
+pass, reintroducing exactly what the main evaluation's 6-way sharding exists
+to prevent -- a single-pass corpus predict had already died once at 424 GB --
+and (b) it selected the LARGEST sections per tissue, when iLISI subsamples to
+50,000 cells and therefore wants many sections and FEW cells. Selecting
+smallest-first under a cell budget cut the rung from 10.57M cells to 2.6M, and
+it is now sharded one tissue per shard so peak memory is bounded by the
+largest tissue (brain, 1.9M cells) rather than the whole rung.
+
+A third, cosmetic but costly: the train stage piped through `| tail -30`, which
+emits nothing until the pipeline closes, so a healthy 2-hour run looked frozen
+in the LSF log while `tee` wrote the real one. Replaced with a line-buffered
+grep on heartbeats and error signatures.
+
+**What it is not.** The reduced scope changes the iLISI ceilings, so its
 numbers compare the two arms against each other and NOT against sections
 8/10/11. Identification, reconstruction, codebook and matched-K all still need
 the full pipeline. Use it to decide whether a run deserves 14 h, not to report
