@@ -187,4 +187,23 @@ def mmd_batch_loss(
 
     if n_pairs == 0:
         return mmd_target.sum() * 0.0
-    return total / n_pairs * float(wt_mmd_batch)
+
+    out = total / n_pairs * float(wt_mmd_batch)
+
+    # EVERY path above returns a Tensor, and yet two calibration sweeps saw
+    # this function hand `None` to the dispatcher -- only at weight >= 200,
+    # only on GPU under DDP, and never reproducible on CPU with the same
+    # shapes (512x256 target, 8 sections, real tissue map). Rather than
+    # return a value that cannot exist, capture the state that produced it.
+    #
+    # Remove this once the cause is known. It is a diagnostic, not a fix, and
+    # it costs one isinstance per call.
+    if not isinstance(out, torch.Tensor):
+        raise RuntimeError(
+            f"mmd_batch_loss produced {type(out).__name__}: "
+            f"n_pairs={n_pairs} valid={len(valid)} "
+            f"unique={unique.tolist()} sigma={sigma} "
+            f"total={total!r} wt={wt_mmd_batch!r} "
+            f"groups={None if groups is None else [int(g) for g in groups]}"
+        )
+    return out
