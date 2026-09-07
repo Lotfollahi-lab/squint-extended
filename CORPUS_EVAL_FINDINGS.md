@@ -696,3 +696,42 @@ impossible given the code, verify that the code that ran IS the code on disk
 before constructing a mechanism that explains the impossible. The check costs
 seconds; the alternative cost three cycles here.
 
+---
+
+## 13. A 2-hour iteration loop for integration, instead of 20
+
+The full cycle is ~14 h training plus ~6 h evaluation per arm. For the one
+question Tier 2b asks -- did within-tissue batch mixing improve? -- nearly all
+of that is wasted:
+
+| stage | cost | needed for iLISI? |
+|---|---|---|
+| predict, 12 shards over 297 sections | 17 min wall | partly |
+| pool 90 GB | 46 min | **no** |
+| metrics: identification over 1,128 combos | **~5 h** | **no** |
+| iLISI itself | minutes, 50,000 cells | yes |
+
+`_fastint.py` reads the UNPOOLED `eval_A_{arm}_sh*` shards and computes
+per-tissue iLISI directly, at the same k=90 and scib scaling as
+`compute_inference_metrics.py`. **7 minutes**, and it reproduces the full
+pipeline's ep3 numbers to within 0.004:
+
+| tissue | full pipeline | fast probe |
+|---|---|---|
+| brain | 0.2105 | 0.2147 |
+| kidney | 0.0893 | 0.0909 |
+| pancreas | 0.1717 | 0.1679 |
+| skin | 0.2109 | 0.2114 |
+
+`_fastloop_job.sh` chains train -> predict -> iLISI at 50,000 steps over a
+balanced 46-section test rung (`_fastrung.json`), with **arm 1 as a wt=0
+control** on the identical budget and rung -- without which a shift cannot be
+told from the effect of shortening the run. About 2 h per arm, both in
+parallel.
+
+**What it is not.** The 46-section scope changes the iLISI ceilings, so its
+numbers compare the two arms against each other and NOT against sections
+8/10/11. Identification, reconstruction, codebook and matched-K all still need
+the full pipeline. Use it to decide whether a run deserves 14 h, not to report
+final numbers.
+
