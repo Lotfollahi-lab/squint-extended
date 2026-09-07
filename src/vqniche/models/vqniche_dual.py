@@ -1090,10 +1090,12 @@ class VQNiche_Dual(BaseModel):
             loss_data['mmd_target'] = z_mlp[:batch_size]
             _mmd_ids = adata_batch_ids[:batch_size].long()
             loss_data['mmd_target_labels'] = _mmd_ids
-            # Scope, when a map was supplied. Absent -> the loss stays global.
-            _grp = self._mmd_group_labels(_mmd_ids)
-            if _grp is not None:
-                loss_data['mmd_group_labels'] = _grp
+            # ALWAYS set, None when no map is configured. The dispatcher
+            # extracts exactly the keys the registry names, so a
+            # conditionally-present key would make the registry unable to
+            # request it -- and a registry that omits it runs the loss
+            # globally without saying so.
+            loss_data['mmd_group_labels'] = self._mmd_group_labels(_mmd_ids)
 
         loss_value = self.common_step(
             batch_loss_data=loss_data,

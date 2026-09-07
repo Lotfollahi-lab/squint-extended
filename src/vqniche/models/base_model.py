@@ -534,7 +534,15 @@ class BaseModel(pl.LightningModule):
                 # operates on the seed prefix only — so it needs the
                 # seed-only label slice.
                 loss_fn = mmd_batch_loss
-                loss_fn_data_keys = ['mmd_target', 'mmd_target_labels']
+                # `mmd_group_labels` SCOPES the pairwise sum, and omitting it
+                # here is not a no-op -- it silently runs the loss GLOBALLY.
+                # At corpus scale that aligns cells across organs (18 training
+                # tissues, >1 tissue in 100% of blocks) and deletes the
+                # strongest signal in the code space. `_step` always populates
+                # the key, using None when no group map is configured, so this
+                # list can request it unconditionally.
+                loss_fn_data_keys = ['mmd_target', 'mmd_target_labels',
+                                     'mmd_group_labels']
                 wt_mmd_batch = loss_kwargs.get('wt_mmd_batch')
                 if wt_mmd_batch is not None:
                     loss_fn_params['wt_mmd_batch'] = wt_mmd_batch
@@ -700,6 +708,18 @@ class BaseModel(pl.LightningModule):
 
             # pass the extracted data to the loss function along with the loss function related kwargs
             loss_fn_value = loss_fn(**_loss_fn_data, **loss_fn_params)
+            # A loss that falls off the end of a branch returns None, and the
+            # bare `torch.add` below then raises "argument 'other' must be
+            # Tensor, not NoneType" -- naming neither the loss nor the inputs.
+            # That cost a debugging cycle on the MMD sweep, so say which one.
+            if not isinstance(loss_fn_value, torch.Tensor):
+                raise TypeError(
+                    f"loss {loss_fn_name!r} returned "
+                    f"{type(loss_fn_value).__name__}, not a Tensor. Data keys "
+                    f"{loss_fn_data_keys} had shapes "
+                    f"{ {k: tuple(v.shape) if torch.is_tensor(v) else type(v).__name__ for k, v in _loss_fn_data.items()} }"
+                    f", params {loss_fn_params}."
+                )
             # add the computed loss to the total_loss
             total_loss = torch.add(total_loss, loss_fn_value)
 

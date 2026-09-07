@@ -187,3 +187,62 @@ def test_wt_override_refuses_a_variant_without_the_loss(rs):
     import inspect
     src = inspect.getsource(rs.train)
     assert "--wt-mmd-batch given but" in src, "the guard is missing from train()"
+
+
+def test_registry_requests_the_group_key(rs):
+    """
+    The dispatcher extracts exactly the keys the registry names. Omitting
+    `mmd_group_labels` does not disable the scope -- it runs the loss
+    GLOBALLY, silently, which at corpus scale aligns cells across organs.
+    That is what happened on the first Tier 2b sweep.
+    """
+    import inspect
+
+    from vqniche.models.base_model import BaseModel
+    src = inspect.getsource(BaseModel.set_loss_fn_tuples)
+    blk = src[src.index("loss_fn_name == 'mmd_batch_loss'"):]
+    blk = blk[:blk.index("elif loss_fn_name ==")]
+    assert "'mmd_group_labels'" in blk, "registry must request the scope key"
+
+
+def test_loss_accepts_an_explicit_none_scope():
+    """`_step` always sets the key, using None when no map is configured."""
+    g = torch.Generator().manual_seed(0)
+    x = torch.cat([torch.randn(32, 8, generator=g),
+                   torch.randn(32, 8, generator=g) + 5])
+    lab = torch.cat([torch.zeros(32), torch.ones(32)]).long()
+    out = mmd_batch_loss(x, lab, wt_mmd_batch=1.0, mmd_group_labels=None)
+    assert isinstance(out, torch.Tensor)
+
+
+def test_every_return_path_is_a_tensor():
+    """
+    A loss that falls off the end returns None, and the dispatcher's
+    `torch.add` then raises without naming it. Pin the edge cases the corpus
+    will actually hit: a single-batch mini-batch, and a block where every
+    pair is cross-tissue so nothing is in scope.
+    """
+    g = torch.Generator().manual_seed(0)
+    x = torch.cat([torch.randn(32, 8, generator=g),
+                   torch.randn(32, 8, generator=g) + 5])
+    lab = torch.cat([torch.zeros(32), torch.ones(32)]).long()
+    cases = {
+        "two batches, unscoped": (x, lab, None),
+        "one batch only": (x[:32], lab[:32], None),
+        "all pairs out of scope": (x, lab, lab.clone()),
+        "empty input": (x[:0], lab[:0], None),
+    }
+    for name, (xx, ll, gg) in cases.items():
+        out = mmd_batch_loss(xx, ll, wt_mmd_batch=500.0, mmd_group_labels=gg)
+        assert isinstance(out, torch.Tensor), f"{name} returned {type(out)}"
+
+
+def test_dispatcher_names_a_loss_that_returns_non_tensor(rs):
+    import inspect
+
+    from vqniche.models.base_model import BaseModel
+    src = inspect.getsource(BaseModel.criterion)
+    assert "not a Tensor" in src and "loss_fn_name!r" in src, (
+        "criterion must name the offending loss; an anonymous "
+        "'must be Tensor, not NoneType' cost a debugging cycle"
+    )
