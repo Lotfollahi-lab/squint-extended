@@ -713,12 +713,27 @@ class BaseModel(pl.LightningModule):
             # Tensor, not NoneType" -- naming neither the loss nor the inputs.
             # That cost a debugging cycle on the MMD sweep, so say which one.
             if not isinstance(loss_fn_value, torch.Tensor):
+                # Identify the callable itself. A function whose every exit
+                # returns a Tensor returned None here, and its own end-of-body
+                # guard did not fire -- which can only mean the object being
+                # called is not the source being read. Report where it lives.
+                import inspect as _inspect
+                try:
+                    _src_file = _inspect.getsourcefile(loss_fn)
+                    _src = _inspect.getsource(loss_fn)
+                    _nret = _src.count("return ")
+                    _guard = "produced" in _src
+                except (OSError, TypeError):
+                    _src_file, _nret, _guard = "<unavailable>", -1, False
                 raise TypeError(
                     f"loss {loss_fn_name!r} returned "
                     f"{type(loss_fn_value).__name__}, not a Tensor. Data keys "
                     f"{loss_fn_data_keys} had shapes "
                     f"{ {k: tuple(v.shape) if torch.is_tensor(v) else type(v).__name__ for k, v in _loss_fn_data.items()} }"
-                    f", params {loss_fn_params}."
+                    f", params {loss_fn_params}. "
+                    f"callable={getattr(loss_fn, '__module__', '?')}."
+                    f"{getattr(loss_fn, '__qualname__', '?')} "
+                    f"file={_src_file} returns={_nret} has_guard={_guard}"
                 )
             # add the computed loss to the total_loss
             total_loss = torch.add(total_loss, loss_fn_value)
