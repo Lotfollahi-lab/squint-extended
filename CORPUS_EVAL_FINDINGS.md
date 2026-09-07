@@ -546,3 +546,99 @@ finally has the mechanism the paper describes. The finding is narrower and
 more useful: *batch conditioning at the decoder does not de-batch the latent*,
 so integration needs an objective term, not more conditioning capacity.
 
+---
+
+## 11. Three epochs is the best model, and integration is now definitively an objective problem
+
+`corpus-holdout-nodecay-3ep` — 562,687 steps (3.00 epochs), 13.4 h, peak 82.9
+GB. One change from `corpus-holdout-tier1-nodecay`: the budget, with the LR
+horizon re-synced so the cosine schedule spans the real run.
+
+**Note on arms:** in this run the FINAL checkpoint (step 562,680) also has the
+lowest `val_loss` (1720.891), so `best` and `last` resolve to the same
+weights. Duplicated rows in its tables are correct, not a collision — but no
+arm comparison is available for it.
+
+### It is the strongest model measured on every identification metric
+
+Per dataset, held-out test, level-0 codes:
+
+| | tier1/best | nodecay/best | **ep3** |
+|---|---|---|---|
+| cell NMI | 0.3841 | 0.4144 | **0.4178** |
+| cell ARI | 0.2111 | 0.2262 | **0.2269** |
+| niche NMI | 0.3750 | 0.3606 | **0.3941** |
+| niche ARI | 0.1996 | 0.1862 | **0.2451** |
+
+The niche gains are the story: **+0.034 NMI (13/17 rows) and +0.059 ARI** over
+nodecay. That is where the epoch-end trace predicted it — NB neighbour fell
+806.3 → 774.9 → 713.9 across the three epochs, −11.5%, the largest movement of
+any term in any run, while `val_loss` bounced and hid it (§4's warning, in
+action: the total is a weighted sum whose components move in opposite
+directions and is not a learning curve).
+
+Under **TERRA's protocol** (latent @ matched K) ep3 leads both branches: cell
+**0.4874** (tier1/last 0.4818, nodecay/last 0.4750), niche **0.4544** (0.4337,
+0.4304).
+
+**And cell NMI enters the paper's range for the first time.** Per dataset:
+
+| dataset | cell NMI | cell ARI | niche NMI | niche ARI |
+|---|---|---|---|---|
+| xhs1022-2 | **0.5211** | 0.3182 | 0.4827 | 0.2849 |
+| xhs1022-1 | 0.5016 | 0.2838 | 0.4472 | 0.2700 |
+| xhs1022-3 | 0.5003 | 0.2987 | — | — |
+| xhs1000 | 0.4733 | 0.2283 | 0.4597 | 0.2980 |
+| xhs1009 | 0.4151 | 0.2165 | 0.3322 | 0.2143 |
+| xhs1010 | 0.3951 | 0.2169 | 0.3655 | 0.2273 |
+
+Paper: cell NMI 0.494–0.604, ARI 0.204–0.339; niche NMI 0.397–0.702, ARI
+0.172–0.410. Three of six datasets now clear the cell-NMI floor, cell ARI sits
+inside the range throughout, and niche ARI (0.214–0.298) is inside as well.
+
+### Integration is now definitively an objective problem, not a capacity or conditioning one
+
+Per-tissue iLISI, `cell_emb`, held-out test:
+
+| tissue | tier1 | nodecay | ep3 |
+|---|---|---|---|
+| brain | 0.2452 | 0.2470 | 0.2105 |
+| kidney | 0.0950 | 0.1092 | 0.0893 |
+| skin | 0.2210 | 0.2364 | 0.2109 |
+| pancreas | 0.1828 | 0.1544 | 0.1717 |
+
+Three of four DOWN, and the global number too (0.0378 → 0.0345). Four
+interventions have now failed on this axis:
+
+1. rebalancing the objective and fixing the codebook (Tier 1) — flat
+2. encoder FiLM conditioning (Tier 2a) — flat
+3. repairing the erased batch embedding, 69/416 → 416/416 (nodecay) — flat
+4. tripling the training budget (ep3) — slightly worse
+
+**Nothing in the objective rewards a batch-free latent**, and conditioning
+capacity, a working covariate and more optimisation are all substitutes for a
+term that is not there. `_patch_dual_no_batch_int` in the reference stack
+removes `adversarial_batch_loss`, `mmd_batch_loss` and `mmd_prior_loss`
+outright; both remaining candidates already exist in `loss/`. Adding one is
+the only untried lever, and after four failures it is also the only one worth
+trying.
+
+### One regression, and it is the §7 effect intensified
+
+R_val reconstruction on chr78 (CosMx, 169 genes, below the 237-gene training
+floor) collapsed: `best`/cell 0.2451 → **0.0879**, niche 0.2576 → **0.0411**.
+More training sharpens the decoder further onto the training panel-width
+distribution, so extrapolation below that floor degrades further — the same
+mechanism as §7, now with 3x the annealing to sharpen it. Test-rung
+reconstruction is unaffected (cell 0.3490, niche 0.7078) and chr78 is
+validation-only, so no reported test number changes. But the caveat hardens:
+**applying this model to a panel narrower than ~237 genes should expect poor
+reconstruction**, and the effect grows with training rather than washing out.
+
+**Capacity remains undiagnosable and unindicated.** The oscillation-on-fixed-
+data signature (val_loss range 137 over 562,687 steps) is a data-order
+signature, not a capacity ceiling, and identification improved by adding
+epochs rather than parameters. Codebook expansion stays ruled out (§1), now
+also by ep3: level 1 is 90/90 at perplexity 0.95–0.98 and identification moved
+for unrelated reasons.
+
