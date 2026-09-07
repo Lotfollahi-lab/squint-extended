@@ -739,7 +739,19 @@ smallest-first under a cell budget cut the rung from 10.57M cells to 2.6M, and
 it is now sharded one tissue per shard so peak memory is bounded by the
 largest tissue (brain, 1.9M cells) rather than the whole rung.
 
-A third, cosmetic but costly: the train stage piped through `| tail -30`, which
+A third, and the one that would have silently invalidated the result: the run
+directory is `<YYYYMMDD_HHMMSS>_seed<n>` at SECOND granularity with no name
+override, so two array elements starting in the same second get the
+**identical** directory. Both fastloop submissions did exactly that -- both
+arms reported `Run directory: .../20260907_232921_seed0` -- which means two
+models sharing one `checkpoints/` directory and one set of predict outputs.
+The first submission's OOM masked it. Fixed by staggering the arms 90 s and by
+asserting after training that exactly one training log names the chosen
+directory; the arms also now read the directory from their OWN log rather than
+`ls -1dt`, which is required for running the fast loop alongside the 14 h job
+since both use the same variant.
+
+A fourth, cosmetic but costly: the train stage piped through `| tail -30`, which
 emits nothing until the pipeline closes, so a healthy 2-hour run looked frozen
 in the LSF log while `tee` wrote the real one. Replaced with a line-buffered
 grep on heartbeats and error signatures.
