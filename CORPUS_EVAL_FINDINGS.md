@@ -681,6 +681,16 @@ run that would execute different code than the working tree dies instead of
 producing a confusing result. Compare the printed `src sha` across array arms:
 they must match.
 
+**Which node, confirmed.** With the gate in place the sweep resolved it
+completely: arms 1-2 reported `src sha cbdef8c29b8968b9` matching the head
+node and ran; arms 3-5 reported STALE SOURCE and refused. All three of those
+had been scheduled onto **`farm-gpu0307`**, and across every earlier sweep the
+same array indices failed. So the apparent weight-dependence was array index
+-> host assignment, nothing more. Touching the tree did not clear that node's
+cache, so both Tier 2b jobs now carry `hname!='farm-gpu0307'` in their `-R`
+select clause. The exclusion is a stopgap for one host; the gate is the real
+safeguard and catches any other node.
+
 **The general lesson, worth applying beyond this branch.** When a result is
 impossible given the code, verify that the code that ran IS the code on disk
 before constructing a mechanism that explains the impossible. The check costs
