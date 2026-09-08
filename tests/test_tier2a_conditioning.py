@@ -214,3 +214,121 @@ def test_n_distinct_batches_rejects_an_object_carrying_neither(rs):
 
     with pytest.raises(TypeError, match="neither"):
         rs._n_distinct_batches(_Blob())
+
+
+# ---------------------------------------------------------------------------
+# Predict-time batch identity. Both defects below were SILENT and both made
+# encoder conditioning inert, which is this module's subject.
+# ---------------------------------------------------------------------------
+
+class _StubBlob:
+    """Minimal blob exposing only what the label-map path touches."""
+
+    def __init__(self, labels, rels):
+        self._labels, self._rels = labels, rels
+
+    def __len__(self):
+        return len(self._labels)
+
+    def get_batch_labels(self):
+        return list(self._labels)
+
+    def section_rows_for(self, names):
+        idx = {r: i for i, r in enumerate(self._rels)}
+        return [idx[n] for n in names]
+
+    def batch_label_to_dense(self, rows=None):
+        labs = (sorted(set(self._labels)) if rows is None
+                else sorted({self._labels[int(r)] for r in rows}))
+        return {lbl: i for i, lbl in enumerate(labs)}
+
+
+@pytest.fixture
+def stub_blob():
+    # 6 sections, composite labels as `batch_key='dataset_batch'` produces.
+    labels = ["10_batch0", "10_batch1", "11_batch0",
+              "11_batch1", "12_batch0", "12_batch1"]
+    rels = [f"d{i}/s{i}.h5ad" for i in range(6)]
+    return _StubBlob(labels, rels)
+
+
+class _FakeCkpt:
+    """A checkpoint carrying just the two widths the map is verified against."""
+
+    def __init__(self, cov_dim, enc_dim):
+        self.dims = {"decoder_covariate_dim": cov_dim,
+                     "encoder_batch_condition_dim": enc_dim}
+
+    def write(self, tmp_path):
+        p = tmp_path / "fake.ckpt"
+        torch.save({"hyper_parameters": self.dims}, p)
+        return str(p)
+
+
+def test_predict_label_map_uses_the_train_restricted_map(rs, stub_blob, tmp_path):
+    """
+    Under a whole-section split the model is sized to the TRAIN labels only.
+    Predict used the blob-wide map, which is both wider and differently
+    numbered, so a FiLM encoder could not run and the covariate read wrong rows.
+    """
+    split = {"val": ["d4/s4.h5ad"], "test": ["d5/s5.h5ad"]}
+    mp, src = rs._predict_label_map(tmp_path, split, stub_blob, ckpt_path=None)
+    assert len(mp) == 4 and "split_sections" in src
+    assert "12_batch0" not in mp and "12_batch1" not in mp
+
+
+def test_predict_label_map_rejects_the_split_predict_rewrites(rs, stub_blob, tmp_path):
+    """
+    Predict repurposes `datamodule.split_sections` into {"predict": [...]}.
+    Reading that instead of the training split claims only the shard's own
+    sections as held out, so the rebuild comes out nearly blob-wide. The width
+    check must refuse it rather than proceed.
+    """
+    rewritten = {"predict": ["d0/s0.h5ad"]}
+    with pytest.raises(ValueError, match="No candidate batch label->dense map"):
+        rs._predict_label_map(
+            tmp_path, rewritten, stub_blob,
+            ckpt_path=_FakeCkpt(4, 4).write(tmp_path),
+        )
+
+
+def test_predict_label_map_accepts_only_the_width_the_model_was_built_with(
+        rs, stub_blob, tmp_path):
+    split = {"val": ["d4/s4.h5ad"], "test": ["d5/s5.h5ad"]}
+    ck = _FakeCkpt(4, 4).write(tmp_path)
+    mp, _ = rs._predict_label_map(tmp_path, split, stub_blob, ckpt_path=ck)
+    assert len(mp) == 4
+
+    # A model sized to all 6 labels was trained without a split, so the
+    # blob-wide map is the correct one for it -- same code, different run.
+    ck6 = _FakeCkpt(6, 0).write(tmp_path)
+    mp6, src6 = rs._predict_label_map(tmp_path, split, stub_blob, ckpt_path=ck6)
+    assert len(mp6) == 6 and "blob-wide" in src6
+
+
+def test_bare_uns_batch_never_matches_a_composite_keyed_map(stub_blob):
+    """
+    The label-domain mismatch, stated directly.
+
+    With `batch_key='dataset_batch'` the map is keyed by `<dataset_id>_batch<N>`
+    (what the streaming loader stamps TRAINING ids from), while `obs_batch`
+    holds the bare `uns['batch']`. Densifying from the bare value assigns every
+    cell the unknown id AND flags it unseen, so the covariate collapses to the
+    mean embedding and FiLM sees a constant one-hot -- indistinguishable from a
+    shard of genuinely novel batches, hence silent.
+    """
+    from vqniche.initializers.initialize import build_batch_one_hot_from_obs
+
+    label_map = stub_blob.batch_label_to_dense(rows=[0, 1, 2, 3])
+
+    bare = [["batch0"] * 2, ["batch1"] * 3]
+    ids, one_hot, unseen = build_batch_one_hot_from_obs(
+        obs_batch=bare, label_to_dense=label_map, unknown_label_dense_id=0)
+    assert bool(unseen.all()) and int(ids.max()) == 0
+
+    composite = [["10_batch0"] * 2, ["10_batch1"] * 3]
+    ids, one_hot, unseen = build_batch_one_hot_from_obs(
+        obs_batch=composite, label_to_dense=label_map, unknown_label_dense_id=0)
+    assert not bool(unseen.any())
+    assert ids.tolist() == [0, 0, 1, 1, 1]
+    assert one_hot.shape[1] == 4

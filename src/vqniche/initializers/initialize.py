@@ -418,7 +418,26 @@ def initialize_databatch(
         dataset_blob: InMemoryDatasetBlob,
         batch_label_to_dense: Optional[Dict[str, int]] = None,
         unknown_batch_label_dense_id: int = 0,
+        section_batch_labels: Optional[List[str]] = None,
     ) -> Batch:
+    """
+    Collate the sections named by `config['dataset']['adata_batch_idx']`.
+
+    `section_batch_labels` (one label per collated section, in the same order)
+    overrides the per-cell labels taken from `obs_batch`. It exists because the
+    two paths did not agree on what a batch label IS. With
+    `batch_key='dataset_batch'` the on-disk blob's manifest records a COMPOSITE
+    identity, `<dataset_id>_batch<N>` -- necessary at corpus scale, where
+    `uns['batch']` collides across datasets -- and the streaming loader stamps
+    training ids from it (`_stamp_batch_ids` -> `get_batch_labels`). But
+    `obs_batch` holds the bare `uns['batch']` value, so densifying from it
+    against a composite-keyed map misses on EVERY cell: each one is assigned
+    the unknown-label id and flagged unseen, and the decoder covariate silently
+    collapses to the mean embedding while FiLM receives a constant one-hot.
+    Nothing raises, because an all-unknown result is indistinguishable from a
+    legitimately novel batch. Callers holding the authoritative per-section
+    labels (i.e. predict on a streaming blob) pass them here.
+    """
     # load PyG data object(s) corresponding to adata_batch_idx (e.g. 0 -> AnnData batch0)
     # NOTE: sss2-1b_1p is 1-indexed, while others are 0-indexed
     adata_batch_idx = config['dataset']['adata_batch_idx']
@@ -591,11 +610,46 @@ def initialize_databatch(
             "`patch_anndata_uns()` or the harmonize script's "
             "`_stamp_uns_and_cell_id` helper)."
         )
+    # Authoritative per-section labels win over `obs_batch`; see the docstring.
+    _obs_batch = data_batch.obs_batch
+    if section_batch_labels is not None:
+        if len(section_batch_labels) != len(_obs_batch):
+            raise ValueError(
+                f"section_batch_labels has {len(section_batch_labels)} entries "
+                f"but {len(_obs_batch)} sections were collated. They must "
+                f"correspond one-to-one, in collation order."
+            )
+        _obs_batch = [
+            [str(_lbl)] * len(_inner)
+            for _lbl, _inner in zip(section_batch_labels, _obs_batch,
+                                    strict=True)
+        ]
+
     batch_ids, batch_conditions, unseen_mask = build_batch_one_hot_from_obs(
-        obs_batch=data_batch.obs_batch,
+        obs_batch=_obs_batch,
         label_to_dense=batch_label_to_dense,
         unknown_label_dense_id=unknown_batch_label_dense_id,
     )
+
+    # A non-empty map that matches NOTHING is a label-domain mismatch, not a
+    # blob of novel batches. It is the failure this function's docstring
+    # describes, and it is silent by construction -- every cell just takes the
+    # mean-embedding fallback. Refuse instead, and say what the two domains
+    # look like so the mismatch is obvious.
+    if batch_label_to_dense and unseen_mask.numel() and bool(unseen_mask.all()):
+        _seen = [lbl for grp in _obs_batch[:3] for lbl in grp[:1]]
+        raise ValueError(
+            f"None of the {len(_obs_batch)} collated sections' batch labels "
+            f"appear in the {len(batch_label_to_dense)}-entry label->dense "
+            f"map, so every cell would be treated as an unseen batch. This is "
+            f"a mismatch between two naming domains, not a novel-batch case. "
+            f"Observed labels look like {_seen}; the map's keys look like "
+            f"{sorted(batch_label_to_dense)[:3]}. With "
+            f"`batch_key='dataset_batch'` the map is keyed by the COMPOSITE "
+            f"`<dataset_id>_batch<N>` identity while `obs_batch` carries the "
+            f"bare `uns['batch']` value -- pass `section_batch_labels` from "
+            f"`dataset_blob.get_batch_labels()` to resolve it."
+        )
     data_batch.adata_batch_ids = batch_ids
     # Per-cell flag: True iff the cell's batch label wasn't in the
     # train-time densification map. The model uses this at predict time

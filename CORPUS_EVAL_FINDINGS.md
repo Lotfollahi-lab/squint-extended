@@ -879,3 +879,91 @@ tissue, same codes regardless of X", the X to attack is ASSAY.**
 4. iLISI should be reported as a fraction of its permutation oracle or dropped
    for the quantised embeddings; its nominal ceiling is unreachable (§14).
 
+
+## 16. Batch conditioning was inert at predict for every run, and it was silent
+
+Evaluating FiLM required fixing predict, and the fix surfaced something larger:
+**at predict time, every cell in the corpus was treated as an unseen batch.**
+Not some cells, not held-out cells -- all 112,578,039, in all 35 shards:
+
+```
+Predict: adata_batch_ids range [0, 0], 1 distinct over 3261663 cells;
+         unseen-label cells = 3261663 (these take the mean-embedding fallback).
+```
+
+### Root cause: two naming domains
+
+With `batch_key='dataset_batch'` -- required at corpus scale, because
+`uns['batch']` collides across datasets (75 distinct values for 636 sections) --
+the blob's manifest records a COMPOSITE batch identity,
+`<dataset_id>_batch<N>`. Row 342 is `1020_batch5`. The two paths then disagree:
+
+| path | label source | value | lookup |
+|---|---|---|---|
+| train, `_stamp_batch_ids` | `get_batch_labels()` (manifest) | `1020_batch5` | matches |
+| predict, `build_batch_one_hot_from_obs` | `obs_batch` (`uns['batch']`) | `batch5` | misses, every cell |
+
+`obs_batch` is `[str(uns['batch'])] * n_cells`, the BARE value. Densified
+against a composite-keyed map, every lookup misses, so every cell gets
+`unknown_label_dense_id=0` and `unseen_mask=True`. Consequences:
+
+- the decoder covariate collapses to the MEAN embedding for every cell;
+- FiLM receives a one-hot that is constant (index 0) for every cell, so
+  encoder conditioning modulates by a constant -- i.e. does nothing.
+
+Training is unaffected: it stamps ids from the manifest identities, which is
+why all 416 embedding rows fill and FiLM's columns fill progressively (§10, and
+the visitation table below).
+
+### Why nothing ever raised
+
+This is the same class as §12 -- a wrong answer that looks like a working run.
+An all-unknown result is indistinguishable from a shard of genuinely novel
+batches, which is a legitimate zero-shot case the mean-embedding fallback
+exists to serve. Worse, it MASKED a second defect: predict also used the
+blob-wide 635-label map instead of the train-restricted 416 one, which should
+have produced ids up to 634 against a 416-row embedding and tripped both the
+range guard in `VQNiche_Dual.forward` and `nn.Embedding`'s own bounds check.
+It never did, across 313 predicts, because the ids never got past 0. Two
+independent bugs, the first hiding the second.
+
+Both are now fixed, and both fail loudly if reintroduced:
+`initialize_databatch` takes `section_batch_labels` (the authoritative
+per-section identities) and raises when a non-empty map matches nothing;
+`_predict_label_map` verifies the chosen map's width against the widths stored
+in the checkpoint and refuses to start on a mismatch.
+
+### `best` is the wrong arm for any encoder-conditioned run
+
+FiLM's `param_generator` is initialised to zero (`init_mode: identity`), so an
+exactly-zero column has never received a gradient. Across the FiLM run:
+
+| checkpoint | FiLM zero-columns | batch_embedding zero-rows |
+|---|---|---|
+| step 20,000 | 364/416 | 0/416 |
+| step 40,000 (lowest val_loss, = `best`) | 309/416 | 0/416 |
+| step 100,000 | 180/416 | 0/416 |
+| step 200,000 (= `last`) | **0/416** | 0/416 |
+
+At 1.07 section-visits per section per epoch (§13), `best` lands 20% into the
+epoch with 74% of the conditioning inert. Scoring it would return a null result
+for a reason that has nothing to do with FiLM -- the same non-answer tier2a
+gave when weight decay had erased 355/416 columns (§10). Only `last` has all
+416 columns live. `batch_embedding` never shows zero rows because it is
+randomly initialised, so non-zero there does NOT mean trained; the FiLM
+zero-column count is the only unambiguous visitation marker available.
+
+### Consequences
+
+1. **Every reconstruction number in this document was produced with a neutral
+   decoder covariate.** They are self-consistent (all runs, all arms, same
+   fallback) and identification is untouched -- codes come from the encoder,
+   which for non-FiLM runs sees no batch information at all. But they do not
+   measure what "batch-conditioned reconstruction" was supposed to mean.
+2. **§15's integration table stands.** It reads `Indices_*` from runs with
+   `encoder_batch_condition_dim=0`, where batch identity reaches only the
+   decoder. Code assignment is unaffected by the covariate fallback.
+3. **FiLM has still never been measured.** The 35 shards completed and wrote
+   output, but with a constant condition, so `_codeagree.py` on them would
+   report the null result for the wrong reason. Re-run predict after the fix
+   before drawing any conclusion about encoder conditioning.

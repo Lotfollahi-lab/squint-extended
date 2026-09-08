@@ -41144,11 +41144,30 @@ def predict(
             f"covariate at predict): {_train_label_to_dense}"
         )
 
+    # The labels the MAP is keyed by, per collated section, in collation order.
+    # `obs_batch` cannot supply these: with `batch_key='dataset_batch'` the map
+    # is keyed by the composite `<dataset_id>_batch<N>` identity the streaming
+    # loader stamps training ids from, while `obs_batch` holds the bare
+    # `uns['batch']` value. Densifying from the bare value missed on every cell
+    # -- all 3.2M per shard flagged unseen, decoder covariate collapsed to the
+    # mean embedding, FiLM handed a constant one-hot -- and nothing raised,
+    # because that is indistinguishable from a shard of genuinely novel
+    # batches. `adata_batch_idx` is the row list actually collated (set by the
+    # --predict-sections block above), so it indexes `get_batch_labels()`.
+    _section_labels = None
+    if _train_label_to_dense and hasattr(dataset_blob, "get_batch_labels"):
+        _all_labels = dataset_blob.get_batch_labels()
+        _section_labels = [
+            str(_all_labels[int(_r)])
+            for _r in config["dataset"]["adata_batch_idx"]
+        ]
+
     data_batch = initialize_databatch(
         config=config,
         dataset_blob=dataset_blob,
         batch_label_to_dense=_train_label_to_dense or None,
         unknown_batch_label_dense_id=0,
+        section_batch_labels=_section_labels,
     )
 
     # Report what the model will ACTUALLY be handed. The dense ids and the
