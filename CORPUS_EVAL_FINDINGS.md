@@ -762,3 +762,49 @@ numbers compare the two arms against each other and NOT against sections
 the full pipeline. Use it to decide whether a run deserves 14 h, not to report
 final numbers.
 
+---
+
+## 14. MMD shows no integration signal at 50,000 steps
+
+The fast loop ran both arms to completion on distinct run directories
+(`20260907_234400` and `20260907_234532`, 92 s apart), identical 41-section
+rung, identical budget, the only difference being `wt_mmd_batch`.
+
+| tissue | sections | wt=0 | wt=400 | Δ |
+|---|---|---|---|---|
+| **cell_emb** — the branch MMD targets (`z_mlp`) | | | | |
+| brain | 8 | 0.2043 | 0.1818 | **−0.023** |
+| kidney | 11 | 0.1814 | 0.1935 | +0.012 |
+| pancreas | 8 | 0.3930 | 0.3551 | **−0.038** |
+| skin | 14 | 0.4556 | 0.4538 | −0.002 |
+| | | | mean | **−0.013**, 1/4 improved |
+| **neighborhood_emb** — not directly targeted | | | | |
+| brain | 8 | 0.0826 | 0.1034 | +0.021 |
+| kidney | 11 | 0.1181 | 0.1132 | −0.005 |
+| pancreas | 8 | 0.2473 | 0.2844 | +0.037 |
+| skin | 14 | 0.3314 | 0.3325 | +0.001 |
+| | | | mean | +0.014, 3/4 improved |
+
+**This reads as noise, not effect**, for three reasons. The two embeddings move
+in OPPOSITE directions. The branch MMD actually acts on — `cell_emb`, since
+`mmd_target = z_mlp[:batch_size]` — is the one that got WORSE, while the
+untargeted branch improved. And **skin, the most reliable estimate** (14
+sections, the largest cell pool, and 111 sections in the full scope), is flat
+on both at −0.4% and +0.3%.
+
+**What this does not establish.** 50,000 steps is 8.9% of the 3-epoch budget,
+at near-peak LR, and there is no repeat arm to estimate run-to-run noise — the
+±0.02 swings on brain and pancreas, each with only 8 sections, are plausibly
+just that. MMD^2 *was* being minimised during calibration (0.0158 → 0.0087
+from wt=100 to 400), so the term works as a term; it simply does not
+translate into iLISI here.
+
+**Where that leaves integration.** Five interventions have now failed to move
+it: the Tier 1 objective rebalance, encoder FiLM, repairing the erased batch
+embedding, tripling the budget, and now a scoped MMD objective term. The
+remaining untried option is the adversarial head, which has known design
+problems at this scale (a 416-way classifier sees ~8 classes per block, and
+`wt_adv_batch=150` was calibrated for two batches). A defensible alternative
+is to report integration as a documented limitation with five negative results
+behind it, which is a stronger statement than an unexplained gap.
+
