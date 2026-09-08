@@ -978,16 +978,40 @@ was not running slowly -- it was blocked in `torch/__init__.py` loading its C
 extension. `/lustre/scratch126` (lus26) had degraded, and both the venv and the
 corpus blob live there:
 
-| path | read throughput |
-|---|---|
-| NFS shared venv (`/nfs/team361/sb75/.venvs/squint`) | 391 MB/s |
-| lus26 venv (`squint/.venv`) | 15.6 MB/s |
-| lus26 blob (`DATASETS/gold/...`) | 10-11 MB/s |
-| `import torch` | > 180 s (normally seconds) |
+| path | read throughput | how measured |
+|---|---|---|
+| NFS shared venv (`/nfs/team361/sb75/.venvs/squint`) | 391 MB/s | different filesystem, healthy |
+| lus26 venv (`squint/.venv`) | 15.6 MB/s, later 343 kB/s | O_DIRECT / uncached |
+| lus26 blob (`DATASETS/gold/...`) | 6.8-11 MB/s | O_DIRECT / uncached |
+| same files via cached `dd` | 3.8-4.0 GB/s | **misleading, do not use** |
+| `import torch` | > 300 s (normally seconds) | ground truth |
 
-`libtorch_cpu.so` is 475 MB and `libtorch_cuda.so` 855 MB, so at 15 MB/s
-importing torch is ~10 minutes of pure I/O before any user code runs. Confirmed
-by `faulthandler.dump_traceback_later`: the stack sits in `create_module`.
+The NFS venv is not a workaround: it fixes the torch import but the corpus blob
+exists only on lus26, so an eval is starved either way.
+
+`libtorch_cpu.so` is 475 MB and `libtorch_cuda.so` 855 MB, so at single-digit
+MB/s importing torch is many minutes of pure I/O before any user code runs.
+Confirmed twice over: `faulthandler.dump_traceback_later` puts the stack in
+`create_module` under `from torch._C import *`, and sampling
+`/proc/<pid>/wchan` on the blocked process returns **`cl_sync_io_wait`** -- the
+Lustre client's synchronous I/O wait, page-faulting the mmap'd library. That
+wchan value is the unambiguous marker; reach for it before theorising.
+
+### Measuring it: two traps
+
+**Plain `dd` measures the page cache, not the filesystem.** The first version
+of `_iogate.sh` read the head of each file and reported 3.8 GB/s while jobs
+were still hanging -- those pages were resident from an earlier probe. Reading
+uncached offsets in the SAME file at that moment gave 1.3-4.3 MB/s, and
+`iflag=direct` on the *cached* region gave 3.3 MB/s. **Always use
+`iflag=direct`.**
+
+**Health is per-file (per-OST), not global.** Observed within the same second:
+449 MB/s on the venv library, 6.8 MB/s on a blob section. Gating on the venv
+alone would green-light an eval whose data is starved, so check both and take
+the worse. Rates also swing violently -- the same venv file went 449 MB/s to
+343 kB/s within minutes -- so run the gate immediately before submitting, and
+accept that a job can still hit a bad patch.
 
 Diagnosis by per-file collection is unambiguous -- of 17 test files, the 12
 that import torch or vqniche ALL hang and the 5 pure-python ones ALL collect
@@ -1000,10 +1024,10 @@ about your edit.
 burns CPU; an I/O stall does not. Check `CPU time` against `Run time` in the
 LSF summary before reading anything into an empty log.
 
-`_iogate.sh` (untracked) measures both throughputs and times `import torch`,
-printing "OK, submit" or "DEGRADED, wait". Run it before submitting, because
-neither the venv nor the blob has a healthy alternative: the NFS venv is fast
-but the corpus blob is only on lus26, so an eval is starved either way.
+`_iogate.sh` (untracked) probes venv and blob with `iflag=direct`, requires
+>= 30 MB/s on BOTH, and only then times `import torch`. It probes 8 MB rather
+than 32: at 343 kB/s a 32 MB probe exceeds its own timeout and reports 0 MB/s,
+which reads as a broken probe instead of telling you how bad things are.
 
 Job scripts should carry an I/O preflight that ABORTS with a clear message
 rather than letting a stall consume the wall clock -- `_tests_job.sh` now does
