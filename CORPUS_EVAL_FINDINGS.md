@@ -808,3 +808,74 @@ problems at this scale (a 416-way classifier sees ~8 classes per block, and
 is to report integration as a documented limitation with five negative results
 behind it, which is a stronger statement than an unexplained gap.
 
+---
+
+## 15. iLISI was the wrong metric, and on the right one integration DID move
+
+**The objective, stated properly:** sections of the same tissue should get the
+same codes, whatever the panel width, dataset or assay. That is a
+code-DISTRIBUTION question, not a neighbourhood-mixing one, and iLISI answers
+the wrong one twice over (§14 and below).
+
+`_codeagree.py` measures it directly: per-section distribution over composite
+RVQ codes, pairwise similarity = 1 - Jensen-Shannon, then
+
+* **cross-panel agreement** = mean similarity for same tissue, DIFFERENT panel
+  — the quantity to maximise, in absolute terms
+* **TRANSFER** = that divided by same-tissue-same-panel — scale-free, but see
+  the warning below
+* **SEPARATION** = same-tissue / different-tissue — must stay HIGH, or a model
+  that gave every tissue identical codes would score perfectly
+
+All 636 sections, CPU only, ~4 min per run.
+
+### Niche branch
+
+| run | same panel | **diff panel** | TRANSFER | SEPARATION | xfer assay |
+|---|---|---|---|---|---|
+| baseline/best | 0.5119 | 0.3114 | 0.6084 | 2.9030 | 0.3424 |
+| baseline/last | 0.5341 | 0.3429 | 0.6421 | 2.6486 | 0.4037 |
+| tier1/last | 0.4704 | 0.3075 | 0.6538 | **3.7806** | 0.3586 |
+| **nodecay/best** | 0.5235 | **0.3609** | 0.6895 | 3.7704 | 0.3110 |
+| ep3/best | 0.4484 | 0.3318 | **0.7400** | 3.7526 | 0.3845 |
+
+**Two real gains, invisible to iLISI.** Cross-panel agreement peaks at
+**nodecay/best, 0.3609 — up 15.9% on baseline/best's 0.3114**; and tissue
+SEPARATION jumped at Tier 1 (2.90 → 3.78) and held. So the objective did
+improve, and the batch-embedding repair is what did it.
+
+**But do not read TRANSFER alone.** ep3 has the highest ratio (0.7400) while
+having the LOWEST same-panel similarity (0.4484) and a cross-panel value
+BELOW nodecay's. The ratio rose because the denominator fell. This is the same
+class of error as the iLISI ceiling: a normalised number that moves for
+reasons unrelated to the thing being claimed. Report the absolute alongside it.
+
+### Cell branch went the other way
+
+Cross-panel agreement is highest at **baseline/best (0.5066)** and declines to
+0.4430 at ep3. So the interventions traded cell-branch cross-panel agreement
+for niche-branch agreement and tissue separation.
+
+### Assay is the dominant nuisance, not panel
+
+Transfer across assay is **0.31-0.55** against 0.61-0.74 for panel and
+0.78-0.90 for dataset, on every run and both branches. Dataset identity barely
+matters; assay matters most. This contradicts the additive regression in §8
+(assay +0.012, the smallest coefficient) because that measured an unconditional
+additive contribution while this is conditional on same tissue -- the
+conditional question is the one the objective asks. **If the goal is "same
+tissue, same codes regardless of X", the X to attack is ASSAY.**
+
+### Consequences
+
+1. The "five failed interventions" narrative was an artefact of the metric.
+   On the stated objective, niche cross-panel agreement improved 15.9% and
+   tissue separation 30%.
+2. `nodecay/best` is the best model for this objective, not `ep3` -- the
+   opposite of what identification says (§11), so the paper has to pick a
+   checkpoint per claim or report both.
+3. Neither the adversary nor more MMD is indicated by this. An assay-targeted
+   term is.
+4. iLISI should be reported as a fraction of its permutation oracle or dropped
+   for the quantised embeddings; its nominal ceiling is unreachable (§14).
+
