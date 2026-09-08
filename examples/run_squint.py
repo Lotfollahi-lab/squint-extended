@@ -40579,7 +40579,7 @@ def _resolve_checkpoint(run_dir, select: str) -> Optional[str]:
 
 def _predict_label_map(
         run_dir,
-        config: dict,
+        split_sections: dict | None,
         dataset_blob,
         ckpt_path: str | None = None,
     ):
@@ -40607,6 +40607,14 @@ def _predict_label_map(
          the run was actually built with, no reconstruction needed.
       2. Rebuilt from the persisted `split_sections`, exactly as train did.
          Needed for runs trained before (1) existed.
+
+    `split_sections` is a PARAMETER, not read from `config`, because predict
+    repurposes `config["datamodule"]["split_sections"]` into {"predict": [...]}
+    for its own loader. Reading it from the config made the rebuild claim only
+    the shard's own sections as held out -- 634 train sections instead of 417 --
+    so the caller must pass the record captured before that rewrite
+    (`_saved_split_sections`). The width check below caught this on the first
+    real run; it is the ordering hazard the parameter removes.
       3. The blob-wide map -- correct when the run had no split.
 
     The CHECKPOINT arbitrates. It records the widths the model was built with
@@ -40653,10 +40661,9 @@ def _predict_label_map(
         except Exception as exc:  # noqa: BLE001
             print(f"NOTE: {_sidecar.name} present but unreadable ({exc}).")
 
-    _split = (config.get("datamodule") or {}).get("split_sections") or None
-    if _split and hasattr(dataset_blob, "section_rows_for"):
+    if split_sections and hasattr(dataset_blob, "section_rows_for"):
         try:
-            _rows = _resolve_train_rows(dataset_blob, _split)
+            _rows = _resolve_train_rows(dataset_blob, split_sections)
             cands.append((
                 dataset_blob.batch_label_to_dense(rows=_rows),
                 f"rebuilt from split_sections over {len(_rows)} train sections",
@@ -41078,7 +41085,7 @@ def predict(
     if hasattr(dataset_blob, "batch_label_to_dense"):
         _stream_map, _ = _predict_label_map(
             run_dir=run_dir,
-            config=config,
+            split_sections=_saved_split_sections,
             dataset_blob=dataset_blob,
             ckpt_path=config["model"].get("model_ckpt_fname"),
         )
