@@ -39563,6 +39563,20 @@ def train(
                   f"(blob-wide would be "
                   f"{len(dataset_blob.batch_label_to_dense())}).")
             cfg["datamodule"]["batch_label_to_dense"] = _label_map
+            # PERSIST it. Every config dump above happens BEFORE this point, so
+            # `user_specified_config.yaml` records `batch_label_to_dense: None`
+            # and the map the run was actually built with survives nowhere --
+            # which is why predict() had to guess, and guessed the blob-wide map
+            # (see the selection logic there). A sidecar rather than a re-dump of
+            # the config: the config file is a contract other tooling parses, and
+            # this is additive provenance, not configuration.
+            with open(run_dir / "batch_label_to_dense.json", "w") as _f:
+                json.dump(
+                    {"n_labels": len(_label_map),
+                     "n_train_sections": len(_train_rows),
+                     "label_to_dense": _label_map},
+                    _f, indent=2,
+                )
         data_batch = initialize_streaming_probe(
             cfg, dataset_blob, batch_label_to_dense=_label_map,
         )
@@ -40563,6 +40577,121 @@ def _resolve_checkpoint(run_dir, select: str) -> Optional[str]:
     return str(p)
 
 
+def _predict_label_map(
+        run_dir,
+        config: dict,
+        dataset_blob,
+        ckpt_path: str | None = None,
+    ):
+    """
+    The batch label->dense map predict must use, chosen to MATCH the model.
+
+    `train()` restricts the map to the TRAIN sections whenever whole-section
+    splits are in use (`batch_label_to_dense(rows=train_rows)`), so the
+    decoder-covariate embedding and the encoder FiLM one-hot are both sized to
+    that many labels -- 416 on the corpus split, not the blob-wide 635.
+
+    Predict used to take the blob-wide map unconditionally, reasoning that a
+    streaming blob "knows the map training used". That is true only for a run
+    trained WITHOUT a split, where the two coincide (the 39-section R0 case the
+    old comment was written against). Under a split they differ in width AND in
+    numbering: on `hst_corpus_110m` every one of the 416 shared labels lands on
+    a different dense id (`1000_batch1` -> 0 for training, 1 blob-wide, and the
+    drift grows along the alphabet). The consequences are asymmetric --
+    a FiLM-conditioned encoder is handed a 635-wide one-hot it was never built
+    for and cannot run at all, while the decoder covariate quietly reads the
+    wrong embedding row for every cell.
+
+    Candidates, best first:
+      1. `<run_dir>/batch_label_to_dense.json` -- written by `train()`: the map
+         the run was actually built with, no reconstruction needed.
+      2. Rebuilt from the persisted `split_sections`, exactly as train did.
+         Needed for runs trained before (1) existed.
+      3. The blob-wide map -- correct when the run had no split.
+
+    The CHECKPOINT arbitrates. It records the widths the model was built with
+    (`decoder_covariate_dim`, `encoder_batch_condition_dim`), so a candidate is
+    accepted only if its length matches, and predict refuses to start when none
+    does. That is what makes this a fix rather than a better guess: a
+    wrong-width map can no longer be used silently, which is precisely how the
+    original defect survived 313 predicts without a single error.
+    """
+    expected = None
+    if ckpt_path:
+        import torch
+        try:
+            _hp = torch.load(ckpt_path, map_location="cpu").get(
+                "hyper_parameters", {}) or {}
+        except Exception as exc:  # noqa: BLE001
+            print(f"NOTE: could not read checkpoint hparams ({exc}); the "
+                  f"label-map width cannot be verified against the model.")
+            _hp = {}
+        _dims = {
+            k: int(_hp.get(k) or 0)
+            for k in ("decoder_covariate_dim", "encoder_batch_condition_dim")
+        }
+        _nz = {k: v for k, v in _dims.items() if v > 0}
+        if len(set(_nz.values())) > 1:
+            raise ValueError(
+                f"Checkpoint declares inconsistent batch-conditioned widths "
+                f"{_nz}. Both are sized from the same label->dense map, so they "
+                f"cannot legitimately differ; the checkpoint is not usable for "
+                f"predict without knowing which is right."
+            )
+        if _nz:
+            expected = next(iter(_nz.values()))
+
+    cands = []
+    _sidecar = Path(run_dir) / "batch_label_to_dense.json"
+    if _sidecar.exists():
+        try:
+            _doc = json.loads(_sidecar.read_text())
+            cands.append((
+                {str(k): int(v) for k, v in _doc["label_to_dense"].items()},
+                f"run-dir sidecar {_sidecar.name}",
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"NOTE: {_sidecar.name} present but unreadable ({exc}).")
+
+    _split = (config.get("datamodule") or {}).get("split_sections") or None
+    if _split and hasattr(dataset_blob, "section_rows_for"):
+        try:
+            _rows = _resolve_train_rows(dataset_blob, _split)
+            cands.append((
+                dataset_blob.batch_label_to_dense(rows=_rows),
+                f"rebuilt from split_sections over {len(_rows)} train sections",
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"NOTE: could not rebuild the train-restricted map ({exc}).")
+
+    _blobwide = dataset_blob.batch_label_to_dense() or None
+    if _blobwide:
+        cands.append((_blobwide, "blob-wide manifest map (correct only with no split)"))
+
+    if expected:
+        for _m, _src in cands:
+            if len(_m) == expected:
+                print(f"Predict: batch label->dense map from {_src}: "
+                      f"{len(_m)} labels, matching the {expected} the "
+                      f"checkpoint was built with.")
+                return _m, _src
+        raise ValueError(
+            f"No candidate batch label->dense map matches the width the model "
+            f"was built with ({expected}). Tried: "
+            + "; ".join(f"{_src} -> {len(_m)}" for _m, _src in cands)
+            + ". Refusing to continue: a wrong-width map either fails in the "
+              "decoder covariate or silently reads the wrong embedding row for "
+              "every cell."
+        )
+
+    if cands:
+        _m, _src = cands[0]
+        print(f"Predict: batch label->dense map from {_src}: {len(_m)} labels "
+              f"(model declares no batch-conditioned width to verify against).")
+        return _m, _src
+    return None, "none"
+
+
 def predict(
     run_dir: str,
     silver_dir: str | None = None,
@@ -40947,7 +41076,12 @@ def predict(
     # no manifest map to reconstruct against.
     _stream_map = None
     if hasattr(dataset_blob, "batch_label_to_dense"):
-        _stream_map = dataset_blob.batch_label_to_dense() or None
+        _stream_map, _ = _predict_label_map(
+            run_dir=run_dir,
+            config=config,
+            dataset_blob=dataset_blob,
+            ckpt_path=config["model"].get("model_ckpt_fname"),
+        )
 
     _train_label_to_dense: dict = {}
     if _stream_map is None:
@@ -40965,12 +41099,17 @@ def predict(
     # ---- Streaming backend uses a DIFFERENT train-time map --------------------
     # The reconstruction above mirrors `build_batch_one_hot_from_obs`, which
     # densifies over TRAIN sections only -- correct for the in-memory backend.
-    # `OnDiskStreamingDataModule` does not do that: `initialize_datamodule`
-    # constructs it without `batch_label_to_dense`, so it falls back to
-    # `dataset.batch_label_to_dense()`, which is derived from the MANIFEST and
-    # therefore spans every section in the blob, held-out ones included. (Hence
-    # R0's "n_distinct_batches=39 (over 39 sections)" and a `batch_embedding` of
-    # 624 params = 39 rows x 16 dim, four of whose rows never receive a gradient.)
+    #
+    # For a streaming blob the map is NOT recoverable from the blob alone, and
+    # the paragraphs below (kept for the reasoning they record) describe only
+    # the no-split case. `train()` restricts the map to the train sections
+    # whenever `split_sections` is set, so which map is right depends on the
+    # RUN, not on the backend. `_predict_label_map` decides, and verifies its
+    # choice against the width stored in the checkpoint.
+    #
+    # Without a split the two coincide -- hence R0's "n_distinct_batches=39
+    # (over 39 sections)" and a `batch_embedding` of 624 params = 39 rows x 16
+    # dim, four of whose rows never receive a gradient.
     #
     # Rebuilding a 35-label map at predict time then shifts every dense id: with
     # batch0 / batch22 / batch3 / batch7 held out, sorted-unique over 35 labels
@@ -40988,13 +41127,8 @@ def predict(
     # Predict must reproduce whatever map training used, so read it from the
     # dataset for streaming blobs rather than reconstructing it.
     if _stream_map is not None:
-        print(
-            f"Predict: streaming blob -- using the manifest-wide label->dense "
-            f"map training actually used ({len(_stream_map)} labels) rather "
-            f"than reconstructing it over train sections. Rebuilding would "
-            f"shift every dense id and index the decoder covariate embedding "
-            f"on the wrong row."
-        )
+        # `_predict_label_map` has already chosen among the candidates and
+        # printed which one, having verified its width against the checkpoint.
         _train_label_to_dense = dict(_stream_map)
 
     if _train_label_to_dense:
@@ -41009,6 +41143,27 @@ def predict(
         batch_label_to_dense=_train_label_to_dense or None,
         unknown_batch_label_dense_id=0,
     )
+
+    # Report what the model will ACTUALLY be handed. The dense ids and the
+    # unseen count are the two things the label-map choice determines, and
+    # neither was ever printed -- so a mismatch could only be inferred from a
+    # crash, and the wrong-row case does not crash. Cheap (three reductions)
+    # and it makes the covariate path auditable from the log alone.
+    _dbg_ids = getattr(data_batch, "adata_batch_ids", None)
+    if _dbg_ids is not None and _dbg_ids.numel():
+        _dbg_unseen = getattr(data_batch, "adata_batch_ids_unseen_mask", None)
+        _dbg_n_unseen = (
+            int(_dbg_unseen.sum()) if _dbg_unseen is not None else None
+        )
+        print(
+            f"Predict: adata_batch_ids range "
+            f"[{int(_dbg_ids.min())}, {int(_dbg_ids.max())}], "
+            f"{int(_dbg_ids.unique().numel())} distinct over "
+            f"{int(_dbg_ids.numel())} cells; unseen-label cells = "
+            f"{_dbg_n_unseen if _dbg_n_unseen is not None else 'n/a'} "
+            f"(these take the mean-embedding fallback). Encoder condition dim = "
+            f"{getattr(data_batch, 'encoder_condition_dim', None)}."
+        )
     datamodule = initialize_datamodule(
         config=config,
         data=data_batch,
