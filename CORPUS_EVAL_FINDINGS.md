@@ -967,3 +967,44 @@ zero-column count is the only unambiguous visitation marker available.
    output, but with a constant condition, so `_codeagree.py` on them would
    report the null result for the wrong reason. Re-run predict after the fix
    before drawing any conclusion about encoder conditioning.
+
+## 17. When lus26 degrades, jobs BLOCK rather than fail, and the log is empty
+
+A companion to §12: another infrastructure failure that presents as a code bug.
+
+The test job died on `TERM_RUNLIMIT` after 60 minutes having used **6.00
+seconds of CPU** at 43 MB peak, with nothing in its log but the code check. It
+was not running slowly -- it was blocked in `torch/__init__.py` loading its C
+extension. `/lustre/scratch126` (lus26) had degraded, and both the venv and the
+corpus blob live there:
+
+| path | read throughput |
+|---|---|
+| NFS shared venv (`/nfs/team361/sb75/.venvs/squint`) | 391 MB/s |
+| lus26 venv (`squint/.venv`) | 15.6 MB/s |
+| lus26 blob (`DATASETS/gold/...`) | 10-11 MB/s |
+| `import torch` | > 180 s (normally seconds) |
+
+`libtorch_cpu.so` is 475 MB and `libtorch_cuda.so` 855 MB, so at 15 MB/s
+importing torch is ~10 minutes of pure I/O before any user code runs. Confirmed
+by `faulthandler.dump_traceback_later`: the stack sits in `create_module`.
+
+Diagnosis by per-file collection is unambiguous -- of 17 test files, the 12
+that import torch or vqniche ALL hang and the 5 pure-python ones ALL collect
+fine, with no exceptions. So a hang in a file you just edited says nothing
+about your edit.
+
+### The signature, and the gate
+
+**Six seconds of CPU against an hour of wall clock is the tell.** A real hang
+burns CPU; an I/O stall does not. Check `CPU time` against `Run time` in the
+LSF summary before reading anything into an empty log.
+
+`_iogate.sh` (untracked) measures both throughputs and times `import torch`,
+printing "OK, submit" or "DEGRADED, wait". Run it before submitting, because
+neither the venv nor the blob has a healthy alternative: the NFS venv is fast
+but the corpus blob is only on lus26, so an eval is starved either way.
+
+Job scripts should carry an I/O preflight that ABORTS with a clear message
+rather than letting a stall consume the wall clock -- `_tests_job.sh` now does
+(and its `-W` went 60 -> 240).
