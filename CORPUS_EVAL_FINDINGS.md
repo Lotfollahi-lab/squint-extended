@@ -1032,3 +1032,66 @@ which reads as a broken probe instead of telling you how bad things are.
 Job scripts should carry an I/O preflight that ABORTS with a clear message
 rather than letting a stall consume the wall clock -- `_tests_job.sh` now does
 (and its `-W` went 60 -> 240).
+
+## 18. Encoder conditioning works: FiLM + nodecay is the best model on the objective
+
+With the predict-time batch identity fixed (§16), FiLM was measurable for the
+first time. It is the best run on every column of the stated objective -- same
+tissue, same codes regardless of panel.
+
+| run | same panel | **diff panel** | TRANSFER | SEPARATION | xfer assay |
+|---|---|---|---|---|---|
+| baseline/best | 0.5119 | 0.3114 | 0.6084 | 2.9030 | 0.3424 |
+| baseline/last | 0.5341 | 0.3429 | 0.6421 | 2.6486 | **0.4037** |
+| tier1/last | 0.4704 | 0.3075 | 0.6538 | 3.7806 | 0.3586 |
+| bigblocks/best | 0.4812 | 0.3252 | 0.6759 | 3.1832 | 0.3731 |
+| nodecay/best | 0.5235 | 0.3609 | 0.6895 | 3.7704 | 0.3110 |
+| ep3/best | 0.4484 | 0.3318 | 0.7400 | 3.7526 | 0.3845 |
+| **FiLM+nodecay/last** | 0.4948 | **0.3684** | **0.7446** | **4.6015** | 0.3153 |
+
+Against the arm-matched reference (`tier1/last`: same 200,000 steps, same
+`last` arm, no nodecay, no FiLM) it improves *everything*, raw agreement
+included: diff-panel +19.8%, transfer +13.9%, separation +21.7%, same-tissue
++11.4%. Versus `baseline/last`: diff-panel +7.4%, separation +73.7%.
+
+### Two ways this could have been spurious, both excluded
+
+**Denominator collapse.** SEPARATION is same-tissue / diff-tissue, so it rises
+if a model merely stops agreeing anywhere. FiLM keeps same-tissue agreement
+high (0.4281, second only to `nodecay/best`'s 0.4377) while pushing
+diff-tissue to the lowest of any run (0.0930 vs baseline 0.1399). Both sides
+move the right way. Contrast `tier1/last`, whose separation gain came partly
+from same-tissue DROPPING to 0.3844.
+
+**Codebook collapse.** Agreement is trivial if everything piles into a few
+codes. It is the reverse -- on the same shard, same 3,051,382 cells:
+
+| run | niche codes used | entropy | top-1 share |
+|---|---|---|---|
+| FiLM+nodecay/last | **2348**/2700 | 6.856 bits | 0.089 |
+| nodecay/best | 877/2700 | 4.715 bits | 0.246 |
+
+FiLM achieves higher cross-panel agreement while using 2.7x more of the
+codebook at 2.1 more bits of entropy.
+
+### What is not yet isolated
+
+`nodecay/best` is step 40,000 and FiLM is step 200,000, so the FiLM-vs-nodecay
+comparison confounds conditioning with 5x the training. There is no
+`nodecay/last` scored. **To attribute the gain, score `tier1-nodecay` at
+arm=last** -- both 200,000 steps, both nodecay, differing only in FiLM. Until
+then the defensible claim is the arm-matched one against `tier1/last`.
+
+### Assay is still the nuisance, and interventions are making it worse
+
+FiLM did nothing for assay transfer (0.3153, effectively tied with
+`nodecay/best`'s 0.3110) and `baseline/last` remains the BEST on it (0.4037).
+Every intervention has improved panel transfer while degrading assay transfer.
+Consistent with §15: assay is the dominant nuisance and needs a targeted term.
+
+The signal for one is real but thin: 10 of 20 tissues span more than one assay
+(492/636 sections), but only **2,014 of 28,043 same-tissue pairs (7.2%)** are
+cross-assay, because Xenium is 560/636 sections. 83% of those pairs sit in
+liver, skin, lung and ovary; skin's minority is 2 sections and breast,
+pancreas, heart and prostate have 1 each. An assay term would be driven by a
+handful of sections, so it risks fitting them rather than the effect.
