@@ -1077,10 +1077,9 @@ codebook at 2.1 more bits of entropy.
 ### What is not yet isolated
 
 `nodecay/best` is step 40,000 and FiLM is step 200,000, so the FiLM-vs-nodecay
-comparison confounds conditioning with 5x the training. There is no
-`nodecay/last` scored. **To attribute the gain, score `tier1-nodecay` at
-arm=last** -- both 200,000 steps, both nodecay, differing only in FiLM. Until
-then the defensible claim is the arm-matched one against `tier1/last`.
+comparison confounds conditioning with 5x the training. **Resolved in section
+19** by scoring `tier1-nodecay` at arm=last: FiLM's contribution is larger
+than this section's arm-matched comparison suggested, not smaller.
 
 ### Assay is still the nuisance, and interventions are making it worse
 
@@ -1095,3 +1094,68 @@ cross-assay, because Xenium is 560/636 sections. 83% of those pairs sit in
 liver, skin, lung and ovary; skin's minority is 2 sections and breast,
 pancreas, heart and prostate have 1 each. An assay term would be driven by a
 handful of sections, so it risks fitting them rather than the effect.
+
+## 19. FiLM isolated: +29.5% on the objective, and it is not a coarse-codebook artefact
+
+`nodecay/last` (step 200,000, arm `last`) closes the confound left open in
+§18. It is identical to `FiLM+nodecay/last` -- same 200,000 steps, same
+no-decay exemption, same arm -- except for encoder conditioning:
+
+| | nodecay/last | FiLM+nodecay/last | delta |
+|---|---|---|---|
+| **diff panel** (the objective) | 0.2845 | 0.3684 | **+29.5%** |
+| same tissue | 0.3594 | 0.4281 | +19.1% |
+| separation | 3.6696 | 4.6015 | +25.4% |
+| transfer | 0.6418 | 0.7446 | +16.0% |
+
+All four improve. The earlier reading -- "+2.1% over nodecay, so most of the
+gain is the no-decay fix rather than FiLM" -- was an artefact of comparing
+against `nodecay/best` at step 40,000. That checkpoint is not a neutral
+reference: within the same run, step 40,000 scores 0.3609 and step 200,000
+scores 0.2845, so `best` was the most FAVOURABLE point available to nodecay.
+
+### Codebook granularity, and why two rows of the table are not comparable
+
+The metric is 1-JS between per-section distributions over 2,700 composite
+codes. Fewer codes in use means lower-dimensional distributions and
+mechanically higher similarity, so agreement must be read against how finely
+each run quantises. Measured on the same shard (3,051,382 cells), niche branch:
+
+| run | codes used | entropy | effective codes (2^H) | top-1 | diff panel |
+|---|---|---|---|---|---|
+| baseline/best | 785 | 4.654 | 25.2 | 0.291 | 0.3114 |
+| baseline/last | 1528 | 5.620 | 49.2 | 0.378 | 0.3429 |
+| nodecay/best | 877 | 4.715 | 26.3 | 0.246 | 0.3609 |
+| bigblocks/best | 2547 | 6.298 | 78.7 | 0.269 | 0.3252 |
+| nodecay/last | 2447 | 6.683 | 102.7 | 0.120 | 0.2845 |
+| ep3/best | 2388 | 6.833 | 114.0 | 0.153 | 0.3318 |
+| **FiLM+nodecay/last** | 2348 | 6.856 | **115.9** | 0.089 | **0.3684** |
+| tier1/last | 2404 | 7.305 | 158.2 | 0.044 | 0.3075 |
+
+`nodecay/best` reaches 0.3609 on **26 effective codes** -- a quarter of the
+granularity of the fine-grained runs, and `baseline/last` puts 37.8% of all
+cells in a single code. Those rows are coarse-quantisation artefacts and should
+not be compared with the rest.
+
+Among runs at comparable granularity (~100-160 effective codes) the ranking is
+unambiguous, and FiLM wins on the objective at essentially the same granularity
+as its two nearest rivals:
+
+    FiLM+nodecay/last  115.9 eff -> 0.3684
+    ep3/best           114.0 eff -> 0.3318
+    nodecay/last       102.7 eff -> 0.2845
+    tier1/last         158.2 eff -> 0.3075
+
+Granularity is not the whole story -- `tier1/last` has the MOST effective codes
+and still scores low, and the correlation across all eight runs is only
+r = -0.25 -- so agreement does carry real signal. But it is enough to
+disqualify the two coarse rows, and it removes the last way FiLM's win could
+have been mechanical: FiLM has the highest agreement while using slightly MORE
+effective codes than `nodecay/last` (115.9 vs 102.7) and a far flatter
+distribution (top-1 0.089 vs 0.120).
+
+### Consequence
+
+`FiLM+nodecay/last` is the model to report for the integration claim. Note it
+is NOT the best on identification -- that is still `ep3` (§11) -- so the paper
+reports a checkpoint per claim, as §15 already anticipated.
