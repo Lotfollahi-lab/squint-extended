@@ -1174,3 +1174,71 @@ bundle (encoder conditioning + a 4x wider decoder covariate), which is what
 was actually run. Note it
 is NOT the best on identification -- that is still `ep3` (§11) -- so the paper
 reports a checkpoint per claim, as §15 already anticipated.
+
+## 20. Can the corpus support an assay-targeted term? Only with stratified blocks
+
+§15 and §19 both point at assay as the dominant nuisance, so the question is
+whether the data can actually train a term against it. The binding constraint
+is not how many cross-assay pairs exist -- it is how often one lands in a
+single training BLOCK, because that is when an MMD or adversary scoped by
+tissue and targeted at assay can produce a gradient at all.
+
+### The signal that exists (TRAIN sections only -- held-out ones cannot train)
+
+| tissue | cross-assay pairs | share | minority sections | minority cells | composition |
+|---|---|---|---|---|---|
+| liver | 788 | 50.4% | **22** | 3,918,830 | cosmx 2, merfish 20, xenium 34 |
+| ovary | 272 | 17.4% | 4 | 881,623 | merfish 4, xenium 68 |
+| brain | 165 | 10.5% | 2 | 312,563 | cosmx 1, merfish 1, xenium 82 |
+| colon | 117 | 7.5% | **11** | 4,682,438 | cosmx 9, merfish 2, xenium 9 |
+| lung | 108 | 6.9% | 4 | 1,320,223 | cosmx 2, merfish 2, xenium 26 |
+| skin | 100 | 6.4% | 2 | 644,736 | merfish 2, xenium 50 |
+| breast / heart / prostate | 9 / 3 / 2 | 0.9% | 1 each | | |
+
+1,564 pairs total. **Pair count is the wrong measure of diversity.** Brain has
+165 pairs from exactly TWO minority sections (one cosmx, one merfish) against
+82 xenium -- the same two sections re-paired 165 times. Effective diversity is
+the minority-section count, and by that measure only **liver (22) and colon
+(11)** have any depth; everything else is 4 sections or fewer.
+
+This also corrects the earlier note in §18, which named liver/skin/lung/ovary
+as holding 83%. That was computed over all 636 sections; restricted to train it
+is liver/ovary/brain/colon at 86%, and by effective diversity it is really just
+liver and colon.
+
+### Why the current configuration cannot use it
+
+Blocks hold `sections_per_block: 8` capped by `max_cells_per_block: 900,000`,
+and the cap binds -- 8 average sections is ~1.84M cells -- giving K = 3.9
+sections per block, which matches the 1.07 section-visits of §13.
+
+    P(a given section pair co-occurs)  = C(3.9,2)/C(417,2) = 6.9e-05
+    E[cross-assay same-tissue pairs per block] = 1,564 x 6.9e-05 = 0.108
+    -> ~11% of blocks carry any assay signal
+
+A 200,000-step run at batch 512 over 900,000-cell blocks consumes ~114 blocks,
+so the term would be active for ~11% of steps but would see only **~12 distinct
+cross-assay block compositions in the entire run**, half of them liver. That is
+enough to fit those sections and not enough to learn assay invariance.
+
+### What would fix it
+
+| scenario | K | P(block has signal) |
+|---|---|---|
+| current (900k budget) | 3.9 | 10.8% |
+| bigblocks budget (1.9M) | 8.0 | 50.5% |
+| stratified assembly | 3.9 | ~100% |
+
+Raising the block budget helps because co-occurrence scales as C(K,2): the
+existing `bigblocks` config alone takes it from 11% to 50%. But the real fix is
+**stratified block assembly** -- deliberately co-scheduling same-tissue,
+different-assay sections rather than relying on a random shuffle to collide
+them. That reaches ~100% of blocks at no extra memory, and it bounds the
+experiment by the 1,564 available pairs instead of by luck.
+
+### Experimental design this implies
+
+An assay term is effectively a liver-and-colon experiment. So the honest test
+is to scope the term to those two tissues and measure whether assay transfer
+improves on the tissues it never saw (ovary, lung, skin). Measuring it on liver
+would not distinguish invariance from memorising 22 sections.
