@@ -1098,8 +1098,21 @@ handful of sections, so it risks fitting them rather than the effect.
 ## 19. FiLM isolated: +29.5% on the objective, and it is not a coarse-codebook artefact
 
 `nodecay/last` (step 200,000, arm `last`) closes the confound left open in
-§18. It is identical to `FiLM+nodecay/last` -- same 200,000 steps, same
-no-decay exemption, same arm -- except for encoder conditioning:
+§18: same 200,000 steps, same no-decay exemption, same arm.
+
+**It is not a single-variable comparison, though.** Diffing the saved configs
+and confirming against the checkpoints, `FiLM+nodecay` changes TWO things
+relative to `nodecay`:
+
+  - encoder FiLM conditioning on `cell_batch_id` (identity init, bias, no
+    residual) -- `conditioning_module.param_generator` is (512, 416);
+  - `decoder_covariate_embed_dim` 16 -> 64, i.e. `batch_embedding` goes from
+    (416, 16) to (416, 64).
+
+Both hand the model more batch capacity, one on the encoder side and one on the
+decoder side, so the delta below belongs to the BUNDLE. Attributing it to FiLM
+alone would need a third run: nodecay + `decoder_covariate_embed_dim=64` and no
+FiLM. Everything else about the comparison is matched:
 
 | | nodecay/last | FiLM+nodecay/last | delta |
 |---|---|---|---|
@@ -1156,6 +1169,8 @@ distribution (top-1 0.089 vs 0.120).
 
 ### Consequence
 
-`FiLM+nodecay/last` is the model to report for the integration claim. Note it
+`FiLM+nodecay/last` is the model to report for the integration claim -- as a
+bundle (encoder conditioning + a 4x wider decoder covariate), which is what
+was actually run. Note it
 is NOT the best on identification -- that is still `ep3` (§11) -- so the paper
 reports a checkpoint per claim, as §15 already anticipated.
