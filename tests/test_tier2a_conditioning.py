@@ -332,3 +332,33 @@ def test_bare_uns_batch_never_matches_a_composite_keyed_map(stub_blob):
     assert not bool(unseen.any())
     assert ids.tolist() == [0, 0, 1, 1, 1]
     assert one_hot.shape[1] == 4
+
+
+def test_all_unseen_tells_a_held_out_shard_from_a_domain_mismatch():
+    """
+    Every cell flagged unseen has two causes that look identical downstream.
+
+    A shard of entirely held-out sections is the zero-shot path working as
+    intended -- `job_A_shards` has two such shards, 7 and 9 sections. The
+    section-16 bug (bare `uns['batch']` densified against a composite
+    `<dataset_id>_batch<N>` map) also flags everything unseen. Refusing both
+    failed 2 of 6 eval shards; refusing neither is how the original bug shipped.
+    """
+    from vqniche.initializers.initialize import all_unseen_is_a_label_mismatch
+
+    corpus = ["1000_batch1", "1002_batch15", "1018_batch21", "1018_batch13"]
+
+    # Held-out shard: absent from the TRAIN map, but valid corpus labels.
+    assert not all_unseen_is_a_label_mismatch(
+        {"1002_batch15", "1018_batch21"}, corpus)
+
+    # Domain mismatch: bare uns['batch'] values, valid nowhere.
+    assert all_unseen_is_a_label_mismatch({"batch15", "batch21"}, corpus)
+
+    # A single unrecognised label among valid ones is still a mismatch.
+    assert all_unseen_is_a_label_mismatch({"1002_batch15", "batch21"}, corpus)
+
+    # No corpus label set to check against: do not refuse. Blocking a
+    # legitimate zero-shot shard is worse than missing a mismatch that the
+    # width check in `_predict_label_map` also catches.
+    assert not all_unseen_is_a_label_mismatch({"batch15"}, [])

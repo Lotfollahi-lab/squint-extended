@@ -413,6 +413,30 @@ def initialize_dataset_blob(
     return dataset_blob
 
 
+def all_unseen_is_a_label_mismatch(observed_labels, corpus_labels) -> bool:
+    """
+    Every cell flagged unseen: is that a bug, or the zero-shot path working?
+
+    Both look identical downstream -- each cell takes the mean-embedding
+    fallback -- so the two have to be told apart here or not at all.
+
+    A shard of entirely HELD-OUT sections legitimately matches nothing in the
+    train map, and `job_A_shards` contains two such shards. A label-domain
+    mismatch (the section-16 bug: bare `uns['batch']` densified against a
+    composite `<dataset_id>_batch<N>` map) also matches nothing. The
+    discriminator is not the train map, which both fail, but the CORPUS label
+    set: held-out sections carry labels that are valid corpus-wide, a domain
+    mismatch produces labels that are valid nowhere.
+
+    Returns True only for the mismatch. With no corpus label set to check
+    against, returns False -- refusing a legitimate zero-shot shard is worse
+    than missing a mismatch that other guards also cover.
+    """
+    if not corpus_labels:
+        return False
+    return not set(observed_labels) <= set(corpus_labels)
+
+
 def initialize_databatch(
         config: Dict,
         dataset_blob: InMemoryDatasetBlob,
@@ -631,12 +655,40 @@ def initialize_databatch(
         unknown_label_dense_id=unknown_batch_label_dense_id,
     )
 
-    # A non-empty map that matches NOTHING is a label-domain mismatch, not a
-    # blob of novel batches. It is the failure this function's docstring
-    # describes, and it is silent by construction -- every cell just takes the
-    # mean-embedding fallback. Refuse instead, and say what the two domains
-    # look like so the mismatch is obvious.
-    if batch_label_to_dense and unseen_mask.numel() and bool(unseen_mask.all()):
+    # A non-empty map that matches NOTHING is USUALLY a label-domain mismatch --
+    # the failure this function's docstring describes, silent by construction
+    # because every cell just takes the mean-embedding fallback.
+    #
+    # But "nothing matches" is also the correct answer for a shard made up
+    # entirely of HELD-OUT sections, which is exactly the zero-shot case the
+    # fallback exists to serve. `job_A_shards` has two such shards (7 and 9
+    # sections, all val/test), and an earlier version of this check refused
+    # them -- a false positive that failed 2 of 6 eval shards.
+    #
+    # The discriminator is not membership in the TRAIN map, it is whether the
+    # observed labels are valid corpus labels at all. Held-out sections carry
+    # labels that are absent from the train map but present in the blob-wide
+    # set; a domain mismatch produces labels that appear in NEITHER.
+    _all_unseen = bool(batch_label_to_dense) and unseen_mask.numel() \
+        and bool(unseen_mask.all())
+    if _all_unseen:
+        _observed = {str(grp[0]) for grp in _obs_batch if len(grp)}
+        _universe = ()
+        if hasattr(dataset_blob, "get_batch_labels"):
+            try:
+                _universe = [str(x) for x in dataset_blob.get_batch_labels()]
+            except Exception:  # noqa: BLE001
+                _universe = ()
+        _all_unseen = all_unseen_is_a_label_mismatch(_observed, _universe)
+        if not _all_unseen:
+            print(
+                f"NOTE: all {len(_obs_batch)} collated sections are held out "
+                f"(their labels are valid corpus labels absent from the "
+                f"{len(batch_label_to_dense)}-entry TRAIN map), so every cell "
+                f"takes the mean-embedding fallback. This is the intended "
+                f"zero-shot path, not a mismatch."
+            )
+    if _all_unseen:
         _seen = [lbl for grp in _obs_batch[:3] for lbl in grp[:1]]
         raise ValueError(
             f"None of the {len(_obs_batch)} collated sections' batch labels "
