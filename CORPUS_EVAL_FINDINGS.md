@@ -1242,3 +1242,64 @@ An assay term is effectively a liver-and-colon experiment. So the honest test
 is to scope the term to those two tissues and measure whether assay transfer
 improves on the tissues it never saw (ovary, lung, skin). Measuring it on liver
 would not distinguish invariance from memorising 22 sections.
+
+## 21. FiLM does not cost identification, and ep3's lead is an ARM effect
+
+§19 left one thing unknown: whether encoder conditioning buys integration at
+the expense of NMI/ARI, the paper's primary claim. It does not.
+
+Held-out TEST split, level-0 codes, unweighted mean over the 81 label keys.
+**These are not the §11 headline numbers** -- those come from `_tier0*.py`,
+which aggregates per dataset under a different protocol. Everything below is
+recomputed the same way for every run so the columns are comparable to each
+other:
+
+| run | cell NMI | cell ARI | niche NMI | niche ARI |
+|---|---|---|---|---|
+| baseline/best | 0.3803 | 0.2159 | 0.2945 | 0.1434 |
+| baseline/last | 0.2875 | 0.1120 | 0.2502 | 0.0981 |
+| tier1/best | 0.3545 | 0.1885 | 0.3271 | 0.1421 |
+| tier1/last | 0.3367 | 0.1540 | 0.2992 | 0.1204 |
+| nodecay/best | 0.3818 | 0.1999 | 0.3117 | 0.1273 |
+| nodecay/last | 0.3207 | 0.1293 | 0.2862 | 0.1027 |
+| **ep3** | **0.3884** | **0.2056** | 0.3190 | **0.1773** |
+| FiLM+nodecay/last | 0.3225 | 0.1319 | 0.3003 | 0.1350 |
+
+Against its arm-matched control, `nodecay/last`, FiLM is neutral to positive:
+cell NMI +0.6%, cell ARI +1.9%, niche NMI +4.9%, **niche ARI +31.5%**. So the
++29.5% code-agreement gain of §19 is not paid for in identification.
+
+### `best` beats `last` in every single-epoch run
+
+| run | cell NMI best -> last |
+|---|---|
+| baseline | 0.3803 -> 0.2875 (-24%) |
+| tier1 | 0.3545 -> 0.3367 (-5%) |
+| nodecay | 0.3818 -> 0.3207 (-16%) |
+
+Identification DEGRADES over a 200,000-step (≈1 epoch) run, and `ep3` -- three
+epochs, where `best` and `last` coincide -- is the strongest of all. So
+FiLM/last trailing ep3 by 16.9% on cell NMI is largely an arm effect, not a
+FiLM effect: FiLM has no usable `best` arm, because at step 40,000 309/416 of
+its conditioning columns are still exactly zero (§18).
+
+This is the same non-monotonicity §19 found for code agreement, where nodecay
+went 0.3609 at 40k to 0.2845 at 200k. One epoch is a bad place to stop on both
+metrics, and it is where five of the seven runs stop.
+
+### Consequence
+
+**FiLM + nodecay + 3 epochs is now the clearly indicated next run.** ep3's
+advantage is training length and FiLM's is integration; the two are
+independent branches off `nodecay` that have never been combined, and this
+section removes the reason to fear the combination -- conditioning costs
+nothing on identification.
+
+### Cost note
+
+Pooling took 68 minutes; the metrics step took 8 h 50 m (CPU time 36,102 s vs
+run time 35,932 s, so genuinely compute-bound, not the §17 I/O stall). It
+scores 4 splits x 4 code keys x 81 label keys ~= 1,300 clusterings over 20.1M
+cells, and `compute_inference_metrics.py` has no `--splits` flag, so `all`,
+`train` and `validation` are always computed even when only `test` is wanted.
+A splits filter would cut roughly 4x off the dominant cost.
