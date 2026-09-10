@@ -6163,6 +6163,27 @@ def _patch_nodecay(
     return cfg
 
 
+def _patch_covwidth(cfg: dict, decoder_covariate_embed_dim: int = 64) -> dict:
+    """
+    Widen the DECODER covariate embedding and touch nothing else.
+
+    Exists to split `_patch_tier2a`, which bundles two changes: encoder FiLM
+    on `cell_batch_id` AND `decoder_covariate_embed_dim` 16 -> 64. Section 19
+    measured that bundle at +29.5% on cross-panel code agreement against
+    `nodecay/last` and could not say which half earned it -- both hand the
+    model more batch capacity, one per side of the bottleneck.
+
+    With this patch the 2x2 closes:
+
+        cov16, no FiLM   corpus-holdout-tier1-nodecay          (have)
+        cov64, no FiLM   corpus-holdout-nodecay-cov64          (this)
+        cov16, FiLM      corpus-holdout-tier2a-nodecay-cov16   (this + tier2a arg)
+        cov64, FiLM      corpus-holdout-tier2a-nodecay         (have)
+    """
+    cfg["model"]["decoder_covariate_embed_dim"] = int(decoder_covariate_embed_dim)
+    return cfg
+
+
 def _patch_tier2a(
         cfg: dict,
         decoder_covariate_embed_dim: int = 64,
@@ -6867,6 +6888,49 @@ VARIANTS: dict = {
             "decoder_covariate_embed_dim 16 -> 64)",
         ],
         "build": lambda: _patch_tier2a(VARIANTS["corpus-holdout-tier1"]["build"]()),
+    },
+
+    "corpus-holdout-nodecay-cov64": {
+        "description": (
+            "ISOLATION, half one of two. `corpus-holdout-tier1-nodecay` with "
+            "the decoder covariate widened 16 -> 64 and NO encoder "
+            "conditioning. Paired with `corpus-holdout-tier2a-nodecay-cov16` "
+            "it splits the section-19 bundle, which moved cross-panel code "
+            "agreement +29.5% while changing both halves at once. Same "
+            "200,000-step budget and LR schedule as every other arm, so the "
+            "only moving part is the covariate width. "
+            "REQUIRES --split-sections-json _splitspec.json."
+        ),
+        "patches": [
+            "=corpus-holdout-tier1-nodecay (all of it)",
+            "+covwidth(decoder_covariate_embed_dim 16 -> 64)",
+        ],
+        "build": lambda: _patch_covwidth(
+            VARIANTS["corpus-holdout-tier1-nodecay"]["build"](),
+            decoder_covariate_embed_dim=64),
+    },
+
+    "corpus-holdout-tier2a-nodecay-cov16": {
+        "description": (
+            "ISOLATION, half two of two. Encoder FiLM exactly as in "
+            "`corpus-holdout-tier2a-nodecay`, but the decoder covariate stays "
+            "at 16 so FiLM is the only change against "
+            "`corpus-holdout-tier1-nodecay`. Score it at BOTH arms: section "
+            "21 found identification degrades best -> last in every "
+            "single-epoch run, and section 19 found code agreement does too "
+            "(nodecay 0.3609 at 40k, 0.2845 at 200k), so ranking these "
+            "ablations on `last` alone could pick the wrong config for the "
+            "3-epoch run. "
+            "REQUIRES --split-sections-json _splitspec.json."
+        ),
+        "patches": [
+            "=corpus-holdout-tier1-nodecay (all of it)",
+            "+tier2a(encoder FiLM on cell_batch_id, identity init; "
+            "decoder_covariate_embed_dim left at 16)",
+        ],
+        "build": lambda: _patch_tier2a(
+            VARIANTS["corpus-holdout-tier1-nodecay"]["build"](),
+            decoder_covariate_embed_dim=16),
     },
 
     "smoke-tier2a+stream+xhs1000-39b_1p": {
