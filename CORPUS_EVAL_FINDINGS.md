@@ -1303,3 +1303,67 @@ scores 4 splits x 4 code keys x 81 label keys ~= 1,300 clusterings over 20.1M
 cells, and `compute_inference_metrics.py` has no `--splits` flag, so `all`,
 `train` and `validation` are always computed even when only `test` is wanted.
 A splits filter would cut roughly 4x off the dominant cost.
+
+## 22. The FiLM gain is an INTERACTION: neither half does anything alone
+
+§19 measured a bundle -- encoder FiLM plus `decoder_covariate_embed_dim`
+16 -> 64 -- at +29.5% on cross-panel code agreement and could not say which
+half earned it. Two runs complete the square, all four cells at 200,000 steps,
+`nodecay`, arm `last`, differing only in these two axes:
+
+| | cov16 | cov64 |
+|---|---|---|
+| **no FiLM** | 0.2845 (`nodecay/last`) | 0.2908 (**+2.2%**) |
+| **FiLM** | 0.2843 (**-0.1%**) | **0.3684** (**+29.5%**) |
+
+**Neither component alone does anything.** FiLM by itself moves the objective
+by -0.1%; a 4x wider decoder covariate by itself moves it +2.2%. Their
+individual effects sum to +2.1% against +29.5% observed, so roughly 93% of the
+gain is interaction.
+
+### It is not a granularity artefact
+
+Agreement rises mechanically as fewer codes are used (§19), so the obvious
+worry is that the winning cell simply quantises coarsely. It does not -- the
+check comes out backwards:
+
+| run | codes | entropy | effective (2^H) | top-1 | diff panel |
+|---|---|---|---|---|---|
+| nodecay/last (cov16, -) | 2447 | 6.683 | 102.7 | 0.120 | 0.2845 |
+| cov64-only (cov64, -) | 2381 | 6.510 | 91.1 | 0.130 | 0.2908 |
+| FiLM-only (cov16, F) | 2331 | 6.855 | **115.7** | 0.116 | 0.2843 |
+| FiLM+nodecay (cov64, F) | 2348 | 6.856 | **115.9** | 0.089 | **0.3684** |
+
+`FiLM-only` and `FiLM+nodecay` sit at **the same granularity** -- 115.7 vs
+115.9 effective codes, entropies equal to three decimals -- and differ by
+29.6% on the objective. Nothing about coarseness can explain that gap; the
+only difference is covariate width. Meanwhile `cov64-only` has the COARSEST
+codebook of the four, which should flatter it, and still scores 0.2908.
+
+### The mechanism this implies
+
+FiLM alone does change the model -- it raises effective codes 102.7 -> 115.7
+and flattens the distribution -- it just does not improve transfer. That is
+the conditional-autoencoder division of labour failing to close:
+
+  - the encoder can only strip batch identity out of the codes if the decoder
+    can put it back, and 16 dimensions across 416 batches cannot;
+  - the decoder can absorb batch at 64 dimensions, but without FiLM the
+    encoder has no signal telling it what to strip.
+
+Only both together complete the loop, which is why the effect is
+multiplicative rather than additive. SEPARATION behaves the same way, though
+less starkly: +13.1% and +2.5% alone, +25.4% together.
+
+### Caveat
+
+One run per cell, no seed replicates. The three null cells span 0.2843-0.2908,
+a 2.3% spread, and the winning cell sits 27% above the top of that range --
+about 13x the observed noise. Strong for n=1, but a seed replicate of the
+winning cell would settle it, and is cheap at 5 h.
+
+### Consequence
+
+**Keep both in the 3-epoch run.** The cheaper cov16 variant is not a viable
+economy: at cov16 FiLM is worth nothing. This also retires the §19 caveat that
+the bundle was unattributed -- it is attributed, to the pair.
