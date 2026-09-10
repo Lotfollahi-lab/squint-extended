@@ -39430,6 +39430,13 @@ def train(
     # silently share one dir and clobber each other's predicted_adata.h5ad /
     # checkpoints — the cause of duplicate run_dirs in seed_run_index.csv.
     # Matches the `<TS>_seed_<N>` layout the multi-seed runner assumes.
+    # `--seed` override, applied BEFORE the run-directory suffix is derived.
+    # Placing it next to `seed_everything` instead -- 67 lines below -- seeded
+    # the run correctly but named the directory from the pre-override value,
+    # so a seed-1 replicate landed in `<ts>_seed0`, indistinguishable at a
+    # glance from the seed-0 original it was meant to be compared against.
+    if seed is not None:
+        cfg.setdefault("experiment", {})["seed"] = int(seed)
     _run_seed = cfg.get("experiment", {}).get("seed", None)
     if _run_seed is not None:
         timestamp = f"{timestamp}_seed{_run_seed}"
@@ -39492,12 +39499,6 @@ def train(
         cfg["dataset"]["gene_count_transform_params"] = {}
 
     # ---- Determinism (mirror train_model.train) ---------------------------
-    # `--seed` override. Until this existed the seed was reachable only by
-    # editing the base config, so every corpus run is seed 0 and no result has
-    # a replicate. The run directory carries `_seed<N>`, so replicates land
-    # side by side rather than colliding.
-    if seed is not None:
-        cfg.setdefault("experiment", {})["seed"] = int(seed)
     pl.seed_everything(cfg["experiment"]["seed"])
 
     # ---- Dataset / Databatch / Datamodule ---------------------------------
