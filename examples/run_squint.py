@@ -6890,6 +6890,28 @@ VARIANTS: dict = {
         "build": lambda: _patch_tier2a(VARIANTS["corpus-holdout-tier1"]["build"]()),
     },
 
+    "corpus-holdout-tier2a-nodecay-3ep": {
+        "description": (
+            "THE COMBINED RUN. Encoder FiLM + the 64-dim decoder covariate "
+            "(section 22: neither is worth anything without the other -- "
+            "alone they give -0.1% and +2.2%, together +29.5%) at ep3's "
+            "three-epoch budget (section 11: the strongest model on every "
+            "identification metric). The two are independent branches off "
+            "`corpus-holdout-tier1-nodecay` that have never been combined. "
+            "Section 21 removed the reason to fear the combination -- "
+            "conditioning costs nothing on identification -- and section 18 "
+            "gives the reason to want it: FiLM's conditioning columns only "
+            "finish filling AT step 200,000, so at one epoch every column has "
+            "had roughly one gradient. Three epochs gives each about three. "
+            "Score several checkpoints, not just `last`: both metrics move "
+            "non-monotonically within a run (sections 19 and 21). "
+            "REQUIRES --split-sections-json _splitspec.json."
+        ),
+        "patches": ["=corpus-holdout-tier2a-nodecay", "+epochs(3.0)"],
+        "build": lambda: _patch_epochs(
+            VARIANTS["corpus-holdout-tier2a-nodecay"]["build"](), epochs=3.0),
+    },
+
     "corpus-holdout-nodecay-cov64": {
         "description": (
             "ISOLATION, half one of two. `corpus-holdout-tier1-nodecay` with "
@@ -39217,6 +39239,7 @@ def train(
         wt_mmd_batch: Optional[float] = None,
         num_workers: Optional[int] = None,
         prefetch: Optional[bool] = None,
+        seed: Optional[int] = None,
     ):
     """
     Train SQUINT.
@@ -39469,6 +39492,12 @@ def train(
         cfg["dataset"]["gene_count_transform_params"] = {}
 
     # ---- Determinism (mirror train_model.train) ---------------------------
+    # `--seed` override. Until this existed the seed was reachable only by
+    # editing the base config, so every corpus run is seed 0 and no result has
+    # a replicate. The run directory carries `_seed<N>`, so replicates land
+    # side by side rather than colliding.
+    if seed is not None:
+        cfg.setdefault("experiment", {})["seed"] = int(seed)
     pl.seed_everything(cfg["experiment"]["seed"])
 
     # ---- Dataset / Databatch / Datamodule ---------------------------------
@@ -42387,6 +42416,15 @@ def main():
                        "the real config. `val_check_interval` is reduced to fit "
                        "if it would exceed the budget."
                    ))
+    p.add_argument("--seed", type=int, default=None,
+                   help=(
+                       "Override the experiment seed (default 0). The run "
+                       "directory is suffixed `_seed<N>`, so a replicate lands "
+                       "beside the original instead of colliding with it. "
+                       "Needed because every corpus run so far is seed 0: the "
+                       "seed was only reachable by editing the base config, "
+                       "so no result has a replicate."
+                   ))
     p.add_argument("--split-sections-json", type=str, default=None,
                    help=(
                        "Path to a split spec (`_splitspec.json`) applying "
@@ -42853,6 +42891,7 @@ def main():
             train_deterministic=_deterministic_override,
             split_sections_json=args.split_sections_json,
             max_steps=args.max_steps,
+            seed=args.seed,
             wt_mmd_batch=args.wt_mmd_batch,
             num_workers=args.num_workers,
             prefetch=_prefetch_override,
