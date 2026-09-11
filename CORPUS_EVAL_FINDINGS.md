@@ -1642,3 +1642,83 @@ on this metric, which is as large as the largest delta here (+0.0495). So the
 paired CIs are honest about ESTIMATOR uncertainty but say nothing about SEED
 uncertainty, and the ordering above could still be a seed artefact. Paired
 deltas fix the estimator; only replicates fix the rest.
+
+## 27. Plain summary: nothing we built reliably beats doing nothing
+
+Sections 15-26 accumulated a lot of machinery. This section states the result
+in one place, in plain terms. The earlier tables are kept above; this one
+supersedes their conclusions.
+
+### First, the vocabulary
+
+**Arm** = which saved checkpoint is scored. Every run keeps two: `best` (the
+lowest validation loss, usually an EARLY step -- 40,000 of 200,000 on these
+runs) and `last` (the final step). **Arm-matched** means comparing best to
+best, or last to last. Mixing them confounds "did the change help?" with "is
+an early or late checkpoint better?", and that second effect is worth up to
+0.0765 here -- larger than any change we made.
+
+**Score** = cross-panel code agreement: do sections of the same tissue get the
+same codes when the gene panel differs. Higher is better.
+
+**Paired delta** = the difference against a reference, computed pair-by-pair
+on identical sections. Section 25 showed this is the only usable comparison:
+marginal numbers carry a 24-27% confidence interval, paired ones about 5x
+tighter.
+
+### The result that matters: arm-matched against doing nothing
+
+Reference is `baseline/last` -- the ORIGINAL model, no interventions at all,
+read at its final checkpoint. Score 0.3429. Every row below is also `last`, so
+this is arm-matched.
+
+| experiment | score | vs baseline/last | 95% CI | verdict |
+|---|---|---|---|---|
+| FiLM+cov64 seed0 | 0.3684 | +0.0255 | [+0.010, +0.040] | **better** |
+| FiLM only seed1 | 0.3220 | -0.0209 | [-0.032, -0.010] | worse |
+| FiLM+cov64 seed1 | 0.3159 | -0.0270 | [-0.041, -0.013] | worse |
+| tier1 | 0.3075 | -0.0354 | [-0.046, -0.026] | worse |
+| cov64 only seed1 | 0.3055 | -0.0374 | [-0.046, -0.028] | worse |
+| FiLM+cov64 3 epochs | 0.3028 | -0.0401 | [-0.049, -0.032] | worse |
+| cov64 only seed0 | 0.2908 | -0.0521 | [-0.061, -0.044] | worse |
+| nodecay | 0.2845 | -0.0584 | [-0.068, -0.048] | worse |
+| FiLM only seed0 | 0.2843 | -0.0586 | [-0.068, -0.050] | worse |
+
+**Eight of nine are significantly WORSE than the untouched baseline.** The one
+exception, `FiLM+cov64 seed0`, is contradicted by its own replicate: seed 1 of
+the same configuration is significantly worse.
+
+### Why every earlier conclusion looked different
+
+Every configuration we ran twice produced two opposite verdicts:
+
+| experiment | seed 0 | seed 1 |
+|---|---|---|
+| FiLM+cov64 | better (+0.026) | **worse** (-0.027) |
+| FiLM only | worse (-0.059) | worse (-0.021) |
+| cov64 only | worse (-0.052) | worse (-0.037) |
+
+`FiLM+cov64` flips sign between seeds. `FiLM only` and `cov64 only` agree in
+direction but differ by 2-3x in size. With one run per configuration -- which
+is what sections 15, 19 and 22 had -- any conclusion was available.
+
+### The bottom line
+
+1. **No intervention reliably improves cross-panel code agreement.** The
+   single positive result does not replicate.
+2. **Checkpoint choice matters more than anything we built.** `baseline/last`
+   (0.3429) beats `baseline/best` (0.3114) by more than most interventions
+   move the metric, and the direction of that gap is not consistent across
+   runs (nodecay is better at `best`, baseline at `last`).
+3. **Three epochs does not help** (-0.0401 against baseline/last).
+4. Sections 15's "integration DID move", 19's "+29.5%", and 22's interaction
+   mechanism are all artefacts of single-run comparisons on a noisy estimator.
+   The honest state is: integration has NOT been moved.
+
+### What would actually settle it
+
+Seed variance is ~0.05 and the effects sought are ~0.02-0.05, so ~5 seeds per
+configuration. At 5 h per run that is ~25 h per cell -- 100 h for the 2x2.
+Before spending that, it is worth asking whether cross-panel code agreement is
+the right target at all, given the untouched baseline is currently the best
+model on it.
