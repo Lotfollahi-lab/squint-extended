@@ -1722,3 +1722,92 @@ configuration. At 5 h per run that is ~25 h per cell -- 100 h for the 2x2.
 Before spending that, it is worth asking whether cross-panel code agreement is
 the right target at all, given the untouched baseline is currently the best
 model on it.
+
+## 28. The metric was the problem. Corrected for specificity, every intervention beats baseline
+
+§27 concluded nothing we built beats the untouched baseline. That conclusion
+was an artefact of the SCORING RULE, not the models.
+
+### What the metric gets right
+
+Codes track tissue, in all 14 runs. Writing A/B/C/D for the four pair classes:
+
+|  | same panel | different panel |
+|---|---|---|
+| same tissue | A | **B** (the objective) |
+| diff tissue | **C** | D |
+
+B > C everywhere, typically by 2-2.6x. So the codes carry biology and the
+metric is not a disguised panel-similarity measure. That was the failure mode
+worth ruling out, and it is ruled out.
+(Pair counts: A=13,239 B=14,804 C=7,354 D=166,533.)
+
+### Two defects, one fatal
+
+**It rewards coarse codebooks.** Over 14 runs, correlation between effective
+codebook size and B is **r = -0.671**. Using fewer codes raises the score for
+free. §19 saw this on two runs; at 14 it is a dominant trend.
+
+**It rewards INDISCRIMINATE agreement.** B has a degenerate maximum: a model
+giving every section identical codes scores 1.0. §15 introduced SEPARATION to
+guard exactly this, then reported and optimised B, which is the UNGUARDED
+quantity. `baseline/last` exploits it precisely -- highest B (0.3429) AND by
+far the highest C (0.2332 against ~0.12-0.13 for conditioned models). It is
+not transferring better, it is discriminating less.
+
+### The correction: score B - C
+
+Cross-panel agreement that is SPECIFIC to tissue. A model that agrees with
+everything gains in B and C equally and nets nothing. Paired bootstrap against
+`baseline/last`, identical sections:
+
+| run | B - C | vs baseline/last | 95% CI |
+|---|---|---|---|
+| **FiLM+cov64 s0** | **0.2420** | +0.1323 | [+0.113, +0.154] |
+| ep3/best | 0.2022 | +0.0925 | [+0.077, +0.109] |
+| FiLM+cov64 s1 | 0.1998 | +0.0901 | [+0.072, +0.107] |
+| nodecay/best | 0.1874 | +0.0778 | [+0.052, +0.103] |
+| tier1/last | 0.1848 | +0.0752 | [+0.060, +0.091] |
+| FiLM only s1 | 0.1782 | +0.0685 | [+0.053, +0.085] |
+| cov64 s1 | 0.1762 | +0.0665 | [+0.054, +0.081] |
+| cov64 s0 | 0.1727 | +0.0630 | [+0.048, +0.079] |
+| FiLM only s0 | 0.1688 | +0.0592 | [+0.042, +0.075] |
+| nodecay/last | 0.1672 | +0.0575 | [+0.041, +0.074] |
+| FiLM+cov64 3ep | 0.1626 | +0.0529 | [+0.039, +0.067] |
+| bigblocks/best | 0.1474 | +0.0377 | [+0.020, +0.058] |
+| baseline/best | 0.1344 | +0.0247 | [+0.002, +0.050] |
+| baseline/last | 0.1097 | reference (WORST) | |
+
+**All 13 beat `baseline/last`, every CI excluding zero.** The run that won
+under B is last under B-C. §27's "nothing beats doing nothing" is withdrawn.
+
+### Why B-C is the better estimator, not just the nicer answer
+
+Seed agreement improves, which is the test that matters:
+
+| cell | B spread | B verdicts | B-C spread | B-C verdicts |
+|---|---|---|---|---|
+| cov64 | 5.1% | worse / no diff | **2.0%** | better / better |
+| FiLM only | 13.3% | worse / no diff | **5.5%** | better / better |
+| FiLM+cov64 | 16.6% | **better / worse** | 21.1% | better / better |
+
+Under B no replicated cell agreed with itself. Under B-C all three give the
+same verdict from both seeds, and two of three tighten substantially. B-C is
+more reproducible, which is evidence it measures something more stable -- not
+merely something more flattering.
+
+### What still stands from §27
+
+Three epochs does not help: `FiLM+cov64 3ep` (0.1626) sits below both
+200,000-step seeds of the same configuration (0.1998, 0.2420). That survives
+the metric change.
+
+### The caution this deserves
+
+Changing the scoring rule flipped the conclusion from "nothing works" to
+"everything works". Both cannot be straightforwardly true, and B-C is a fix
+for a defect we identified rather than an independently justified measure.
+Before it is used for a paper claim it needs EXTERNAL validation -- does it
+predict held-out tissue identity from codes, or track identification (NMI/ARI)
+across runs? Adopting it because it reverses an unwelcome result would be the
+same error as trusting B, in the opposite direction.
