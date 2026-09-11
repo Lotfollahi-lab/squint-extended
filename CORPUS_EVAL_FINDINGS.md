@@ -1367,3 +1367,58 @@ winning cell would settle it, and is cheap at 5 h.
 **Keep both in the 3-epoch run.** The cheaper cov16 variant is not a viable
 economy: at cov16 FiLM is worth nothing. This also retires the §19 caveat that
 the bundle was unattributed -- it is attributed, to the pair.
+
+## 23. The replicate: the interaction survives, its size does not, and my noise estimate was wrong in kind
+
+§22 closed with "one run per cell... a seed replicate would settle it, and is
+cheap at 5 h." It did settle it, and not in §22's favour.
+
+| cell | diff panel | separation |
+|---|---|---|
+| nodecay/last (cov16, -) | 0.2845 | 3.6696 |
+| cov64-only (cov64, -) | 0.2908 | 4.1497 |
+| FiLM-only (cov16, F) | 0.2843 | 3.7618 |
+| **FiLM+cov64 seed 0** | **0.3684** | **4.6015** |
+| **FiLM+cov64 seed 1** | **0.3159** | 4.0642 |
+
+### What holds
+
+The direction. Both seeds clear every null cell on the objective -- seed 1's
+0.3159 is +8.6% above the highest null (0.2908), seed 0's 0.3684 is +26.7%.
+The two-seed mean of 0.3422 is **+19.4%** over the null mean.
+
+### What does not
+
+**The effect size.** §22 reported +29.5% from seed 0 alone. Two seeds give
++19.4%, and the seed-to-seed spread on the winning cell is **14.3%** --
+comparable to the effect being measured.
+
+**Separation.** Seed 0 led every run at 4.6015 and §22 claimed +25.4%. Seed 1
+gives 4.0642, BELOW `cov64-only`'s 4.1497. The separation claim is not
+supported by two seeds and should be dropped.
+
+**And the reasoning behind §22's confidence was invalid.** §22 argued the
+effect was "about 13x the observed noise", taking the 2.3% spread across the
+three null cells as the noise floor. Those three cells are DIFFERENT
+CONFIGURATIONS, not replicates; their agreement measures how little the two
+components do alone, and says nothing about run-to-run variance. The single
+actual replicate puts seed variance at 14.3% -- 6x that spread -- so the
+13x claim had no basis. Tight agreement among different configurations is not
+evidence of a small noise floor.
+
+### It is not a training difference
+
+Both seeds are equivalent where it could matter: step 200,000, 0/416 FiLM
+columns zero, |FiLM| mean 0.0196 vs 0.0199, batch-embedding mean 0.0613 vs
+0.0602, val_loss 1771.042 vs 1775.019 (0.2% apart). The eval is identical too
+-- same 64-dim embedding, condition dim 416, same 16,546,102 unseen cells. The
+variance is in the metric, not the fit.
+
+### Consequence
+
+With 14.3% seed variance on the winner, one run per null cell cannot size the
+interaction. Before this is a paper claim the three null cells need replicates
+too -- 3 x 5 h, or at minimum a second seed for `cov64-only` and `FiLM-only`,
+the two the interaction argument rests on. What can be stated now is the
+direction: encoder conditioning plus a widened decoder covariate beats either
+alone, by something around 20% with wide error.
