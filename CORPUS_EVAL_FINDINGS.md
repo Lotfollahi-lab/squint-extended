@@ -1811,3 +1811,84 @@ Before it is used for a paper claim it needs EXTERNAL validation -- does it
 predict held-out tissue identity from codes, or track identification (NMI/ARI)
 across runs? Adopting it because it reverses an unwelcome result would be the
 same error as trusting B, in the opposite direction.
+
+## 29. External validation: BOTH forms of the metric are weak proxies. Use the prediction task instead
+
+§28 proposed B-C and warned it needed external validation before carrying a
+claim. It got one, and the result does not fully vindicate B-C either.
+
+### The external task
+
+Given a section's code distribution, name its TISSUE, using only reference
+sections whose gene PANEL differs. Leave-one-section-out, two predictors
+(1-NN by 1-JS; nearest tissue centroid). This is the stated objective as a
+prediction problem with a right answer, not an average of the quantity being
+validated. 20 tissues, majority-class rate 0.2626.
+
+### How well does each metric predict the task?
+
+| target | corr with B | corr with **B-C** |
+|---|---|---|
+| 1-NN accuracy | +0.143 | **+0.357** |
+| 1-NN balanced accuracy | +0.034 | +0.003 |
+| centroid accuracy | +0.035 | **+0.529** |
+| centroid balanced accuracy | -0.098 | **+0.172** |
+
+**B-C beats B in three of four, decisively on centroid accuracy (+0.53 vs
++0.04).** So §28's correction is real: the original metric is very nearly
+UNCORRELATED with the objective it was introduced to measure.
+
+**But B-C is not a good proxy either.** The best correlation is +0.53 at
+n=14 (marginal at p~0.05), and on balanced accuracy -- which matters, since
+Xenium skin dominates -- both metrics correlate with essentially nothing.
+
+### Ranked by the task itself
+
+| run | centroid acc | 1-NN acc | B | B-C |
+|---|---|---|---|---|
+| bigblocks/best | **0.4245** | 0.4214 | 0.3252 | 0.1474 |
+| FiLM+cov64 s0 | 0.4119 | 0.3947 | 0.3684 | 0.2420 |
+| cov64 s1 | 0.4104 | **0.4371** | 0.3055 | 0.1762 |
+| nodecay/last | 0.4041 | 0.3805 | 0.2845 | 0.1672 |
+| ep3/best | 0.4009 | 0.4308 | 0.3318 | 0.2022 |
+| FiLM+cov64 s1 | 0.3789 | 0.3789 | 0.3159 | 0.1998 |
+| tier1/last | 0.3632 | 0.3962 | 0.3075 | 0.1848 |
+| FiLM+cov64 3ep | 0.3585 | 0.3443 | 0.3028 | 0.1626 |
+| FiLM only s0 / s1 | 0.3569 | 0.3915 / 0.3978 | | |
+| cov64 s0 | 0.3506 | 0.3962 | 0.2908 | 0.1727 |
+| nodecay/best | 0.3459 | 0.4167 | 0.3609 | 0.1874 |
+| baseline/best | 0.3223 | 0.3947 | 0.3114 | 0.1344 |
+| baseline/last | **0.3176** | **0.3491** | 0.3429 | 0.1097 |
+
+`baseline/last` is LAST on both predictors -- the run the original metric
+ranked FIRST. That is the clearest evidence the original metric was inverted
+with respect to its own objective.
+
+But the top of the table is not the FiLM story either: `bigblocks` leads on
+centroid, `cov64 s1` on 1-NN, and the two predictors disagree on the ordering.
+Seeds still disagree (cov64 0.3506 vs 0.4104; FiLM+cov64 0.4119 vs 0.3789), so
+seed noise is present in the task too, not only in the similarity metric.
+
+### Absolute performance is modest
+
+0.32-0.44 raw accuracy against a 0.2626 majority-class rate, and 0.16-0.28
+balanced accuracy over 20 tissues. The codes carry real but limited
+cross-panel tissue information. No model is close to solving this.
+
+### What to do
+
+1. **Stop optimising B.** It is roughly uncorrelated with the objective
+   (r = +0.03 to +0.14) and it is maximised by indiscriminate agreement.
+2. **Use cross-panel tissue prediction as the integration metric.** It is
+   direct, bounded, interpretable against a majority-class baseline, and has
+   a right answer. Report balanced accuracy alongside raw, given the skew.
+3. **Keep B-C only as a cheap diagnostic**, not a target.
+4. Seeds and paired/bootstrap intervals are still required -- §25 applies to
+   the new metric too, and the seed disagreements above confirm it.
+
+### Standing correction
+
+Sections 15, 19, 22, 24, 26 and 27 all ranked models on B. Given r = +0.03 to
++0.14 against the objective, none of those rankings should be quoted -- in
+either direction. §28's reversal was directionally right about the defect but
+overstated how much B-C fixes it.
