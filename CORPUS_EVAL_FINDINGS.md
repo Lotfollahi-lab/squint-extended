@@ -1492,3 +1492,72 @@ Before any of this is a paper claim, either the metric needs its variance
 reduced (more sections per estimate, or a paired design across seeds) or the
 cells need enough seeds to separate ~20% effects against 15% noise -- on the
 order of 5 per cell, i.e. ~25 h of GPU per cell at 200,000 steps.
+
+## 25. It is both: the estimator is unusable marginally, and seed variance matches the effect
+
+§24 left the question of whether the 13-17% spread is the model or the
+estimator. `_agreevar.py` answers it with a section-level bootstrap (resampling
+SECTIONS, not pairs -- 28,043 pairs come from 636 sections, so a pair-level
+bootstrap would report a fantastically tight interval and be wrong) and a
+PAIRED design exploiting the fact that every run scores identical sections.
+
+Validated first: the reimplementation reproduces `_codeagree.py` exactly
+(film_s0 0.3684 vs 0.3684, film_s1 0.3159 vs 0.3159).
+
+### Marginally, the estimator is unusable
+
+| run | diff-panel | 95% CI | width |
+|---|---|---|---|
+| base (cov16,noFiLM) | 0.2845 | [0.2525, 0.3218] | 24.4% |
+| cov64 s0 / s1 | 0.2908 / 0.3055 | [0.2543,0.3313] / [0.2708,0.3452] | 26.5 / 24.4% |
+| FiLM-only s0 / s1 | 0.2843 / 0.3220 | [0.2511,0.3205] / [0.2845,0.3654] | 24.4 / 25.1% |
+| FiLM+cov64 s0 / s1 | 0.3684 / 0.3159 | [0.3216,0.4182] / [0.2792,0.3575] | 26.2 / 24.8% |
+| FiLM+cov64 3ep | 0.3028 | [0.2657, 0.3439] | 25.8% |
+
+**Every interval is 24-27% wide and every one overlaps every other.** No
+marginal comparison in §15, §19, §22 or §24 was powered -- including the ones
+I drew conclusions from. Four-significant-figure quotes off these numbers were
+never meaningful.
+
+### Paired, the intervals shrink 5x -- and the seeds still disagree
+
+Paired difference against `base`, identical sections:
+
+| run | delta | 95% CI | excludes 0 |
+|---|---|---|---|
+| cov64 s0 | +0.0063 | [-0.0010, +0.0135] | no |
+| cov64 s1 | +0.0210 | [+0.0139, +0.0289] | **yes** |
+| FiLM-only s0 | -0.0002 | [-0.0064, +0.0058] | no |
+| FiLM-only s1 | +0.0375 | [+0.0259, +0.0507] | **yes** |
+| FiLM+cov64 s0 | +0.0840 | [+0.0644, +0.1035] | **yes** |
+| FiLM+cov64 s1 | +0.0314 | [+0.0157, +0.0474] | **yes** |
+| FiLM+cov64 3ep | +0.0183 | [+0.0095, +0.0278] | **yes** |
+
+Pairing cuts interval width from ~0.07 to ~0.015. But look down the seed
+pairs: **in every cell the two seeds' CIs fail to overlap.** FiLM-only goes
+-0.0002 to +0.0375; FiLM+cov64 goes +0.0314 to +0.0840. Each is individually
+precise and they disagree.
+
+### So the answer is both, and it is decisive
+
+The estimator is the obstacle for MARGINAL comparisons (25% CI). Seed variance
+is the obstacle once that is removed: within the winning cell the seed
+difference is 0.0526 while the configuration effect over base averages 0.0577.
+**Seed variance is the same size as the effect being measured** -- now
+established with non-overlapping CIs rather than inferred from two points.
+
+### What to do differently
+
+1. **Never compare runs marginally on this metric.** Use the paired
+   difference; it is 5x more precise and costs nothing extra.
+2. **Seeds are still required**, but fewer: against a seed SD of roughly 0.037
+   and a target effect of 0.058, about 4-5 per cell gives a standard error a
+   third of the effect. The paired design is what makes each of those draws
+   worth having.
+3. Every ranking in §15, §19, §22 and §24 should be re-derived this way before
+   it is quoted. The ordinal claim that survives is weak: FiLM+cov64 has the
+   two largest paired deltas, but its lower seed (+0.0314) sits inside
+   FiLM-only's upper seed (+0.0375) range.
+
+Three epochs remains unhelpful: +0.0183, significant but below both 200,000-
+step seeds of the same configuration.
