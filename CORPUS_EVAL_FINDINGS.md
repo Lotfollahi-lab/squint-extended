@@ -1422,3 +1422,73 @@ too -- 3 x 5 h, or at minimum a second seed for `cov64-only` and `FiLM-only`,
 the two the interaction argument rests on. What can be stated now is the
 direction: encoder conditioning plus a widened decoder covariate beats either
 alone, by something around 20% with wide error.
+
+## 24. With two seeds per cell the interaction shrinks, the cells overlap, and three epochs does not help
+
+§23 replicated the winning cell and found 14% seed variance. Replicating the
+two ablation cells settles what that means, and it is not favourable.
+
+| cell | seeds | range | mean | spread |
+|---|---|---|---|---|
+| cov16, no FiLM | 1 | 0.2845 | 0.2845 | -- |
+| cov64, no FiLM | 2 | 0.2908 - 0.3055 | 0.2982 | 5.1% |
+| cov16, FiLM | 2 | 0.2843 - **0.3220** | 0.3031 | 13.3% |
+| cov64, FiLM | 2 | **0.3159** - 0.3684 | 0.3422 | 16.6% |
+| cov64, FiLM, 3 epochs | 1 | 0.3028 | 0.3028 | -- |
+
+### The null cells are not tight either
+
+§22 read a 2.3% spread across three differently-configured single runs as a
+noise floor. With replicates, `cov16,FiLM` spreads **13.3%** -- nearly the
+winner's 16.6%. The 2.3% was an accident of which single draws happened to be
+taken, exactly as §23 warned.
+
+### The winning cell now OVERLAPS a null cell
+
+`cov16,FiLM` reaches 0.3220; `cov64,FiLM` falls to 0.3159. A run with FiLM
+alone beat a run with both. The winner is still separated from `cov64,noFiLM`
+(max 0.3055 < min 0.3159), but on two draws per cell that is one lucky pair
+away from collapsing too.
+
+### The interaction is smaller than claimed and no longer super-additive enough to matter
+
+On two-seed means against the cov16/no-FiLM baseline:
+
+    cov64 alone  +4.8%      FiLM alone  +6.6%      sum  +11.4%
+    both        +20.3%      (§22 claimed +29.5% from single runs)
+
+Still super-additive -- 20.3% against a predicted 11.4% -- but the margin is
+9 points while within-cell spread is 13-17 points. **The interaction is not
+resolvable at this sample size.** §22's "~93% of the gain is interaction" was
+an artefact of single draws; the honest figure is that roughly half the
+combined effect exceeds the sum of its parts, with error bars wider than the
+excess.
+
+### Three epochs made the objective WORSE
+
+`cov64,FiLM` at 562,680 steps scores **0.3028**, below both 200,000-step seeds
+(0.3159, 0.3684) and level with the `cov16,FiLM` mean. Its diff-tissue is the
+highest of any run (0.1043) and its separation the lowest (3.4814). n=1, and
+inside the 200k range's spread, so this is not conclusive -- but it is the
+third time more training has hurt this metric (§19: nodecay 0.3609 at 40k ->
+0.2845 at 200k; §21: identification degrades best -> last in every one-epoch
+run). The expectation from §18 that FiLM would improve with more gradients per
+conditioning column is not borne out on the objective.
+
+Its val_loss trajectory says the same: 1774, 1792, 1851, 1808, 1888, 1908,
+1777, 1835, 1859, 1757 across the ten checkpoints -- a 150-unit band with no
+trend, where the final checkpoint is the minimum by luck. Lowest val_loss of
+any run, and mid-table on the metric that matters.
+
+### Consequence: this metric cannot resolve 20% effects from single runs
+
+Run-to-run spread is 13-17% on three of the four cells. Every single-run
+comparison in §15, §19 and §22 sits inside that band, so their rankings are
+provisional and their percentages should not be quoted. What survives is
+ordinal and weak: conditioning plus a widened covariate is the best cell on
+the mean of two seeds, by a margin the sample size cannot defend.
+
+Before any of this is a paper claim, either the metric needs its variance
+reduced (more sections per estimate, or a paired design across seeds) or the
+cells need enough seeds to separate ~20% effects against 15% noise -- on the
+order of 5 per cell, i.e. ~25 h of GPU per cell at 200,000 steps.
