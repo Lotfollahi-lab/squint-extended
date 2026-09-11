@@ -1892,3 +1892,87 @@ Sections 15, 19, 22, 24, 26 and 27 all ranked models on B. Given r = +0.03 to
 +0.14 against the objective, none of those rankings should be quoted -- in
 either direction. §28's reversal was directionally right about the defect but
 overstated how much B-C fixes it.
+
+## 30. Why the Fig-3 heatmap has dim blocks: three causes, not one defect
+
+The section-similarity heatmap (cell branch, FiLM run) shows weak diagonal
+blocks for brain and kidney, and a dim sub-block inside skin. Decomposing
+within-tissue agreement against each source of heterogeneity separates three
+different causes that need three different remedies.
+
+### Within-tissue agreement tracks heterogeneity
+
+| tissue | secs | within | panels | assays | subdirs | same-subdir | diff-subdir |
+|---|---|---|---|---|---|---|---|
+| embryo | 20 | **0.8925** | 1 | 1 | 10 | 0.9129 | 0.8914 |
+| uterus / placenta | 3 / 4 | 0.8437 / 0.8207 | 1 | 1 | 1 | | |
+| spinal_cord | 8 | 0.7544 | 1 | 1 | 2 | 0.7547 | 0.7540 |
+| skin | 167 | 0.6459 | 8 | 2 | 12 | 0.7752 | 0.6250 |
+| ovary | 72 | 0.6023 | 5 | 2 | 18 | 0.9627 | 0.5793 |
+| lung | 36 | 0.4210 | 8 | 3 | 18 | 0.5703 | 0.4111 |
+| liver | 56 | 0.4133 | 7 | 3 | 13 | 0.6164 | 0.3955 |
+| colon | 20 | 0.4023 | 7 | 3 | 6 | 0.6678 | 0.3175 |
+| **kidney** | 89 | **0.3368** | **2** | **1** | 22 | 0.5110 | 0.3300 |
+| **brain** | 97 | **0.2711** | 9 | 3 | 26 | 0.6045 | 0.2425 |
+
+    corr(within-tissue agreement, n_panels)  = -0.576
+    corr(within-tissue agreement, n_assays)  = -0.620
+    corr(within-tissue agreement, n_subdirs) = -0.536
+
+Single-panel single-assay tissues score 0.75-0.89. Tissues spanning many score
+0.27-0.48. And globally, **same-subdirectory agreement is 0.7227 against
+0.4898 across subdirectories -- a 1.48x gap** inside the same tissue.
+
+### Cause 1 -- panel width. This is the skin sub-block, and it is a real gap
+
+Skin splits cleanly by panel width:
+
+| subdir | n | panel | within itself | vs rest of skin |
+|---|---|---|---|---|
+| xhs1000 / xhs1010 / xhs1011 | 39 / 26 / 22 | 4948 | 0.74-0.78 | **0.66-0.68** |
+| xhs1022-1 / -2 / -3 | 18 / 22 / 15 | 4947 | 0.79-0.84 | **0.69-0.72** |
+| xhs1009 | 17 | **252** | 0.8435 | **0.3475** |
+| mhm18 | 2 | 498 | 0.7062 | **0.2550** |
+| xhs36 | 2 | 372 | 0.8666 | **0.3953** |
+| xhs31 | 2 | 278/376 | 0.3277 | 0.2802 |
+
+`xhs1009` is internally COHERENT (0.8435) and simply lands somewhere else
+(0.3475 against wide-panel skin). The model is not confused about those
+sections; it assigns them consistent but different codes. Under cross-panel
+union+mask a 252-gene section has 252 of 9,574 features observed, so the
+shared MLP sees a mostly-unobserved input and the latent lands in a different
+region. **Batch conditioning cannot fix this** -- panel width is not the batch
+label. This is the cross-panel representation gap, still open.
+
+### Cause 2 -- study and donor. This is kidney, and it is what conditioning targets
+
+Kidney has **2 panels and 1 assay**, so its 0.3368 cannot be a panel or assay
+effect. But same-subdir 0.5110 against diff-subdir 0.3300 over 22
+subdirectories: the residual is study, donor and sub-anatomy. That IS what
+FiLM and the decoder covariate are for -- but the batch label is per-SECTION
+(`dataset_batch`, 416 of them), so each conditioning column gets roughly one
+gradient per epoch (§18). Conditioning on a coarser grouping -- subdirectory
+or dataset, ~156 or ~79 groups instead of 416 -- would give each column
+10-20x more gradient for the same compute.
+
+### Cause 3 -- label coarseness. This is brain, and it is not a defect
+
+Brain spans 26 subdirectories, 9 panels and 3 assays, with the largest
+same/diff-subdir gap of any tissue (0.6045 vs 0.2425, 2.5x). But "brain" also
+covers cortex, cerebellum, hippocampus and more, which have genuinely
+different cell-type compositions. Their code distributions SHOULD differ. The
+metric assumes same-tissue implies same-codes; for a label this coarse that
+assumption is simply false, and a dim brain block is the correct answer rather
+than a failure.
+
+### Consequence
+
+The heatmap is not one defect. Ranked by what is actually fixable:
+
+1. **Panel width (open, real).** Needs an encoder that is invariant to how many
+   genes were measured -- explicit panel/width conditioning, or input scaling
+   by observed-gene count. Not attempted.
+2. **Study/donor (addressable now).** Re-run conditioning with a coarser batch
+   grouping so the conditioning parameters are actually trained.
+3. **Brain (not a defect).** Evaluate at sub-anatomy resolution where labels
+   exist, or exclude coarse labels from any cross-panel claim.
