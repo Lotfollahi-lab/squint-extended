@@ -1561,3 +1561,84 @@ established with non-overlapping CIs rather than inferred from two points.
 
 Three epochs remains unhelpful: +0.0183, significant but below both 200,000-
 step seeds of the same configuration.
+
+## 26. §15 re-derived with the paired estimator. The old table is kept; the conclusion changes
+
+§25 established that marginal comparisons on this metric are unpowered (95% CI
+24-27% wide) while paired comparisons on identical sections are ~5x tighter.
+§15's table was entirely marginal, so it is re-derived here. **Both tables are
+kept** -- the old one is what was published and acted on, and the difference
+between them is the point.
+
+Every recomputed marginal reproduces the published value exactly (7/7 MATCH at
+4 decimals), so the two tables differ only in method, not in data.
+
+### OLD -- §15 as published (marginal, single runs, no intervals)
+
+| run | same panel | diff panel | TRANSFER | SEPARATION | xfer assay |
+|---|---|---|---|---|---|
+| baseline/best | 0.5119 | 0.3114 | 0.6084 | 2.9030 | 0.3424 |
+| baseline/last | 0.5341 | 0.3429 | 0.6421 | 2.6486 | 0.4037 |
+| tier1/last | 0.4704 | 0.3075 | 0.6538 | **3.7806** | 0.3586 |
+| **nodecay/best** | 0.5235 | **0.3609** | 0.6895 | 3.7704 | 0.3110 |
+| ep3/best | 0.4484 | 0.3318 | **0.7400** | 3.7526 | 0.3845 |
+
+### NEW -- paired deltas vs baseline/best, identical sections, 95% CI
+
+| run | arm | marginal | paired delta | 95% CI | |
+|---|---|---|---|---|---|
+| baseline/best | best | 0.3114 | -- | (reference) | |
+| baseline/last | last | 0.3429 | +0.0315 | [+0.0215, +0.0423] | * ARM |
+| tier1/last | last | 0.3075 | -0.0039 | [-0.0136, +0.0070] | **ns** ARM |
+| bigblocks/best | best | 0.3252 | +0.0138 | [+0.0027, +0.0264] | * |
+| nodecay/best | best | 0.3609 | +0.0495 | [+0.0381, +0.0636] | * |
+| nodecay/last | last | 0.2845 | -0.0270 | [-0.0389, -0.0157] | * ARM |
+| ep3/best | best | 0.3318 | +0.0204 | [+0.0082, +0.0317] | * |
+
+`*` = CI excludes zero. `ARM` = compared across arms, so intervention and arm
+are confounded in that row.
+
+### Arm-matched comparisons, which is what the ARM rows need
+
+    tier1/last    vs baseline/last   -0.0354  [-0.0463, -0.0264]  *
+    nodecay/last  vs baseline/last   -0.0584  [-0.0684, -0.0485]  *
+    nodecay/last  vs tier1/last      -0.0231  [-0.0318, -0.0159]  *
+
+### What changes
+
+**Tier 1 is indistinguishable from baseline, or worse.** Against
+`baseline/best` it is `ns` (-0.0039, CI spans zero); arm-matched against
+`baseline/last` it is significantly WORSE (-0.0354). §15 read its 0.3075
+against baseline's 0.3114 as roughly flat; that was right by accident, and
+arm-matched it is a regression.
+
+**The no-decay result depends entirely on which arm is compared, and reverses.**
+
+    best vs best:  nodecay  +0.0495  BETTER
+    last vs last:  nodecay  -0.0584  WORSE
+
+Both comparisons are arm-matched and both are significant. The same
+intervention improves the objective at one arm and degrades it at the other,
+so "no-decay improves integration" is not a stable claim.
+
+**The arm effect is larger than any intervention, and its sign is not
+consistent between runs:**
+
+    baseline:  best - last  = -0.0315  (last is better)
+    nodecay:   best - last  = +0.0765  (best is better)
+
+A 0.0765 swing inside one run dwarfs every intervention delta in the table.
+And because the sign flips between runs, there is no rule like "always report
+best" that would make the comparisons safe.
+
+**What survives as a clean, arm-matched, significant improvement over
+`baseline/best`:** `nodecay/best` (+0.0495), `ep3/best` (+0.0204),
+`bigblocks/best` (+0.0138) -- in that order. All three are best-vs-best.
+
+### Caveat that still applies
+
+These are single runs per configuration. §25 measured seed variance at ~0.05
+on this metric, which is as large as the largest delta here (+0.0495). So the
+paired CIs are honest about ESTIMATOR uncertainty but say nothing about SEED
+uncertainty, and the ordering above could still be a seed artefact. Paired
+deltas fix the estimator; only replicates fix the rest.
