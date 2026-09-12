@@ -49,6 +49,7 @@ import torch
 import pytorch_lightning as pl
 
 from vqniche.modules import MLP as MLP_Module
+from vqniche.modules.mlp import _lin_or_gather
 from vqniche.modules import init_gnn_module
 from vqniche.modules import FiLM
 from vqniche.modules import CrossStitch
@@ -75,6 +76,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             branch_adapter: Optional[dict] = None,
             shared_token: Optional[dict] = None,
             cross_branch_residual: Optional[dict] = None,
+            gene_mask_mode: Optional[str] = None,
             shared_codebook: bool = False,
             cell_conditioned_niche: Optional[dict] = None,
             niche_attends_cell_codebook: Optional[dict] = None,
@@ -490,6 +492,37 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         #     specialised. If you want FiLM on the path-specific
         #     outputs too, add a per-path FiLM downstream — not
         #     supported in this module yet.
+        # ---- measured-gene mask projection (opt-in) -------------------------
+        # `gene_mask_mode='add'` builds a V-wide projection of the PER-CELL
+        # measured-gene mask. Default None leaves every existing run
+        # bit-identical; this adds parameters, so it is never implicit.
+        self.gene_mask_proj = None
+        if gene_mask_mode == "add":
+            # Sized to the trunk's OUTPUT width: `out_channels` when set, else
+            # the last hidden layer, because MLP runs plain_last=True (so
+            # hidden_channels=[400,400,256] emits 256, matching the shipped
+            # checkpoints' `mlp_module.lins.2.weight` of (256, 400)).
+            _mp = mlp_params or {}
+            _hd = _mp.get("out_channels") or _mp.get("hidden_channels")
+            if isinstance(_hd, (list, tuple)):
+                _hd = _hd[-1] if _hd else None
+            if not _hd:
+                raise ValueError(
+                    "gene_mask_mode='add' needs mlp_params['hidden_channels'] "
+                    "(or 'out_channels') to size the mask projection; got "
+                    f"{_mp.get('hidden_channels')!r}."
+                )
+            self.gene_mask_proj = torch.nn.Linear(in_channels, int(_hd),
+                                                  bias=False)
+            # Zero-init, so a run STARTS identical to the unconditioned model
+            # and the mask pathway has to earn its contribution -- the same
+            # discipline as FiLM's identity init.
+            torch.nn.init.zeros_(self.gene_mask_proj.weight)
+        elif gene_mask_mode not in (None, "none"):
+            raise ValueError(
+                f"gene_mask_mode must be None or 'add', got {gene_mask_mode!r}."
+            )
+
         if 'condition_list' in conditioning_params:
             film_in_channels = (
                 shared_out_dim if self.shared_mlp_module is not None
@@ -644,6 +677,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             batch_edge_index: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
             gene_ids: Optional[torch.Tensor] = None,
+            gene_mask: Optional[torch.Tensor] = None,
         ):
         """
         Parameters
@@ -672,11 +706,32 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         idx_niche:  (N,) or (N, Q)       niche-codebook indices
         """
         # ---- shared MLP (Y-shape mode) --------------------------------------
+        # ---- measured-gene mask ---------------------------------------------
+        # `gene_ids` is BLOCK-level: which vocabulary columns this block's panel
+        # union covers. `gene_mask` is PER-CELL: which of those a given cell
+        # actually measured. Only the decoders received it until now, so the
+        # encoder could not tell an UNMEASURED gene from a measured zero -- and
+        # a block deliberately mixes panels, so a 252-gene cell and a 4,948-gene
+        # cell reach the same trunk with only the zero pattern between them.
+        # Section 30 measured the cost: skin's 252-gene sections are internally
+        # coherent (0.8435) yet sit at 0.3475 against wide-panel skin.
+        #
+        # Gathered by the same `gene_ids` as the input trunk, so it stays
+        # width-correct, and added to the trunk OUTPUT.
+        mask_delta = None
+        if self.gene_mask_proj is not None and gene_mask is not None:
+            _m = gene_mask.to(batch_x.dtype)
+            if _m.dim() == 1:
+                _m = _m.unsqueeze(0).expand(batch_x.shape[0], -1)
+            mask_delta = _lin_or_gather(self.gene_mask_proj, _m, gene_ids)
+
         # If a shared MLP trunk is configured, compute it ONCE on
         # `batch_x` and apply FiLM (if any) here. The result will be
         # concatenated with each path-specific MLP's output below.
         if self.shared_mlp_module is not None:
             z_shared = self.shared_mlp_module(batch_x, gene_ids=gene_ids)
+            if mask_delta is not None and z_shared.shape[-1] == mask_delta.shape[-1]:
+                z_shared = z_shared + mask_delta
             if self.conditioning_module is not None:
                 z_shared = self.conditioning_module(
                     x=z_shared, conditions=batch_encoder_conditions,
@@ -689,6 +744,9 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             self.mlp_module(batch_x, gene_ids=gene_ids)
             if self.mlp_module is not None else batch_x
         )
+        if mask_delta is not None and self.mlp_module is not None and \
+                z_mlp_cell_path.shape[-1] == mask_delta.shape[-1]:
+            z_mlp_cell_path = z_mlp_cell_path + mask_delta
 
         # FiLM on the cell-path output ONLY when the shared MLP is
         # NOT in play (legacy / decoupled modes). In Y-shape mode
@@ -719,6 +777,9 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # spatial losses via the shared MLP weights.
         if self.niche_mlp_module is not None:
             z_mlp_niche_path = self.niche_mlp_module(batch_x, gene_ids=gene_ids)
+            if mask_delta is not None and \
+                    z_mlp_niche_path.shape[-1] == mask_delta.shape[-1]:
+                z_mlp_niche_path = z_mlp_niche_path + mask_delta
             # FiLM on the niche path only in NON-Y-shape mode
             # (mirrors the cell-path policy above).
             if self.conditioning_module is not None and self.shared_mlp_module is None:

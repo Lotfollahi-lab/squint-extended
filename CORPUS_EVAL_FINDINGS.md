@@ -1976,3 +1976,79 @@ The heatmap is not one defect. Ranked by what is actually fixable:
    grouping so the conditioning parameters are actually trained.
 3. **Brain (not a defect).** Evaluate at sub-anatomy resolution where labels
    exist, or exclude coarse labels from any cross-panel claim.
+
+## 31. Three changes for §30's causes, and a zero-shot bug found on the way
+
+§30 separated the Fig-3 heatmap into panel width, study/donor and label
+coarseness. Two are addressable in code; implementing them surfaced a third
+problem that was silently affecting every held-out section.
+
+### The encoder never saw the measured-gene mask
+
+`VQNiche_Dual_Encoder.forward` took `gene_ids` but NOT `gene_mask`. The
+difference matters because they are different scopes:
+
+* `gene_ids` is BLOCK-level -- which vocabulary columns this block's panel
+  union covers, shared by every cell in the block;
+* `gene_mask` is PER-CELL -- which of those that cell actually measured.
+
+A block deliberately mixes panels, so a 252-gene cell and a 4,948-gene cell
+enter the same trunk and the encoder's only clue is the zero pattern, which is
+indistinguishable from genuine biological zeros. The decoders had the mask all
+along, for the masked reconstruction loss; the encoder did not.
+
+`gene_mask_mode='add'` adds a V-wide projection of the mask, gathered by the
+same `gene_ids` as the input trunk and added to the trunk output. Zero-init, so
+a run starts bit-identical to the unconditioned model and the pathway has to
+earn its contribution -- the same discipline as FiLM's identity init. Default
+`None` leaves every existing model untouched (verified: the shipped FiLM
+checkpoint still loads, `gene_mask_proj=None`, FiLM intact).
+
+### `batch_key='subdir'` -- study-level grouping without a rebuild
+
+Derived at RUNTIME from `section_rels`, which manifest v4 already stores, so
+the 944 GB blob does not need rebuilding -- only the projection
+`rel.split("/")[0]`. Gives 156 groups corpus-wide, **131 over train sections**
+against 416.
+
+### The bug: FiLM conditioned unseen batches on training group 0
+
+A held-out section whose label never appeared in training densifies to
+`unknown_batch_label_dense_id` (0) and is flagged in
+`adata_batch_ids_unseen_mask`. The decoder covariate honours that flag and
+substitutes the mean of the trained embeddings. **FiLM did not**:
+`_encoder_batch_conditions` built a plain one-hot, so the cell was conditioned
+as though it belonged to the alphabetically-first training batch. Arbitrary,
+not neutral.
+
+Under the per-section key that applied to **100% of held-out cells** --
+16,546,102 of them -- so every zero-shot section in every evaluation was
+modulated by one particular training section's gamma/beta.
+
+Fixed by feeding the uniform vector `1/n` for unseen cells. `param_generator`
+is LINEAR, so that yields exactly the mean of the per-group modulations: the
+same neutral choice the decoder makes, with no second code path.
+
+### Why the coarser key matters more than the gradient argument
+
+The per-section key guarantees the fallback fires for everything held out:
+
+| grouping | train groups | held-out sections covered | held-out cells |
+|---|---|---|---|
+| `dataset_batch` (current) | 416 | **0 / 219 (0%)** | 0 (0%) |
+| **`subdir`** | **131** | **92 / 219 (42%)** | 2,898,182 (18%) |
+| `dataset_id` | 68 | 135 / 219 (62%) | 5,920,753 (36%) |
+
+Conditioning currently cannot help a single held-out section -- it can only
+fall back. That is a better reason to change the key than the 3x gradient gain.
+
+### Verified
+
+`_maskgroup.py` (untracked): subdir projection 156/636 and build-time identity;
+mask projection built at the trunk's output width, a no-op at init and
+divergent for narrow vs wide cells once trained; FiLM's uniform fallback equal
+to the mean over groups and different from group 0's one-hot.
+
+**Not yet trained.** All three change what a NEW run does; none has been
+evaluated, and §29 applies -- judge them on cross-panel tissue prediction with
+seeds, not on the heatmap.

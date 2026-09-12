@@ -233,7 +233,8 @@ def _section_dataset_id(section) -> Optional[str]:
     return None if dsid is None else str(dsid)
 
 
-def _section_batch_identity(section, batch_key: str = "batch") -> str:
+def _section_batch_identity(section, batch_key: str = "batch",
+                            rel: Optional[str] = None) -> str:
     """
     The label the decoder covariate, FiLM conditioning and GRL adversary treat
     as "which batch is this cell from" — see `OnDiskDatasetBlob.__init__` for
@@ -244,7 +245,16 @@ def _section_batch_identity(section, batch_key: str = "batch") -> str:
     keeps its old identities instead of silently collapsing them all onto a
     single "None_batchN".
     """
+    # Checked BEFORE the section is touched: grouping by study needs only the
+    # rel path, so it must not depend on the section carrying a batch label.
+    if batch_key == "subdir" and rel:
+        return str(rel).split("/")[0]
     label = _section_batch_label(section)
+    if batch_key == "subdir":
+        # No rel to group by. Fall back to the composite rather than silently
+        # collapsing every section into one group.
+        dsid = _section_dataset_id(section)
+        return label if dsid is None else f"{dsid}_{label}"
     if batch_key != "dataset_batch":
         return label
     dsid = _section_dataset_id(section)
@@ -451,9 +461,15 @@ class OnDiskDatasetBlob(OnDiskDataset):
         # Default stays "batch" so existing blobs, variants and the paper's
         # reproduction are untouched; `process()` WARNS whenever labels actually
         # collide, so the corpus case cannot pass silently again.
-        if batch_key not in ("batch", "dataset_batch"):
+        # 'subdir' groups by the section's directory -- the STUDY it came from
+        # -- rather than the section itself. On the corpus that is 131 train
+        # groups against 416, which matters twice over (see `get_batch_labels`):
+        # each conditioning row gets ~3x more gradient per epoch, and 42% of
+        # held-out sections land in a group the model actually trained on
+        # instead of 0%.
+        if batch_key not in ("batch", "dataset_batch", "subdir"):
             raise ValueError(
-                f"batch_key must be 'batch' or 'dataset_batch', got "
+                f"batch_key must be 'batch', 'dataset_batch' or 'subdir', got "
                 f"{batch_key!r}."
             )
         self.batch_key = batch_key
@@ -994,7 +1010,9 @@ class OnDiskDatasetBlob(OnDiskDataset):
             # Cheap per-section facts recorded HERE so consumers never have
             # to deserialize a row just to learn them (see `manifest` below).
             node_counts.append(int(data_batch["x_cell_gene_counts"].shape[0]))
-            batch_labels.append(_section_batch_identity(data_batch, self.batch_key))
+            batch_labels.append(_section_batch_identity(
+                data_batch, self.batch_key,
+                rel=section_rels[-1] if section_rels else None))
             del data_batch   # never hold two sections at once
 
             _n = node_counts[-1]
@@ -1422,6 +1440,20 @@ class OnDiskDatasetBlob(OnDiskDataset):
             self.batch_labels = [
                 _section_batch_label(self.get(i)) for i in range(len(self))
             ]
+        if self.batch_key == "subdir":
+            # Derived here rather than read from the manifest, because
+            # `batch_labels` was written at BUILD time under whatever key the
+            # blob was built with. `section_rels` (manifest v4) already carries
+            # "subdir/file.h5ad" for every row, so the study-level grouping
+            # needs no rebuild of the 944 GB blob -- only this projection.
+            rels = getattr(self, "section_rels", None)
+            if not rels:
+                raise RuntimeError(
+                    "batch_key='subdir' needs `section_rels` (manifest_version "
+                    ">= 4); this blob predates it, so the study each section "
+                    "came from cannot be recovered without a rebuild."
+                )
+            return [str(r).split("/")[0] for r in rels]
         return self.batch_labels
 
     def batch_label_to_dense(self, rows: Optional[List[int]] = None) -> dict:

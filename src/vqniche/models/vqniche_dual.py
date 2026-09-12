@@ -585,6 +585,10 @@ class VQNiche_Dual(BaseModel):
             batch_edge_index=batch_edge_index,
             batch_encoder_conditions=batch_encoder_conditions,
             gene_ids=gene_ids,
+            # The per-cell measured-gene mask now reaches the ENCODER as well
+            # as the decoders. It is ignored unless the encoder was built with
+            # `gene_mask_mode='add'`, so existing models are unaffected.
+            gene_mask=gene_mask,
         )
 
         if read_depth is None:
@@ -766,7 +770,30 @@ class VQNiche_Dual(BaseModel):
                 f"conditioning width {n}; the densification map and the "
                 "encoder condition dim disagree."
             )
-        return torch.nn.functional.one_hot(ids, num_classes=n).to(batch.x.dtype)
+        oh = torch.nn.functional.one_hot(ids, num_classes=n).to(batch.x.dtype)
+
+        # UNSEEN batches get the MEAN modulation, not group 0's.
+        #
+        # A held-out section whose batch label never appeared in training is
+        # densified to `unknown_batch_label_dense_id` (0) and flagged in
+        # `adata_batch_ids_unseen_mask`. The decoder covariate already honours
+        # that flag and substitutes the mean of the trained embeddings. FiLM did
+        # not: a one-hot at index 0 conditions the cell as if it belonged to the
+        # alphabetically-FIRST training batch, which is arbitrary rather than
+        # neutral. Under the per-section `dataset_batch` key that applied to
+        # 100% of held-out cells (16,546,102 of them), so every zero-shot
+        # section was modulated by one particular training section's gamma/beta.
+        #
+        # `param_generator` is LINEAR, so feeding the uniform vector 1/n yields
+        # exactly the mean of the per-group modulations -- the same neutral
+        # choice the decoder makes, obtained without a second code path.
+        unseen = getattr(batch, 'adata_batch_ids_unseen_mask', None)
+        if unseen is not None:
+            u = unseen.reshape(-1).to(torch.bool)
+            if u.any():
+                oh = oh.clone()
+                oh[u] = 1.0 / float(n)
+        return oh
 
     def _mmd_group_labels(self, ids: torch.Tensor) -> Optional[torch.Tensor]:
         """
