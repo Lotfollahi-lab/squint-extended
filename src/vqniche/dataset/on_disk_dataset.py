@@ -473,6 +473,13 @@ class OnDiskDatasetBlob(OnDiskDataset):
                 f"{batch_key!r}."
             )
         self.batch_key = batch_key
+        # Whether the CALLER chose this key, as opposed to taking the default.
+        # An existing blob's manifest records the key it was BUILT with, and
+        # reopening restores it (see the manifest block in `__init__`) -- which
+        # would silently undo an explicit override. `batch_key='subdir'` is a
+        # re-projection of `section_rels`, valid on a blob built under any key,
+        # so an explicit choice has to survive the reopen.
+        self._batch_key_explicit = batch_key != "batch"
 
         # force_reload is consulted by OnDiskDataset._process via the base
         # Dataset; store it so `process()` gating matches PyG semantics.
@@ -1362,7 +1369,10 @@ class OnDiskDatasetBlob(OnDiskDataset):
             # name that `section_rows_for()` resolves against; None on older
             # blobs, which then cannot address rows by name.
             self.section_rels = _manifest.get("section_rels", None)
-            self.batch_key = _manifest.get("batch_key", "batch")
+            # The manifest is the DEFAULT, not an override: a caller that
+            # named a key meant it (see `_batch_key_explicit`).
+            if not getattr(self, "_batch_key_explicit", False):
+                self.batch_key = _manifest.get("batch_key", "batch")
             self.min_panels_per_gene = _manifest.get("min_panels_per_gene", 1)
             # Blobs built before the file container existed have no `container`
             # field and are sqlite by construction.

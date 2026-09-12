@@ -6184,6 +6184,46 @@ def _patch_covwidth(cfg: dict, decoder_covariate_embed_dim: int = 64) -> dict:
     return cfg
 
 
+def _patch_integrator(cfg: dict, gene_mask: bool = True,
+                      big_blocks: bool = True) -> dict:
+    """
+    Everything section 30 diagnosed, switched on at once.
+
+    §30 split the Fig-3 heatmap into three causes. Two are addressable in the
+    model and both are applied here; the third (label coarseness, e.g. "brain"
+    spanning cortex and cerebellum) is an evaluation question, not a model one.
+
+      PANEL WIDTH   `gene_mask_mode='add'`. The encoder took `gene_ids`
+                    (block-level: which vocabulary columns the block's panel
+                    union covers) but never `gene_mask` (per-cell: which of
+                    those that cell measured), so an unmeasured gene and a
+                    measured zero were the same number to it. Skin's 252-gene
+                    sections are internally coherent (0.8435) yet sit at 0.3475
+                    against wide-panel skin.
+
+      STUDY/DONOR   `batch_key='subdir'`. Conditioning grouped by SECTION (416
+                    train groups), so each row saw ~1 gradient per epoch and
+                    0 of 219 held-out sections fell in a trained group. By
+                    study it is 131 groups and 92 of 219.
+
+    `big_blocks` is separate from both: it widens the streaming block so a
+    mini-batch mixes more sections. It is in by default because `bigblocks` is
+    the current leader on cross-panel tissue prediction (0.4245) and the only
+    run that changed how sections are MIXED rather than how batch is
+    REPRESENTED -- which §30 suggests is the axis that matters.
+
+    Toggles exist so the two uncertain components can be ablated in one
+    wall-clock window; the subdir key stays on in every arm.
+    """
+    cfg = _patch_tier2a(cfg, decoder_covariate_embed_dim=64)
+    cfg.setdefault("dataset", {})["batch_key"] = "subdir"
+    if gene_mask:
+        cfg["model"]["encoder_params"]["gene_mask_mode"] = "add"
+    if big_blocks:
+        cfg = _patch_blocks(cfg)
+    return cfg
+
+
 def _patch_tier2a(
         cfg: dict,
         decoder_covariate_embed_dim: int = 64,
@@ -6910,6 +6950,50 @@ VARIANTS: dict = {
         "patches": ["=corpus-holdout-tier2a-nodecay", "+epochs(3.0)"],
         "build": lambda: _patch_epochs(
             VARIANTS["corpus-holdout-tier2a-nodecay"]["build"](), epochs=3.0),
+    },
+
+    "corpus-holdout-integrator": {
+        "description": (
+            "THE INTEGRATION CANDIDATE. Encoder FiLM + 64-dim decoder "
+            "covariate, the per-cell measured-gene mask reaching the ENCODER "
+            "for the first time, batch grouped by STUDY (131 train groups, not "
+            "416), and 1.9M-cell blocks. Every mechanism section 30 diagnosed, "
+            "plus the block width that currently leads cross-panel tissue "
+            "prediction. Rank it on that metric (section 29), not on code "
+            "agreement, which correlates +0.03..+0.14 with the objective. "
+            "REQUIRES --split-sections-json _splitspec.json."
+        ),
+        "patches": ["=corpus-holdout-tier1-nodecay",
+                    "+tier2a(FiLM, cov 16->64)",
+                    "+gene_mask_mode='add'",
+                    "+batch_key='subdir'",
+                    "+blocks(max_cells_per_block=1.9M)"],
+        "build": lambda: _patch_integrator(
+            VARIANTS["corpus-holdout-tier1-nodecay"]["build"]()),
+    },
+
+    "corpus-holdout-integrator-nomask": {
+        "description": (
+            "ABLATION: the integrator WITHOUT the encoder gene mask. Isolates "
+            "the panel-width fix, which is the most novel change and addresses "
+            "the largest diagnosed cause. Everything else identical."
+        ),
+        "patches": ["=corpus-holdout-integrator", "-gene_mask_mode"],
+        "build": lambda: _patch_integrator(
+            VARIANTS["corpus-holdout-tier1-nodecay"]["build"](),
+            gene_mask=False),
+    },
+
+    "corpus-holdout-integrator-smallblocks": {
+        "description": (
+            "ABLATION: the integrator at the ORIGINAL 900k block budget. "
+            "Isolates block composition -- what `bigblocks` changed, and the "
+            "only axis on which a run currently beats everything else."
+        ),
+        "patches": ["=corpus-holdout-integrator", "-blocks(1.9M)"],
+        "build": lambda: _patch_integrator(
+            VARIANTS["corpus-holdout-tier1-nodecay"]["build"](),
+            big_blocks=False),
     },
 
     "corpus-holdout-nodecay-cov64": {

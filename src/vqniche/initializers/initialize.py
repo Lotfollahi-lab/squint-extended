@@ -366,9 +366,21 @@ def initialize_dataset_blob(
         # `_reject_global_scope_transforms`.
         from ..dataset.on_disk_dataset import OnDiskDatasetBlob
 
+        # `batch_key` decides what "a batch" MEANS for conditioning. The blob's
+        # manifest records the key it was built with ('dataset_batch' on the
+        # corpus: one group per section, 416 over the train split). Passing
+        # 'subdir' re-projects `section_rels` to the STUDY each section came
+        # from -- 131 train groups -- which needs no rebuild and matters twice:
+        # each conditioning row gets ~3x more gradient, and 92 of 219 held-out
+        # sections land in a trained group instead of 0.
+        _blob_kwargs = {}
+        _bk = (config.get("dataset", {}) or {}).get("batch_key")
+        if _bk:
+            _blob_kwargs["batch_key"] = _bk
         dataset_blob = OnDiskDatasetBlob(
                             name=dataset_name,
                             data_directory_path=root_data_dir,
+                            **_blob_kwargs,
                         )
         # Consumed by initialize_datamodule; not applied by the dataset itself.
         dataset_blob.section_transform = transforms
