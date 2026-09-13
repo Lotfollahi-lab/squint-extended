@@ -644,6 +644,37 @@ def compute_avg_cosine(emb: np.ndarray) -> float:
 # Main
 # ---------------------------------------------------------------------------
 
+def select_split_masks(adata, wanted=None):
+    """
+    `resolve_split_masks` filtered to the splits actually asked for.
+
+    Every split is scored by default, which is right for an exploratory pass
+    and wasteful for a table that reads only one of them. On the corpus the
+    NMI/ARI sweep is 4 splits x 4 code keys x ~81 label keys over 20.1M cells
+    and took 8 h 50 m, of which only the `test` rows reach the reported
+    numbers -- so restricting it is close to a 4x saving on the dominant cost.
+
+    `wanted` is a comma-separated list ("test", or "all,test"); None keeps
+    every split, so existing callers are unaffected. An unknown name RAISES
+    rather than silently scoring nothing, because an empty result here looks
+    exactly like a run that had no labels.
+    """
+    pairs = resolve_split_masks(adata)
+    if not wanted:
+        return pairs
+    want = [w.strip() for w in str(wanted).split(",") if w.strip()]
+    have = [p[0] for p in pairs]
+    missing = [w for w in want if w not in have]
+    if missing:
+        raise ValueError(
+            f"--splits asked for {missing}, which this object does not have. "
+            f"Available: {have}."
+        )
+    kept = [p for p in pairs if p[0] in want]
+    print(f"  splits: scoring {[p[0] for p in kept]} of {have}", flush=True)
+    return kept
+
+
 def resolve_split_masks(adata) -> "List[Tuple[str, np.ndarray]]":
     """
     (name, boolean mask) per split to report separately, plus "all".
@@ -770,6 +801,15 @@ def main() -> None:
              "predate that.",
     )
     ap.add_argument(
+        "--splits", type=str, default=None,
+        help="Comma-separated splits to score, e.g. `--splits test`. Default "
+             "scores every split the object has (all / train / validation / "
+             "test). The NMI/ARI sweep dominates runtime -- 8 h 50 m on the "
+             "corpus -- and only `test` feeds the reported table, so "
+             "restricting it is close to a 4x saving. An unknown split name "
+             "is an error, not an empty result.",
+    )
+    ap.add_argument(
         "--seed", type=int, default=0,
         help="Random seed for sub-samples in batch integration metrics.",
     )
@@ -849,7 +889,7 @@ def main() -> None:
     # checkpoint, so it cannot be read off a number that has it mixed into
     # train. `data_split` remains the fallback when terra_split is absent.
     nmi_ari_frames: List[pd.DataFrame] = []
-    for _split, _mask in resolve_split_masks(adata):
+    for _split, _mask in select_split_masks(adata, args.splits):
         nmi_ari_frames.append(
             compute_nmi_ari(
                 adata, code_label_pairs,
@@ -922,7 +962,7 @@ def main() -> None:
     # ----------------------------------------------- Pearson reconstruction
     print("\n=== Pearson reconstruction (cell + niche branch) ===")
     pearson_frames: List[pd.DataFrame] = []
-    for _split, _mask in resolve_split_masks(adata):
+    for _split, _mask in select_split_masks(adata, args.splits):
         pearson_frames.append(
             compute_pearson_metrics(
                 adata, cell_mask=(None if _split == "all" else _mask),
@@ -957,7 +997,7 @@ def main() -> None:
         # with 16.5M held-out ones; a single iLISI/ASW/MMD over that mixture
         # describes neither. Flattened into one loop so the metric bodies below
         # keep their original nesting.
-        _jobs = [(s, m, e) for s, m in resolve_split_masks(adata)
+        _jobs = [(s, m, e) for s, m in select_split_masks(adata, args.splits)
                  for e in emb_keys]
         for _split, _mask, emb_key in _jobs:
             if emb_key not in adata.obsm:
@@ -1083,7 +1123,7 @@ def main() -> None:
               "but no utilisation fraction")
 
     _cb_rows = []
-    for _split, _mask in resolve_split_masks(adata):
+    for _split, _mask in select_split_masks(adata, args.splits):
         for _branch, _obsm_key in (("cell", "cell_code_indices"),
                                    ("niche", "neighborhood_code_indices")):
             if _obsm_key not in adata.obsm:
@@ -1145,7 +1185,7 @@ def main() -> None:
     # cosine over the embedding -- and it is the measure that showed the corpus
     # run's cell latent narrowing from 0.157 to 0.368 between step 40,000 and
     # 200,000. Pooling train and held-out cells would blur exactly that.
-    _cjobs = [(s, m, e) for s, m in resolve_split_masks(adata) for e in emb_keys]
+    _cjobs = [(s, m, e) for s, m in select_split_masks(adata, args.splits) for e in emb_keys]
     for _split, _mask, emb_key in _cjobs:
         if emb_key not in adata.obsm:
             continue
