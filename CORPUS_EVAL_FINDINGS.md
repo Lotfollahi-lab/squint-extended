@@ -2052,3 +2052,74 @@ to the mean over groups and different from group 0's one-hot.
 **Not yet trained.** All three change what a NEW run does; none has been
 evaluated, and §29 applies -- judge them on cross-panel tissue prediction with
 seeds, not on the heatmap.
+
+## 32. The integrator run: a large win from the subdir key, and the gene mask BACKFIRES
+
+Three 200,000-step runs, all with FiLM + the 64-dim covariate and
+`batch_key='subdir'` (131 train groups, not 416), differing only in the encoder
+gene mask and the block budget. Scored on cross-panel tissue prediction (§29).
+
+| run | centroid | balanced | 1-NN | B-C | B |
+|---|---|---|---|---|---|
+| **B — no mask, 1.9M blocks** | **0.5377** | **0.3317** | **0.4953** | 0.1651 | 0.4010 |
+| bigblocks (previous leader) | 0.4245 | 0.2730 | 0.4214 | 0.1474 | 0.3252 |
+| FiLM+cov64 s0 | 0.4119 | 0.2468 | 0.3947 | 0.2420 | 0.3684 |
+| A — mask, 1.9M blocks | 0.3821 | 0.2018 | 0.4324 | 0.1301 | 0.3928 |
+| C — mask, 900k blocks | 0.3648 | 0.2254 | 0.4292 | 0.1524 | 0.3979 |
+| baseline/best | 0.3223 | 0.1534 | 0.3947 | 0.1344 | 0.3114 |
+
+**B is the best model measured on this project**: +26.7% centroid and +21.5%
+balanced over the previous leader, +67% over baseline. The observed seed spread
+on this task is ~17% (cov64: 0.3506 vs 0.4104) and B sits 31% above the higher
+of those, so the lead is outside the noise we have measured -- though it is
+still one run.
+
+### The gene mask makes things worse, and the mechanism is visible
+
+A and B are identical except the mask. It costs **29%** (0.3821 vs 0.5377).
+The diagnostic says why:
+
+| run | same tissue, same panel | same tissue, DIFF panel | **diff tissue, SAME panel** | xhs1009 vs wide-panel skin |
+|---|---|---|---|---|
+| A — mask | 0.6191 | 0.3928 | **0.2627** | **0.2689** |
+| B — no mask | 0.6084 | 0.4010 | **0.2359** | **0.3820** |
+| C — mask, small blocks | 0.6369 | 0.3979 | 0.2455 | 0.2591 |
+| FiLM+cov64 s0 | 0.4948 | 0.3684 | 0.1265 | 0.4539 |
+
+Two columns tell the story. The mask RAISES different-tissue same-panel
+agreement (0.2627 vs 0.2359) -- codes become more determined by panel -- and it
+LOWERS the narrow-vs-wide-panel agreement the mask was built to fix: xhs1009
+(252 genes) against wide-panel skin falls from 0.3820 to **0.2689**.
+
+The reason is that the mask is nearly CONSTANT within a panel. `mask_delta` is
+therefore a per-panel offset added to every cell's latent, and the cheapest use
+of a panel-identity signal is to separate panels. §30 predicted the encoder
+could not distinguish "unmeasured" from "measured zero"; that was true, but
+supplying the distinction additively let the model organise the latent BY PANEL
+-- precisely the failure it was meant to repair.
+
+(The xhs1009 figure here is measured against wide-panel skin only, `n_vars` >
+4000, whereas §30 measured it against all other skin sections. The two
+definitions are not interchangeable; the comparison across runs in this table
+uses one definition throughout.)
+
+### What earned B's win
+
+B differs from `bigblocks` by FiLM + cov64 + the subdir key, and from
+`FiLM+cov64 s0` by the subdir key + big blocks. **The subdir key is the
+ingredient B shares with nothing that came before**, and the mechanism is
+measurable rather than inferred: 131/131 conditioning columns trained (against
+309/416 still zero at step 40,000 under the per-section key), and 13,647,920
+unseen cells instead of 16,546,102 -- 2,898,182 held-out cells conditioned on a
+study the model actually saw, where previously every held-out cell fell back.
+
+### Consequence
+
+1. **Drop `gene_mask_mode='add'`.** It is worse than nothing and the reason is
+   structural, not a tuning failure. If the panel-width problem is attacked
+   again it must be with a formulation that cannot be used to separate panels
+   -- an invariance penalty, or conditioning the DECODER on width while keeping
+   the encoder blind.
+2. **Keep `batch_key='subdir'`.** It is the best-supported change in the
+   project.
+3. B is the integration candidate. Identification is the remaining gate.
