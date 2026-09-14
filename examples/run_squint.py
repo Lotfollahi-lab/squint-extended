@@ -3336,10 +3336,46 @@ def _patch_dual_shared_codebook(cfg: dict) -> dict:
 
 
 def _patch_dual_cell_conditioned_niche(cfg: dict, mode: str = "bias") -> dict:
-    """[s60 #4/#5] Cell-conditioned niche: the niche code is conditioned on the
+    """
+    [s60 #4/#5] Cell-conditioned niche: the niche code is conditioned on the
     (detached) level-0 cell code — 'bias' adds a per-cell-code embedding to the
-    niche VQ input; 'film' affine-modulates z_q_niche by the cell code."""
+    niche VQ input; 'film' affine-modulates z_q_niche by the cell code;
+    'film_scale' is the paper's Eq. 5, a scale-only gamma initialised to ones.
+
+    EXEMPTS `ccn_gamma` FROM WEIGHT DECAY, but only for runs that already have
+    a no-decay group (i.e. the `nodecay` family). Measured on
+    `corpus-holdout-integrator-nomask-ccn/20260914_084540_seed0`: gamma starts
+    at exactly 1.0 and is 0.0835 by step 20,000, then decays monotonically to
+    0.0229 at step 200,000 — so ~90% of training ran with z_q_niche multiplied
+    by a mean-0.02, mixed-sign vector rather than the paper's near-identity
+    re-weighting. `encoder.ccn_gamma.weight` matched neither `batch_embedding`
+    nor `conditioning_module`, so it sat in the decayed group; with Adam's
+    L2-in-gradient a near-zero gradient lets the decay term normalise to ~lr
+    per step, which is ample to erase a 1.0 init. Within the same run the two
+    EXEMPT conditioning tensors moved the other way (|.| 0.034 -> 0.077 and
+    0.017 -> 0.033).
+
+    This is the same failure `_patch_nodecay` was written for — see section 17
+    of CORPUS_EVAL_FINDINGS.md, where weight decay erased `batch_embedding`.
+
+    Only the gamma modes need it: gamma initialises to ONES, while `bias`
+    (ccn_bias) and `film_cont` (ccn_gen) initialise to zeros, where decay
+    toward zero is harmless. `ccn_beta` also inits to zero and is left alone.
+
+    CONDITIONAL ON PURPOSE. 97 of the 98 variants using this patch are frozen
+    small-scale experiments (s57/s60/s62/s63/s64/s65 and the dualvq sweep) with
+    no `no_decay_patterns` key at all. Creating the key for them would change
+    their optimiser grouping and stop them reproducing, so the exemption is
+    only appended where a no-decay group already exists. Those runs do decay
+    their gamma too; at their step counts the effect is far smaller, and
+    changing them is a separate decision, not a side effect of this fix.
+    """
     cfg["model"]["encoder_params"]["cell_conditioned_niche"] = {"mode": mode}
+    if mode in ("film", "film_prevq", "film_scale"):
+        _op = cfg.get("model", {}).get("optimizer_params") or {}
+        _nd = _op.get("no_decay_patterns")
+        if _nd is not None and "ccn_gamma" not in _nd:
+            _op["no_decay_patterns"] = list(_nd) + ["ccn_gamma"]
     return cfg
 
 
