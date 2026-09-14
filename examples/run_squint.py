@@ -6984,6 +6984,26 @@ VARIANTS: dict = {
             gene_mask=False),
     },
 
+    "corpus-holdout-integrator-nomask-ccn": {
+        "description": (
+            "The section-32 winner (integrator-nomask) PLUS the paper's own "
+            "cell->niche coupling, Eq. 5: z_q_niche <- gamma(j_cell_L0) * "
+            "z_q_niche, a scale-only Embedding init to ones. This is SQUINT's "
+            "DEFAULT in the paper and has never been switched on at corpus "
+            "scale -- cell_conditioned_niche is unset in all 77 corpus "
+            "configs. The paper's Table 3 says the axis barely moves niche "
+            "NMI (0.702 default vs 0.705 decoupled) but halves integration: "
+            "iLISI 0.609 -> 0.313 decoupled. Integration is exactly the axis "
+            "four corpus interventions have failed to move, so running the "
+            "paper's default is the cheapest remaining structural hypothesis."
+        ),
+        "patches": ["=corpus-holdout-integrator-nomask",
+                    "+cell_conditioned_niche(film_scale)"],
+        "build": lambda: _patch_dual_cell_conditioned_niche(
+            VARIANTS["corpus-holdout-integrator-nomask"]["build"](),
+            mode="film_scale"),
+    },
+
     "corpus-holdout-integrator-smallblocks": {
         "description": (
             "ABLATION: the integrator at the ORIGINAL 900k block budget. "
