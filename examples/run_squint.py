@@ -41396,6 +41396,78 @@ def predict(
             for _r in config["dataset"]["adata_batch_idx"]
         ]
 
+    # ---- CONDITIONING ARM (SQUINT_COND_ARM) -----------------------------
+    # A causal test of whether the codes are driven by expression or by the
+    # batch label. The sub-directory label determines tissue EXACTLY
+    # (H(tissue | subdir) = 0.000 bits over all 636 sections), and encoder
+    # FiLM modulates z_mlp BEFORE quantisation, so the label can change which
+    # code a cell receives. Scoring a section's tissue from its codes could
+    # therefore be reading back a label that was injected rather than one
+    # that was inferred.
+    #
+    #   true     (default) the section's own label -- no change at all
+    #   shuffle  labels permuted AMONG the collated sections with a fixed
+    #            seed: every label is still a real training label, so
+    #            conditioning stays fully active, but it now names the wrong
+    #            sub-directory and therefore the wrong tissue
+    #   unseen   every section relabelled to one real corpus label drawn from
+    #            a sub-directory absent from the TRAIN map, which is exactly
+    #            what a genuinely new study receives -- the mean-embedding
+    #            fallback. A made-up string would instead trip the
+    #            label-domain guard in `initialize_databatch`, which is right
+    #            to refuse it: that guard exists to catch naming-domain bugs.
+    #
+    # If accuracy on training sections survives `shuffle` and `unseen`, the
+    # codes carry tissue on their own. If it collapses toward the majority
+    # class, the conditioning was carrying it.
+    _arm = str(os.environ.get("SQUINT_COND_ARM", "true")).strip().lower()
+    if _arm not in ("true", "shuffle", "unseen"):
+        raise ValueError(f"SQUINT_COND_ARM must be true|shuffle|unseen, got {_arm!r}")
+    if _arm != "true":
+        if _section_labels is None:
+            raise ValueError(
+                f"SQUINT_COND_ARM={_arm!r} needs per-section labels, but none "
+                f"were built -- the run has no train label map, so there is no "
+                f"conditioning to perturb and the arm would be a silent no-op."
+            )
+        _orig = list(_section_labels)
+        if _arm == "shuffle":
+            import random as _random
+            _rng = _random.Random(int(os.environ.get("SQUINT_COND_SEED", "0")))
+            # Derangement where possible: a label that lands back on its own
+            # section would leave that section unperturbed and quietly dilute
+            # the effect being measured.
+            for _ in range(64):
+                _perm = _orig[:]
+                _rng.shuffle(_perm)
+                if len(_orig) < 2 or all(a != b for a, b in zip(_orig, _perm)):
+                    break
+            _section_labels = _perm
+            _fixed = sum(1 for a, b in zip(_orig, _section_labels) if a == b)
+            print(f"  COND ARM shuffle: {len(_orig)} section labels permuted "
+                  f"(seed {os.environ.get('SQUINT_COND_SEED', '0')}), "
+                  f"{_fixed} left on their own section")
+        else:
+            _sub = os.environ.get("SQUINT_COND_UNSEEN_LABEL")
+            if not _sub:
+                raise ValueError(
+                    "SQUINT_COND_ARM='unseen' needs SQUINT_COND_UNSEEN_LABEL "
+                    "-- a real corpus label from a sub-directory that is NOT "
+                    "in the train map. Anything else either stays in the map "
+                    "(no effect) or trips the label-domain guard.")
+            if _train_label_to_dense and _sub in _train_label_to_dense:
+                raise ValueError(
+                    f"SQUINT_COND_UNSEEN_LABEL={_sub!r} IS in the train map, "
+                    f"so it would be conditioned normally and the arm would "
+                    f"measure nothing.")
+            _section_labels = [_sub] * len(_orig)
+            print(f"  COND ARM unseen: all {len(_orig)} sections relabelled "
+                  f"{_sub!r}, which is absent from the train map -> every cell "
+                  f"takes the mean-embedding fallback")
+    else:
+        print("  COND ARM true: section labels unchanged")
+    # ---------------------------------------------------------------------
+
     data_batch = initialize_databatch(
         config=config,
         dataset_blob=dataset_blob,
