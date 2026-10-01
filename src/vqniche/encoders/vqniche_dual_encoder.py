@@ -678,6 +678,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             batch_encoder_conditions: Optional[torch.Tensor] = None,
             gene_ids: Optional[torch.Tensor] = None,
             gene_mask: Optional[torch.Tensor] = None,
+            batch_x_nbr: Optional[torch.Tensor] = None,
         ):
         """
         Parameters
@@ -685,6 +686,18 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         batch_x: (N, n_genes)
         batch_edge_index: (2, num_edges)  — local node-IDs of the batch
         batch_encoder_conditions: optional FiLM conditioning tensor.
+        batch_x_nbr: optional (N, n_genes), in-silico perturbation only. When
+            given, each node is encoded from `batch_x` as ITSELF (cell branch,
+            the niche root term, and its own self-loop message) but from
+            `batch_x_nbr` when it is someone else's NEIGHBOUR. That separates a
+            knockout in the index cell from one in its neighbourhood, the two
+            scopes TERRA edits independently -- impossible with one `x`, where
+            every node is simultaneously an index cell and a neighbour. With
+            `batch_x_nbr == batch_x` the output equals the default path (see
+            `_split_niche_gnn`). Supported only for the plain decoupled
+            architecture (separate niche MLP, 1-layer mean-SAGE, no FiLM /
+            shared trunk / cross-stitch / cell->niche coupling / nbr-aug); any
+            other configuration raises rather than approximating.
         gene_ids: optional cross-panel gather, (1, W) or (W,). Under
             `cross_panel` every input trunk is built at the gene-vocabulary
             width V while `batch_x` is only W wide — the union of the current
@@ -866,7 +879,11 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             self.niche_neck(niche_path_input) if self.niche_neck is not None
             else niche_path_input
         )
-        z_gnn = self.gnn_module(gnn_input, batch_edge_index)
+        if batch_x_nbr is None:
+            z_gnn = self.gnn_module(gnn_input, batch_edge_index)
+        else:
+            z_gnn = self._split_niche_gnn(
+                gnn_input, batch_x_nbr, batch_edge_index, gene_ids, mask_delta)
 
         # Cell quantization (skip if already done above).
         # cell-VQ takes `z_mlp` (concat(z_shared, z_mlp_cell_path) in Y-shape
@@ -919,6 +936,58 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             z_q_niche = z_q_niche + self.shared_token_proj_niche(_z_sh)
 
         return z_mlp, z_gnn, z_q_cell, z_q_niche, idx_cell, idx_niche
+
+    def _split_niche_gnn(self, h_self_in, batch_x_nbr, edge_index, gene_ids, mask_delta):
+        """
+        One mean-SAGE layer whose messages come from `batch_x_nbr` except on
+        self-loops. Reproduces `SAGEConv` (aggr='mean', root_weight, no
+        project/normalize; verified against PyG 2.6.1) by hand, because PyG's
+        bipartite `(x_src, x_dst)` form would route the self-loop message
+        through the perturbed source features as well.
+        """
+        unsupported = {
+            "niche_mlp_module is None": self.niche_mlp_module is None,
+            "shared_mlp_module": self.shared_mlp_module is not None,
+            "conditioning_module": self.conditioning_module is not None,
+            "cross_stitch": self.cross_stitch is not None,
+            "cell_to_niche_source": self.cell_to_niche_source is not None,
+            "nbr_aug_proj": self.nbr_aug_proj is not None,
+            "detach_gnn_input": False,
+        }
+        bad = [k for k, v in unsupported.items() if v]
+        convs = getattr(self.gnn_module, "convs", None)
+        if convs is None or len(convs) != 1:
+            bad.append("gnn is not a 1-layer BasicGNN")
+        else:
+            conv = convs[0]
+            if (type(conv).__name__ != "SAGEConv" or conv.project or conv.normalize
+                    or not conv.root_weight or str(conv.aggr) != "mean"):
+                bad.append("conv is not mean-SAGE with root weight")
+        if bad:
+            raise NotImplementedError(
+                f"split-input (neighbour-scoped) perturbation is not defined for "
+                f"this encoder: {bad}")
+
+        h_nbr = self.niche_mlp_module(batch_x_nbr, gene_ids=gene_ids)
+        if mask_delta is not None and h_nbr.shape[-1] == mask_delta.shape[-1]:
+            h_nbr = h_nbr + mask_delta
+        if self.niche_adapter is not None:
+            h_nbr = self.niche_adapter(h_nbr)
+        if self.niche_neck is not None:
+            h_nbr = self.niche_neck(h_nbr)
+
+        src, dst = edge_index[0], edge_index[1]
+        msg = h_nbr[src]
+        loop = src == dst
+        if loop.any():
+            msg = msg.clone()
+            msg[loop] = h_self_in[dst[loop]]
+        n = h_self_in.shape[0]
+        agg = torch.zeros(n, msg.shape[-1], dtype=msg.dtype, device=msg.device)
+        agg.index_add_(0, dst, msg)
+        deg = torch.bincount(dst, minlength=n).clamp(min=1).to(msg.dtype)
+        agg = agg / deg.unsqueeze(-1)
+        return conv.lin_l(agg) + conv.lin_r(h_self_in)
 
     @staticmethod
     def _code_l0(idx: torch.Tensor) -> torch.Tensor:

@@ -41583,6 +41583,53 @@ def predict(
             )
     model.eval()
 
+    # ---- GENE KNOCKOUT ARM (SQUINT_GENE_KO) -----------------------------
+    # TERRA-style in-silico perturbation (terra_manuscript Fig. 5f-h): zero
+    # the named genes' counts and re-encode. `SQUINT_GENE_KO_SCOPE` picks
+    # where the edit lands, mirroring TERRA's index-cell / neighbourhood
+    # token blocks:
+    #   both  every cell, as itself and as a neighbour (TERRA's experiments)
+    #   cell  only as the index cell (its own codes and root term)
+    #   nbr   only where it is another cell's neighbour
+    # Applied inside `predict_step` from the unedited batch, so read depth
+    # stays the cell's real library size and `.X` / `X_nbr` stay observed.
+    # A gene off the vocabulary, or unmeasured on a panel being predicted,
+    # raises: zeroing a column that is already zero would be a silent no-op
+    # arm, indistinguishable from "the knockout has no effect".
+    _ko_genes = [g.strip() for g in os.environ.get("SQUINT_GENE_KO", "").split(",")
+                 if g.strip()]
+    _ko_scope = os.environ.get("SQUINT_GENE_KO_SCOPE", "both").strip().lower()
+    _gene_ko_record = None
+    if _ko_genes:
+        # `split_identity` is test-only: routes through the neighbour-scoped
+        # path with no edit, which must reproduce the default forward.
+        if _ko_scope not in ("both", "cell", "nbr", "split_identity"):
+            raise ValueError(f"SQUINT_GENE_KO_SCOPE must be both|cell|nbr, got {_ko_scope!r}")
+        _vocab = getattr(dataset_blob, "gene_vocab", None)
+        if _vocab is None:
+            raise ValueError("SQUINT_GENE_KO needs a cross-panel blob with a gene vocabulary")
+        import pandas as pd
+        _vocab = pd.Index([str(g) for g in _vocab])
+        _cols = _vocab.get_indexer(_ko_genes)
+        if (_cols < 0).any():
+            raise ValueError(
+                f"SQUINT_GENE_KO genes not in the vocabulary: "
+                f"{[g for g, c in zip(_ko_genes, _cols) if c < 0]}")
+        _pm = getattr(data_batch, "panel_masks", None)
+        if _pm is not None:
+            _unmeasured = [g for g, c in zip(_ko_genes, _cols)
+                           if not bool(_pm[:, int(c)].all())]
+            if _unmeasured:
+                raise ValueError(
+                    f"SQUINT_GENE_KO genes unmeasured on at least one predicted "
+                    f"panel (a knockout there is a no-op): {_unmeasured}")
+        model.gene_knockout = {"cols": [int(c) for c in _cols], "scope": _ko_scope}
+        _gene_ko_record = {"genes": _ko_genes, "scope": _ko_scope,
+                           "vocab_cols": [int(c) for c in _cols]}
+        print(f"  GENE KO {_ko_scope}: {_ko_genes} -> vocab columns "
+              f"{[int(c) for c in _cols]}")
+    # ---------------------------------------------------------------------
+
     # Resolve optimization overrides. Each kwarg defaults to the legacy
     # training-parity value when not set; the multi-seed runner
     # (`_run_one_seed.py`) opts INTO the faster settings explicitly so
@@ -41933,6 +41980,8 @@ def predict(
     )
     adata.uns["squint"]["run_dir"] = run_dir
     adata.uns["squint"]["ckpt"] = str(config["model"]["model_ckpt_fname"])
+    adata.uns["squint"]["gene_knockout"] = (
+        json.dumps(_gene_ko_record) if _gene_ko_record else "none")
 
     # Codebook geometry, so post-hoc utilisation has a denominator without
     # re-reading the training config. RVQ stores one index column per level,

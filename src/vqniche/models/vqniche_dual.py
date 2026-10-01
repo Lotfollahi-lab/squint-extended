@@ -565,8 +565,13 @@ class VQNiche_Dual(BaseModel):
             adata_batch_ids: Optional[torch.Tensor] = None,
             gene_ids: Optional[torch.Tensor] = None,
             gene_mask: Optional[torch.Tensor] = None,
+            batch_x_nbr: Optional[torch.Tensor] = None,
         ):
         """
+        `batch_x_nbr` is for in-silico perturbation only: the features each
+        node contributes as a NEIGHBOUR, while `batch_x` is what it is encoded
+        from as itself (see `VQNiche_Dual_Encoder.forward`). `None` = default.
+
         `gene_ids` / `gene_mask` are the cross-panel pair, both `None` on the
         single-panel path. Under `cross_panel` the model is built at the gene-
         VOCABULARY width V while a block carries only W genes (the union of its
@@ -589,6 +594,7 @@ class VQNiche_Dual(BaseModel):
             # as the decoders. It is ignored unless the encoder was built with
             # `gene_mask_mode='add'`, so existing models are unaffected.
             gene_mask=gene_mask,
+            batch_x_nbr=batch_x_nbr,
         )
 
         if read_depth is None:
@@ -1255,18 +1261,22 @@ class VQNiche_Dual(BaseModel):
         # (MSE, NB likelihood, absolute expression) was wrong.
         gene_ids  = getattr(predict_batch, 'gene_ids', None)
         gene_mask = self._per_cell_gene_mask(predict_batch)
+        batch_x, batch_x_nbr = self._gene_knockout_inputs(predict_batch.x, gene_ids)
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, _logits) = self(
-            batch_x=predict_batch.x,
+            batch_x=batch_x,
             batch_edge_index=predict_batch.edge_index,
             batch_encoder_conditions=encoder_conditions,
             batch_attr_decoder_conditions=attr_decoder_conditions,
             adata_batch_ids_unseen_mask=unseen_mask,
+            # Library size of the UNEDITED cell, so a knockout changes decoded
+            # composition rather than also rescaling every gene.
             read_depth=predict_batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
             gene_ids=gene_ids,
             gene_mask=gene_mask,
+            batch_x_nbr=batch_x_nbr,
         )
         # Build a per-batch cache the predict-collator can fold together.
         return self._cache_inference_data(
@@ -1277,6 +1287,45 @@ class VQNiche_Dual(BaseModel):
             xhat_cell=xhat_cell, xhat_niche=xhat_niche,
             cache_dict=None,
         )
+
+    def _gene_knockout_inputs(self, x, gene_ids):
+        """
+        In-silico knockout, predict only. `self.gene_knockout` is set by
+        `run_squint.py --predict` from SQUINT_GENE_KO and is absent otherwise:
+        {'cols': vocabulary column ids, 'scope': 'both' | 'cell' | 'nbr'}.
+
+        Returns (batch_x, batch_x_nbr):
+          both  (x_ko, None)   every cell edited, as itself and as a neighbour
+          cell  (x_ko, x)      edited only as the index cell
+          nbr   (x,    x_ko)   edited only where it is someone's neighbour
+        The cell branch never sees neighbours, so under 'nbr' its codes must
+        be unchanged exactly -- the check that the split path is wired right.
+        """
+        ko = getattr(self, "gene_knockout", None)
+        if not ko:
+            return x, None
+        cols = torch.as_tensor(ko["cols"], dtype=torch.long, device=x.device)
+        if gene_ids is not None:
+            # Block narrowed to W columns: find each vocab column's position.
+            gid = gene_ids.reshape(-1).to(x.device)
+            hit = gid.unsqueeze(0) == cols.unsqueeze(1)          # (G, W)
+            if not bool(hit.any(dim=1).all()):
+                raise ValueError("knockout gene absent from this block's columns")
+            cols = hit.float().argmax(dim=1)
+        x_ko = x.clone()
+        x_ko[:, cols] = 0
+        scope = ko["scope"]
+        if scope == "both":
+            return x_ko, None
+        if scope == "cell":
+            return x_ko, x
+        if scope == "nbr":
+            return x, x_ko
+        if scope == "split_identity":
+            # Test-only: exercise the split niche path with NO edit; must
+            # reproduce the default forward.
+            return x, x.clone()
+        raise ValueError(f"unknown knockout scope {scope!r}")
 
     def on_predict_model_eval(self) -> None:
         return super().on_predict_model_eval()
